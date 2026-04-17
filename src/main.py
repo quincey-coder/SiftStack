@@ -1011,6 +1011,18 @@ def cli_main() -> None:
         help="Stop after scraping this many notices (0 = no limit)",
     )
     parser.add_argument(
+        "--min-delinquent-years",
+        type=int,
+        default=2,
+        help="Minimum years delinquent to include for tax_delinquent records (default: 2)",
+    )
+    parser.add_argument(
+        "--min-delinquent-amount",
+        type=float,
+        default=3000.0,
+        help="Minimum $ owed to include for tax_delinquent records (default: 3000)",
+    )
+    parser.add_argument(
         "--verbose", "-v",
         action="store_true",
         help="Enable debug logging",
@@ -1679,11 +1691,20 @@ def _run_scrape_pipeline(args, targets) -> None:
             ", ".join(f"{c}/{t}" for c, t in skipped),
         )
 
+    # Build scraper kwargs (e.g., tax delinquent thresholds)
+    scraper_kwargs = {}
+    min_years = getattr(args, "min_delinquent_years", 2)
+    min_amount = getattr(args, "min_delinquent_amount", 3000.0)
+    if min_years or min_amount:
+        scraper_kwargs["min_years"] = min_years
+        scraper_kwargs["min_amount"] = min_amount
+
     notices = asyncio.run(scrape_targets(
         targets=runnable,
         mode=args.mode,
         since_date=getattr(args, "since", None),
         max_notices=getattr(args, "max_notices", None),
+        scraper_kwargs=scraper_kwargs,
     )) if runnable else []
     # Handle async probate lookup before pipeline (requires asyncio.run)
     probate_notices = [n for n in notices if n.notice_type == "probate" and n.decedent_name and not n.address]

@@ -45,13 +45,21 @@ def register(county: str, notice_type: str):
     return wrapper
 
 
-def get_scraper(county: str, notice_type: str) -> Scraper | None:
-    """Look up and instantiate a scraper for the given county + notice type."""
+def get_scraper(county: str, notice_type: str, **kwargs) -> Scraper | None:
+    """Look up and instantiate a scraper for the given county + notice type.
+
+    Extra kwargs are passed to the scraper constructor (e.g., min_years, min_amount
+    for tax delinquent scrapers).
+    """
     cls = _REGISTRY.get((county.lower(), notice_type.lower()))
     if cls is None:
         logger.warning("No scraper registered for %s/%s", county, notice_type)
         return None
-    return cls()
+    try:
+        return cls(**kwargs)
+    except TypeError:
+        # Scraper doesn't accept kwargs — instantiate without them
+        return cls()
 
 
 def list_registered() -> list[tuple[str, str]]:
@@ -64,15 +72,21 @@ async def scrape_targets(
     mode: str = "daily",
     since_date: str | None = None,
     max_notices: int | None = None,
+    scraper_kwargs: dict | None = None,
 ) -> list[NoticeData]:
     """Run all scrapers for the given (county, notice_type) targets.
+
+    Args:
+        scraper_kwargs: Extra kwargs passed to scraper constructors
+            (e.g., min_years/min_amount for tax delinquent scrapers).
 
     Returns combined list of NoticeData from all scrapers.
     """
     all_notices: list[NoticeData] = []
+    kwargs = scraper_kwargs or {}
 
     for county, notice_type in targets:
-        scraper = get_scraper(county, notice_type)
+        scraper = get_scraper(county, notice_type, **kwargs)
         if scraper is None:
             continue
 

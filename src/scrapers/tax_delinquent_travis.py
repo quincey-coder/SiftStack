@@ -62,9 +62,22 @@ def _property_type_label(code: str) -> str:
     return types.get(code.upper().strip(), code.strip())
 
 
+# Default filter thresholds — configurable via CLI
+DEFAULT_MIN_DELINQUENT_YEARS = 2
+DEFAULT_MIN_DELINQUENT_AMOUNT = 3000.0
+
+
 @register("Travis", "tax_delinquent")
 class TravisTaxDelinquentScraper:
     """Download and parse Travis County tax delinquent CSV."""
+
+    def __init__(
+        self,
+        min_years: int = DEFAULT_MIN_DELINQUENT_YEARS,
+        min_amount: float = DEFAULT_MIN_DELINQUENT_AMOUNT,
+    ):
+        self.min_years = min_years
+        self.min_amount = min_amount
 
     async def scrape(
         self,
@@ -72,7 +85,10 @@ class TravisTaxDelinquentScraper:
         since_date: str | None = None,
         max_notices: int | None = None,
     ) -> list[NoticeData]:
-        logger.info("Downloading Travis County tax delinquent CSV...")
+        logger.info(
+            "Downloading Travis County tax delinquent CSV (filters: %d+ years, $%.0f+ owed)...",
+            self.min_years, self.min_amount,
+        )
 
         try:
             resp = requests.get(CSV_URL, timeout=REQUEST_TIMEOUT)
@@ -123,6 +139,25 @@ class TravisTaxDelinquentScraper:
             except ValueError:
                 pass
 
+            # Apply minimum thresholds
+            years_delinquent = 0
+            if first_year and first_year not in ("0", "0000", ""):
+                try:
+                    years_delinquent = datetime.now().year - int(first_year)
+                except ValueError:
+                    pass
+
+            if self.min_years > 0 and years_delinquent < self.min_years:
+                skipped += 1
+                continue
+
+            try:
+                if self.min_amount > 0 and float(delinquent_total) < self.min_amount:
+                    skipped += 1
+                    continue
+            except ValueError:
+                pass
+
             notice = NoticeData(
                 notice_type="tax_delinquent",
                 county="Travis",
@@ -136,14 +171,10 @@ class TravisTaxDelinquentScraper:
                 source_url=f"https://tax-office.traviscountytx.gov/properties/{account}",
             )
 
-            # Set tax delinquency fields
+            # Set tax delinquency fields (years already computed above)
             notice.tax_delinquent_amount = delinquent_total
-            if first_year and first_year != "0" and first_year != "0000":
-                try:
-                    years = datetime.now().year - int(first_year)
-                    notice.tax_delinquent_years = str(max(years, 1))
-                except ValueError:
-                    pass
+            if years_delinquent > 0:
+                notice.tax_delinquent_years = str(years_delinquent)
 
             # Set estimated value
             if appraisal_value:

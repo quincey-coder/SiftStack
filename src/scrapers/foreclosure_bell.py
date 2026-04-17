@@ -18,9 +18,13 @@ import logging
 import re
 from datetime import datetime, timedelta
 
+import cv2
+import numpy as np
+from PIL import Image
 from playwright.async_api import async_playwright
 from pdfminer.high_level import extract_text
 
+from image_utils import fix_rotation, ocr_page
 from notice_parser import NoticeData
 from scrapers import register
 
@@ -51,6 +55,51 @@ _SALE_DATE_RE = re.compile(
     r"(\w+\s+\d{1,2},?\s+\d{4})\s*(?:,\s*)?(?:being\s+)?(?:the\s+)?(?:first\s+)?(?:Tuesday|Tues)",
     re.IGNORECASE,
 )
+
+
+def _ocr_pdf_bytes(pdf_bytes: bytes) -> str:
+    """Render PDF pages to images and OCR them.
+
+    Uses pypdfium2 to render at 200 DPI, applies bilateral filter + Otsu
+    threshold for clean text, then runs Tesseract with PSM=3.
+    """
+    try:
+        import pypdfium2 as pdfium
+    except ImportError:
+        logger.warning("pypdfium2 not installed — cannot OCR scanned PDFs")
+        return ""
+
+    all_text = []
+    try:
+        pdf = pdfium.PdfDocument(pdf_bytes)
+        for page_idx in range(len(pdf)):
+            page = pdf[page_idx]
+            # Render at 200 DPI
+            bitmap = page.render(scale=200 / 72)
+            pil_image = bitmap.to_pil()
+
+            # Convert to grayscale numpy array for preprocessing
+            gray = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2GRAY)
+
+            # Bilateral filter — removes noise while preserving text edges
+            filtered = cv2.bilateralFilter(gray, 15, 75, 75)
+
+            # Otsu threshold — auto-determines optimal binary threshold
+            _, binary = cv2.threshold(filtered, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+            # Convert back to PIL for Tesseract
+            processed = Image.fromarray(binary)
+
+            # OCR with PSM=3 (fully automatic)
+            page_text = ocr_page(processed, psm=3)
+            if page_text:
+                all_text.append(page_text)
+
+        pdf.close()
+    except Exception as e:
+        logger.warning("OCR failed: %s", e)
+
+    return "\n".join(all_text)
 
 
 def _parse_notice_text(text: str) -> NoticeData | None:
@@ -188,11 +237,15 @@ class BellForeclosureScraper:
                             logger.warning("  PDF too small: %d bytes", len(pdf_bytes))
                             continue
 
-                        # Extract text
+                        # Extract text — try text layer first, fall back to OCR
                         text = extract_text(io.BytesIO(pdf_bytes))
                         if not text or len(text) < 50:
-                            logger.info("  PDF is scanned image (no text layer) — skipping")
-                            continue
+                            logger.info("  No text layer — running OCR...")
+                            text = _ocr_pdf_bytes(pdf_bytes)
+                            if not text or len(text) < 50:
+                                logger.warning("  OCR also returned no text — skipping")
+                                continue
+                            logger.info("  OCR extracted %d chars", len(text))
 
                         # Split into individual notices if multiple in one PDF
                         # Notices typically separated by "NOTICE OF" headers
