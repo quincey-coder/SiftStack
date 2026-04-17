@@ -98,3 +98,8 @@ try:
     from scrapers import foreclosure_travis  # noqa: F401
 except ImportError as e:
     logger.debug("Could not import foreclosure_travis: %s", e)
+
+try:
+    from scrapers import probate_odyssey  # noqa: F401
+except ImportError as e:
+    logger.debug("Could not import probate_odyssey: %s", e)
