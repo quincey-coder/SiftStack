@@ -1,11 +1,11 @@
 """Room-by-room rehab cost estimation with 4-tier finish system.
 
 Generates full rehab budgets, wholetail comparisons, and project timelines.
-Regional pricing calibrated for Knoxville / East Tennessee market.
+Regional pricing calibrated for Austin / Central Texas market.
 
 Usage:
-  python src/main.py rehab --address "123 Main St, Knoxville, TN 37918"
-  python src/main.py rehab --address "123 Main St" --tier 2 --scope full --region knoxville
+  python src/main.py rehab --address "123 Main St, Austin, TX 78701"
+  python src/main.py rehab --address "123 Main St" --tier 2 --scope full --region austin
 """
 
 import logging
@@ -20,13 +20,13 @@ import config
 logger = logging.getLogger(__name__)
 
 # ── Regional multipliers ──────────────────────────────────────────────
-# Knoxville labor/materials costs relative to national average (1.0)
+# Austin labor/materials costs relative to national average (1.0)
 REGIONAL_MULTIPLIERS = {
-    "knoxville": 0.88,      # ~12% below national average
-    "blount": 0.86,          # Slightly lower than Knox
+    "austin": 0.95,          # ~5% below national average
+    "travis": 0.95,
+    "bell": 0.88,            # Lower cost area
+    "williamson": 0.93,
     "national": 1.00,
-    "nashville": 0.95,
-    "chattanooga": 0.90,
 }
 DEFAULT_REGION = "knoxville"
 
@@ -232,7 +232,7 @@ def estimate_rehab(address: str = "", sqft: int = 0, bedrooms: int = 3,
 
     # Default sqft if not provided
     if not sqft:
-        sqft = 1500  # Knoxville average for older SFH
+        sqft = 1500  # Austin area average for older SFH
 
     full_baths = int(bathrooms)
     secondary_baths = max(0, full_baths - 1)

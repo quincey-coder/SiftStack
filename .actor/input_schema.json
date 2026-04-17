@@ -2,7 +2,7 @@
     "title": "SiftStack Input",
     "type": "object",
     "schemaVersion": 1,
-    "required": ["mode", "tn_username", "tn_password", "captcha_api_key"],
+    "required": ["mode"],
     "properties": {
         "mode": {
             "title": "Scrape Mode",
@@ -15,7 +15,7 @@
         "counties": {
             "title": "Counties",
             "type": "array",
-            "description": "Counties to scrape. Leave empty for all (Knox + Blount).",
+            "description": "Counties to scrape. Leave empty for all (Travis, Bell, Williamson).",
             "items": { "type": "string" },
             "default": [],
             "editor": "stringList"
@@ -42,27 +42,6 @@
             "default": 1,
             "minimum": 1,
             "editor": "number"
-        },
-        "tn_username": {
-            "title": "tnpublicnotice.com Email",
-            "type": "string",
-            "description": "Login email for tnpublicnotice.com Smart Search",
-            "editor": "textfield",
-            "isSecret": true
-        },
-        "tn_password": {
-            "title": "tnpublicnotice.com Password",
-            "type": "string",
-            "description": "Login password for tnpublicnotice.com",
-            "editor": "textfield",
-            "isSecret": true
-        },
-        "captcha_api_key": {
-            "title": "2Captcha API Key",
-            "type": "string",
-            "description": "API key from 2captcha.com for reCAPTCHA solving",
-            "editor": "textfield",
-            "isSecret": true
         },
         "use_residential_proxy": {
             "title": "Use Residential Proxy",

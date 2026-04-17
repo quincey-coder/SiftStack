@@ -346,7 +346,7 @@ def run_enrichment_pipeline(
         return notices
 
     # ── Step 3c: Probate Property Lookup ────────────────────────────
-    # For probate records without a property address, search Knox Tax API
+    # For probate records without a property address, search TX CAD API
     # by the decedent's name to find their property.
     probate_no_addr = [
         n for n in notices

@@ -42,7 +42,7 @@ def _build_lastline(notice: NoticeData) -> str:
     lastline = ", ".join(parts)
     if notice.zip:
         lastline += " " + notice.zip if lastline else notice.zip
-    return lastline or "TN"
+    return lastline or "TX"
 
 
 def standardize_addresses(
@@ -125,8 +125,8 @@ def standardize_addresses(
             metadata = candidate.metadata
             analysis = candidate.analysis
 
-            # Safety: reject non-TN results (bad match on out-of-state address)
-            if components and components.state_abbreviation and components.state_abbreviation != "TN":
+            # Safety: reject non-TX results (bad match on out-of-state address)
+            if components and components.state_abbreviation and components.state_abbreviation != "TX":
                 logger.warning(
                     "Smarty returned %s for '%s' -- keeping original",
                     components.state_abbreviation,
@@ -318,7 +318,7 @@ def retry_with_geocoded_city(
             metadata = candidate.metadata
             analysis = candidate.analysis
 
-            if components and components.state_abbreviation and components.state_abbreviation != "TN":
+            if components and components.state_abbreviation and components.state_abbreviation != "TX":
                 failed += 1
                 continue
 

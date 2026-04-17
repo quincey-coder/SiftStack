@@ -1,8 +1,8 @@
-"""Entry point for SiftStack — full-stack REI operations platform.
+"""Entry point for SiftStack — Texas REI operations platform.
 
 Runs as either:
   - Apify Actor (when APIFY_IS_AT_HOME is set — reads input from Actor.get_input())
-  - Standalone CLI (python src/main.py daily --counties Knox --types foreclosure)
+  - Standalone CLI (python src/main.py daily --counties Travis --types foreclosure)
 """
 
 import argparse
@@ -18,11 +18,9 @@ from config import (
     LOG_DIR,
     NOTICE_TYPES,
     OUTPUT_DIR,
-    SAVED_SEARCHES,
-    SavedSearch,
+    TX_COUNTIES,
 )
 from data_formatter import deduplicate, write_csv, write_csv_by_type
-from scraper import scrape_all
 
 logger = logging.getLogger(__name__)
 
@@ -30,22 +28,27 @@ logger = logging.getLogger(__name__)
 # ── Shared helpers ────────────────────────────────────────────────────
 
 
-def _filter_searches(
+def _filter_targets(
     counties: list[str] | None,
     types: list[str] | None,
-) -> list[SavedSearch]:
-    """Filter SAVED_SEARCHES by county and/or notice type."""
-    searches = list(SAVED_SEARCHES)
+) -> list[tuple[str, str]]:
+    """Build list of (county, notice_type) pairs to scrape.
+
+    Returns all combinations of TX_COUNTIES × NOTICE_TYPES, filtered by
+    the --counties and --types CLI args.
+    """
+    target_counties = TX_COUNTIES
+    target_types = NOTICE_TYPES
 
     if counties:
         county_set = {c.lower() for c in counties}
-        searches = [s for s in searches if s.county.lower() in county_set]
+        target_counties = [c for c in TX_COUNTIES if c.lower() in county_set]
 
     if types:
         type_set = {t.lower() for t in types}
-        searches = [s for s in searches if s.notice_type.lower() in type_set]
+        target_types = [t for t in NOTICE_TYPES if t.lower() in type_set]
 
-    return searches
+    return [(c, t) for c in target_counties for t in target_types]
 
 
 # ── Preflight health checks ─────────────────────────────────────────
@@ -63,11 +66,7 @@ def _preflight_check(mode: str) -> list[str]:
     enrichment_modes = scrape_modes | {"pdf-import", "photo-import", "dropbox-watch", "csv-import"}
     datasift_modes = {"manage-presets", "manage-sold", "phone-validate"}
 
-    if mode in scrape_modes:
-        if not config.TNPN_EMAIL or not config.TNPN_PASSWORD:
-            failures.append("TNPN_EMAIL / TNPN_PASSWORD not set (required for scraping)")
-        if not config.CAPTCHA_API_KEY:
-            failures.append("CAPTCHA_API_KEY not set (CAPTCHA solving will fail)")
+    # No login credentials needed — all TX sources are public
 
     if mode in enrichment_modes:
         # These are warnings, not blockers — pipeline degrades gracefully
@@ -89,37 +88,6 @@ def _preflight_check(mode: str) -> list[str]:
     if mode == "phone-validate":
         if not config.TRESTLE_API_KEY:
             failures.append("TRESTLE_API_KEY not set (required for phone validation)")
-
-    # ── Connectivity checks (only for scrape modes) ─────────────────
-    if mode in scrape_modes:
-        import requests as _requests
-        try:
-            resp = _requests.head(config.BASE_URL, timeout=10, allow_redirects=True)
-            if resp.status_code >= 500:
-                failures.append(f"tnpublicnotice.com returned {resp.status_code} — site may be down")
-        except Exception as e:
-            failures.append(f"Cannot reach tnpublicnotice.com: {e}")
-
-    # ── 2Captcha balance check ──────────────────────────────────────
-    if mode in scrape_modes and config.CAPTCHA_API_KEY:
-        import requests as _requests
-        try:
-            resp = _requests.get(
-                f"https://2captcha.com/res.php?key={config.CAPTCHA_API_KEY}&action=getbalance",
-                timeout=10,
-            )
-            balance_text = resp.text.strip()
-            try:
-                balance = float(balance_text)
-                if balance < 0.50:
-                    failures.append(f"2Captcha balance too low: ${balance:.2f} (need at least $0.50)")
-                else:
-                    logger.info("Preflight: 2Captcha balance: $%.2f", balance)
-            except ValueError:
-                if "ERROR" in balance_text:
-                    failures.append(f"2Captcha API key invalid: {balance_text}")
-        except Exception as e:
-            logger.warning("Preflight: Could not check 2Captcha balance: %s", e)
 
     return failures
 
@@ -149,9 +117,6 @@ async def actor_main() -> None:
         # Set both config.* AND os.environ so downstream modules that read
         # from either source (e.g., datasift_uploader uses os.environ) pick them up.
         _cred_map = {
-            "TNPN_EMAIL": actor_input.get("tn_username", ""),
-            "TNPN_PASSWORD": actor_input.get("tn_password", ""),
-            "CAPTCHA_API_KEY": actor_input.get("captcha_api_key", ""),
             "ANTHROPIC_API_KEY": actor_input.get("anthropic_api_key", ""),
             "SMARTY_AUTH_ID": actor_input.get("smarty_auth_id", ""),
             "SMARTY_AUTH_TOKEN": actor_input.get("smarty_auth_token", ""),
@@ -186,30 +151,17 @@ async def actor_main() -> None:
         include_commercial = actor_input.get("include_commercial", False)
         include_entities = actor_input.get("include_entities", False)
 
-        # Validate
-        if not config.TNPN_EMAIL or not config.TNPN_PASSWORD:
-            Actor.log.error("tn_username and tn_password are required")
-            try:
-                from slack_notifier import notify_preflight_failure
-                notify_preflight_failure(["TNPN credentials missing"])
-            except Exception:
-                pass
-            await Actor.fail(status_message="Missing SiftStack credentials")
-            return
-        if not config.CAPTCHA_API_KEY:
-            Actor.log.warning("captcha_api_key not set — CAPTCHA solving will fail")
-
-        # Filter searches
-        searches = _filter_searches(counties, types)
-        if not searches:
-            Actor.log.error("No saved searches match the given counties/types filters")
-            await Actor.fail(status_message="No matching saved searches")
+        # Filter targets
+        targets = _filter_targets(counties, types)
+        if not targets:
+            Actor.log.error("No scrape targets match the given counties/types filters")
+            await Actor.fail(status_message="No matching scrape targets")
             return
 
         Actor.log.info(
-            "Running %d saved searches: %s",
-            len(searches),
-            ", ".join(s.saved_search_name for s in searches),
+            "Running %d scrape targets: %s",
+            len(targets),
+            ", ".join(f"{c}/{t}" for c, t in targets),
         )
 
         # Set up residential proxy if requested
@@ -323,14 +275,9 @@ async def actor_main() -> None:
                     Actor.log.warning("Failed to persist seen_notice_ids to KVS: %s", e)
 
             # ── Scrape ────────────────────────────────────────────────
-            notices = await scrape_all(
-                mode=mode, searches=searches, proxy_url=proxy_url, on_batch=push_batch,
-                since_date_override=since_date_override or None,
-                llm_api_key=config.ANTHROPIC_API_KEY or None,
-                start_page=start_page,
-                seen_ids=seen_ids,
-                on_search_complete=persist_seen_ids,
-            )
+            # TX scrapers not yet implemented — stub for Phase 2+
+            Actor.log.warning("TX scrapers not yet implemented — returning empty results")
+            notices = []
             # Handle async probate lookup before pipeline (requires await)
             probate_notices = [n for n in notices if n.notice_type == "probate" and n.decedent_name and not n.address]
             if probate_notices:
@@ -492,9 +439,6 @@ async def actor_main() -> None:
 
             # Compute estimated run cost
             cost_breakdown = {}
-            # 2Captcha: $0.003 per solve, ~1 solve per notice scraped
-            captcha_count = total  # each notice detail page requires a CAPTCHA
-            cost_breakdown["2Captcha"] = round(captcha_count * 0.003, 2)
             # Anthropic Haiku: ~$0.001 per record (LLM parsing + obituary search)
             if config.ANTHROPIC_API_KEY:
                 cost_breakdown["Anthropic (Haiku)"] = round(total * 0.001, 3)
@@ -611,7 +555,7 @@ def _run_pdf_import(args) -> None:
         logging.error("PDF file not found: %s", pdf_path)
         sys.exit(1)
 
-    county = args.pdf_county.strip().title()  # "knox" → "Knox"
+    county = args.pdf_county.strip().title()  # "travis" → "Travis"
 
     api_key = config.ANTHROPIC_API_KEY or None
 
@@ -987,7 +931,7 @@ def _run_manage_sold(args) -> None:
     """Run the SiftMap sold properties management workflow."""
     from datasift_uploader import run_manage_sold_workflow
 
-    # Parse counties if provided, otherwise use default (Knox, Blount)
+    # Parse counties if provided, otherwise use default (Travis, Bell, Williamson)
     counties = None
     if args.counties and args.counties.lower() != "all":
         counties = [c.strip().title() for c in args.counties.split(",")]
@@ -1038,7 +982,7 @@ def cli_main() -> None:
         "--counties",
         type=str,
         default=None,
-        help='Comma-separated counties to scrape (e.g. "Knox,Blount" or "all")',
+        help='Comma-separated counties to scrape (e.g. "Travis,Bell,Williamson" or "all")',
     )
     parser.add_argument(
         "--types",
@@ -1080,7 +1024,7 @@ def cli_main() -> None:
         "--pdf-county",
         type=str,
         default=None,
-        help='County name for PDF import, e.g. "Knox" (required for pdf-import mode)',
+        help='County name for PDF import, e.g. "Travis" (required for pdf-import mode)',
     )
     parser.add_argument(
         "--pdf-date",
@@ -1105,7 +1049,7 @@ def cli_main() -> None:
         type=str,
         default=None,
         dest="photo_county",
-        help='County name for photo import, e.g. "Knox" (required for photo-import mode)',
+        help='County name for photo import, e.g. "Travis" (required for photo-import mode)',
     )
     parser.add_argument(
         "--photo-type",
@@ -1158,7 +1102,7 @@ def cli_main() -> None:
         "--csv-county",
         type=str,
         default=None,
-        help='County name for CSV import, e.g. "Knox" (sets county for records missing it)',
+        help='County name for CSV import, e.g. "Travis" (sets county for records missing it)',
     )
 
     parser.add_argument(
@@ -1377,8 +1321,8 @@ def cli_main() -> None:
                         help="Finish tier 1-4 (rehab mode, default: 2)")
     parser.add_argument("--scope", type=str, default="full", choices=["full", "wholetail"],
                         help="Rehab scope (rehab mode, default: full)")
-    parser.add_argument("--region", type=str, default="knoxville",
-                        help="Regional pricing (rehab mode, default: knoxville)")
+    parser.add_argument("--region", type=str, default="austin",
+                        help="Regional pricing (rehab mode, default: austin)")
     parser.add_argument("--sqft", type=int, default=0,
                         help="Property sqft override (rehab mode)")
     parser.add_argument("--bedrooms", type=int, default=0,
@@ -1436,7 +1380,7 @@ def cli_main() -> None:
     parser.add_argument("--blueprint", type=str, default="wholesale",
                         choices=["wholesale", "flip", "hold", "hybrid"],
                         help="Investment blueprint (playbook mode)")
-    parser.add_argument("--market", type=str, default="knoxville",
+    parser.add_argument("--market", type=str, default="austin",
                         help="Target market (playbook mode)")
     parser.add_argument("--team-size", type=int, default=1,
                         help="Team size 1/2/5 (playbook mode)")
@@ -1683,7 +1627,7 @@ def cli_main() -> None:
         _run_csv_import(args)
         return
 
-    # Filter saved searches
+    # Filter scrape targets
     counties = None
     if args.counties and args.counties.lower() != "all":
         counties = [c.strip() for c in args.counties.split(",")]
@@ -1692,19 +1636,19 @@ def cli_main() -> None:
     if args.types and args.types.lower() != "all":
         types = [t.strip() for t in args.types.split(",")]
 
-    searches = _filter_searches(counties, types)
-    if not searches:
-        logging.error("No saved searches match the given --counties / --types filters")
+    targets = _filter_targets(counties, types)
+    if not targets:
+        logging.error("No scrape targets match the given --counties / --types filters")
         sys.exit(1)
 
     logging.info(
-        "Running %d saved searches: %s",
-        len(searches),
-        ", ".join(s.saved_search_name for s in searches),
+        "Running %d scrape targets: %s",
+        len(targets),
+        ", ".join(f"{c}/{t}" for c, t in targets),
     )
 
     try:
-        _run_scrape_pipeline(args, searches)
+        _run_scrape_pipeline(args, targets)
     except Exception as e:
         logging.exception("Pipeline failed with unhandled error")
         try:
@@ -1715,15 +1659,12 @@ def cli_main() -> None:
         sys.exit(1)
 
 
-def _run_scrape_pipeline(args, searches) -> None:
+def _run_scrape_pipeline(args, targets) -> None:
     """Run the daily/historical scrape → enrich → export → upload pipeline."""
-    # Scrape
-    notices = asyncio.run(scrape_all(
-        mode=args.mode, searches=searches,
-        llm_api_key=config.ANTHROPIC_API_KEY or None,
-        since_date_override=args.since,
-        max_notices=args.max_notices,
-    ))
+    # TX scrapers not yet implemented — stub for Phase 2+
+    logging.warning("TX scrapers not yet implemented — returning empty results")
+    logging.info("Targets: %s", ", ".join(f"{c}/{t}" for c, t in targets))
+    notices = []
     # Handle async probate lookup before pipeline (requires asyncio.run)
     probate_notices = [n for n in notices if n.notice_type == "probate" and n.decedent_name and not n.address]
     if probate_notices:

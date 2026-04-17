@@ -6,11 +6,11 @@ Scores each zip by distress density, property values, equity, and competition.
 Data sources:
   - Our own scraped notice data (aggregated by zip)
   - Zillow API (property values via OpenWeb Ninja)
-  - Knox County Tax API (delinquency density)
+  - TX CAD APIs (delinquency density)
 
 Usage:
-  python src/main.py market-analysis --counties Knox,Blount
-  python src/main.py market-analysis --counties Knox --zip-codes 37918,37919,37920
+  python src/main.py market-analysis --counties Travis,Bell,Williamson
+  python src/main.py market-analysis --counties Travis --zip-codes 78701,78702,78703
 """
 
 import csv
@@ -32,18 +32,27 @@ import config
 
 logger = logging.getLogger(__name__)
 
-# ── Knox/Blount county zip codes ──────────────────────────────────────
-KNOX_ZIPS = [
-    "37901", "37902", "37909", "37912", "37914", "37915", "37916", "37917",
-    "37918", "37919", "37920", "37921", "37922", "37923", "37924", "37931",
-    "37932", "37934", "37938",
+# ── Travis/Bell/Williamson county zip codes ──────────────────────────
+TRAVIS_ZIPS = [
+    "78701", "78702", "78703", "78704", "78705", "78712", "78717", "78719",
+    "78721", "78722", "78723", "78724", "78725", "78726", "78727", "78728",
+    "78729", "78730", "78731", "78732", "78733", "78734", "78735", "78736",
+    "78737", "78738", "78739", "78741", "78742", "78744", "78745", "78746",
+    "78747", "78748", "78749", "78750", "78751", "78752", "78753", "78754",
+    "78756", "78757", "78758", "78759",
 ]
-BLOUNT_ZIPS = [
-    "37801", "37803", "37804", "37853", "37882", "37886",
+BELL_ZIPS = [
+    "76501", "76502", "76504", "76508", "76513", "76541", "76542", "76543",
+    "76544", "76548", "76549", "76554", "76559", "76571",
+]
+WILLIAMSON_ZIPS = [
+    "78613", "78626", "78628", "78633", "78634", "78641", "78642", "78664",
+    "78665", "78681", "78717", "78726", "78727", "78728", "78729", "78750",
 ]
 COUNTY_ZIPS = {
-    "knox": KNOX_ZIPS,
-    "blount": BLOUNT_ZIPS,
+    "travis": TRAVIS_ZIPS,
+    "bell": BELL_ZIPS,
+    "williamson": WILLIAMSON_ZIPS,
 }
 
 # ── Scoring weights ───────────────────────────────────────────────────
@@ -435,7 +444,7 @@ def run_market_analysis(counties: list[str] | None = None,
 
     Returns dict with report data and output path.
     """
-    counties = counties or ["Knox", "Blount"]
+    counties = counties or ["Travis", "Bell", "Williamson"]
     county_str = ", ".join(counties)
     logger.info("Starting market analysis for: %s", county_str)
 

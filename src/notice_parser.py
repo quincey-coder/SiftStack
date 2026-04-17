@@ -1,12 +1,7 @@
-"""Parse individual notice pages and extract structured data.
+"""Parse notice text and extract structured data.
 
-After reCAPTCHA is solved and "View Notice" is clicked, the detail page shows:
-  1. Structured metadata labels: Publication Name, Publication City and State,
-     Publication County, Notice Publish Date
-  2. A "Notice Content" section with the raw legal text body
-
-We extract the metadata labels directly, then regex-parse address/owner/etc.
-from the Notice Content body.
+Extracts address, owner, dates, and other fields from raw legal notice text
+using regex patterns tuned for Texas (Travis, Bell, Williamson counties).
 
 IMPORTANT: For address parsing, we ONLY extract addresses that appear after
 high-confidence property-indicator phrases like "commonly known as" or
@@ -32,7 +27,7 @@ class NoticeData:
     auction_date: str = ""     # Scheduled sale/auction date (YYYY-MM-DD)
     address: str = ""
     city: str = ""
-    state: str = "TN"
+    state: str = "TX"
     zip: str = ""
     owner_name: str = ""
     notice_type: str = ""      # foreclosure | tax_sale | tax_lien | probate
@@ -134,24 +129,29 @@ class NoticeData:
     run_id: str = ""                   # Unique pipeline run identifier for data lineage
 
 
-# ── Known TN cities in Knox & Blount counties ─────────────────────────
-# Sorted longest-first so "Lenoir City" matches before "City"
-TN_CITIES: list[str] = sorted(
+# ── Known TX cities in Travis, Bell & Williamson counties ─────────────
+# Sorted longest-first so "Round Rock" matches before "Rock"
+TX_CITIES: list[str] = sorted(
     [
-        "Knoxville", "Maryville", "Alcoa", "Farragut", "Powell",
-        "Lenoir City", "Loudon", "Oak Ridge", "Clinton", "Sevierville",
-        "Pigeon Forge", "Gatlinburg", "Karns", "Halls", "Concord",
-        "Friendsville", "Louisville", "Townsend", "Walland", "Rockford",
-        "Corryton", "Mascot", "Strawberry Plains", "New Market",
-        "Kodak", "Dandridge", "Bean Station", "Jefferson City",
-        "Morristown", "Madisonville", "Vonore", "Greenback",
+        # Travis County
+        "Austin", "Pflugerville", "Manor", "Del Valle", "Lakeway",
+        "Bee Cave", "West Lake Hills", "Rollingwood", "Sunset Valley",
+        "Lago Vista", "Jonestown", "Point Venture", "Volente",
+        # Bell County
+        "Killeen", "Temple", "Belton", "Harker Heights", "Copperas Cove",
+        "Nolanville", "Salado", "Troy", "Rogers", "Holland",
+        "Little River Academy", "Morgan's Point Resort", "Morgans Point Resort",
+        # Williamson County
+        "Round Rock", "Georgetown", "Cedar Park", "Leander", "Taylor",
+        "Hutto", "Liberty Hill", "Jarrell", "Florence", "Granger",
+        "Thrall", "Bartlett", "Coupland", "Weir",
     ],
     key=len,
     reverse=True,
 )
 
 # Set version for O(1) membership tests in standalone address validation
-_KNOWN_CITIES_SET: set[str] = {c.title() for c in TN_CITIES}
+_KNOWN_CITIES_SET: set[str] = {c.title() for c in TX_CITIES}
 
 # ── Reusable suffix pattern ──────────────────────────────────────────
 # Word-boundary at the end prevents matching "Cir" inside "Circuit", etc.
@@ -202,10 +202,10 @@ _PROP_INDICATOR = (
     r")"
 )
 
-# Optional ", Knox County" or ", Blount County" between city and state
+# Optional ", Travis County" or ", Bell County" between city and state
 _OPTIONAL_COUNTY = r"(?:\s*[,.]\s*\w+\s+County)?"
 
-# FULL match: indicator + address + city + [county] + Tennessee/TN + zip
+# FULL match: indicator + address + city + [county] + Texas/TX + zip
 # Captures (address, city, zip) all from the same context.
 FULL_PROPERTY_RE = re.compile(
     _PROP_INDICATOR
@@ -216,7 +216,7 @@ FULL_PROPERTY_RE = re.compile(
     + r"([\w][\w\s]*?)"           # city name
     + _OPTIONAL_COUNTY
     + r"\s*[,.]\s*"
-    + r"(?:Tennessee|Tenn\.?|TN)"
+    + r"(?:Texas|Tex\.?|TX)"
     + r"\s*[,.\s]*"
     + r"(\d{5}(?:-\d{4})?)?",     # optional zip
     re.IGNORECASE,
@@ -237,7 +237,7 @@ LOCATED_AT_FULL_RE = re.compile(
     + r"([\w][\w\s]*?)"
     + _OPTIONAL_COUNTY
     + r"\s*[,.]\s*"
-    + r"(?:Tennessee|Tenn\.?|TN)"
+    + r"(?:Texas|Tex\.?|TX)"
     + r"\s*[,.\s]*"
     + r"(\d{5}(?:-\d{4})?)?",
     re.IGNORECASE,
@@ -256,7 +256,7 @@ STANDALONE_ADDR_RE = re.compile(
     + r"([\w][\w\s]*?)"           # city name
     + _OPTIONAL_COUNTY
     + r"\s*[,.]\s*"
-    + r"(?:Tennessee|Tenn\.?|TN)"
+    + r"(?:Texas|Tex\.?|TX)"
     + r"\s*[,.\s]*"
     + r"(\d{5}(?:-\d{4})?)?",     # optional zip
     re.IGNORECASE,
@@ -273,17 +273,15 @@ _BAD_ADDR_WORDS = [
 
 # Known government / courthouse addresses (normalized lowercase)
 _KNOWN_BAD_ADDRS = [
-    "400 main street",      # Knox County City-County Building
-    "400 main avenue",
-    "400 main ave",
-    "400 w main",
-    "345 court street",     # Blount County courthouse area
-    "345 court st",
-    "800 s gay st",         # Downtown Knoxville (law offices)
-    "800 s. gay st",
-    "800 south gay",
-    "300 main street",      # Blount County courthouse
-    "300 main st",
+    "1000 guadalupe",       # Travis County courthouse (west steps — foreclosure sale location)
+    "1000 guadalupe st",
+    "314 w 11th st",        # Travis County admin building
+    "1201 huey dr",         # Bell County courthouse (Belton)
+    "1201 huey drive",
+    "1201 huey road",
+    "405 mlk st",           # Williamson County Justice Center (Georgetown)
+    "405 martin luther king",
+    "405 m l king",
 ]
 
 
@@ -315,24 +313,23 @@ def _is_valid_address(addr: str) -> bool:
     return True
 
 
-# ── TN zip code ──────────────────────────────────────────────────────
-# TN zips range from 37010 to 38589 — require 37xxx or 38xxx prefix
-ZIP_RE = re.compile(r"\b(3[78]\d{3})(?:-\d{4})?\b")
+# ── TX zip code ──────────────────────────────────────────────────────
+# TX zips range from 73301 to 79999 — require 7xxxx prefix
+ZIP_RE = re.compile(r"\b(7\d{4})(?:-\d{4})?\b")
 
 # Zips to reject when found via fallback (no address context):
 # Courthouse / auction / law-office zips that commonly appear in notice text
 _COURTHOUSE_ZIPS = {
-    "37902",  # Downtown Knoxville (courthouse, City-County Building)
-    "37901",  # Knoxville PO Box area
-    "38103",  # Memphis (law firms often referenced)
-    "38101",  # Memphis PO Box area
-    "37219",  # Nashville (state offices)
+    "78701",  # Downtown Austin (Travis County courthouse)
+    "76513",  # Belton (Bell County courthouse)
+    "78626",  # Georgetown (Williamson County courthouse)
 }
 
 # Expected zip prefixes by county (for fallback validation)
 _COUNTY_ZIP_PREFIXES: dict[str, list[str]] = {
-    "Knox":   ["377", "378", "379"],
-    "Blount": ["377", "378"],
+    "Travis":     ["786", "787", "733"],
+    "Bell":       ["765", "766", "768"],
+    "Williamson": ["786", "785", "765", "776"],
 }
 
 
@@ -453,7 +450,7 @@ PR_ADDRESS_RE = re.compile(
     r"\s*[,.\s]+\s*"
     r"([A-Za-z][\w\s]*?)"             # city
     r"\s*[,.]\s*"
-    r"(?:Tennessee|Tenn\.?|TN)"
+    r"(?:Texas|Tex\.?|TX)"
     r"\s*[,.\s]*"
     r"(\d{5})",                        # zip
     re.IGNORECASE,
@@ -584,19 +581,19 @@ _COURTHOUSE_COUNTY_RE = re.compile(
 )
 
 # Counties we care about — notices for other counties are false positives
-_TARGET_COUNTIES = {"knox", "blount"}
+_TARGET_COUNTIES = {"travis", "bell", "williamson"}
 
 
 def is_target_county(text: str, search_county: str) -> bool:
     """Check if the notice's actual property county matches our target counties.
 
-    The search may return notices that merely *mention* Knox County (e.g. the
-    trustee is from Knox County) but the actual property is in Hamilton, Hardeman,
-    Union, etc.  We detect this by looking at Register's Office and Courthouse
+    The search may return notices that merely *mention* Travis County (e.g. the
+    trustee is from Travis County) but the actual property is elsewhere.
+    We detect this by looking at Register's Office and Courthouse
     references which indicate where the property actually is.
 
-    Returns True if the property appears to be in Knox or Blount County (or if
-    we can't determine the county — benefit of the doubt).
+    Returns True if the property appears to be in Travis, Bell, or Williamson
+    County (or if we can't determine the county — benefit of the doubt).
     """
     # Find all Register's Office mentions — the first one is typically the
     # property's recording county (later mentions may be trustee appointments)
@@ -754,7 +751,7 @@ async def parse_notice_page(
             if not notice.owner_street and llm_result.get("owner_street"):
                 notice.owner_street = llm_result["owner_street"]
                 notice.owner_city = llm_result.get("owner_city") or notice.owner_city
-                notice.owner_state = llm_result.get("owner_state") or "TN"
+                notice.owner_state = llm_result.get("owner_state") or "TX"
                 notice.owner_zip = llm_result.get("owner_zip") or notice.owner_zip
                 logger.info("LLM filled PR address: %s", notice.owner_street)
         else:
@@ -946,16 +943,16 @@ def _get_context_before(text: str, pos: int, chars: int) -> str:
 def _extract_city_zip_near(notice: NoticeData, text: str, addr_end: int) -> None:
     """Extract city and zip from the text near the end of the address match.
 
-    Looks in the 200 characters after the address for "City, TN ZIP" or
-    "City, Tennessee ZIP".
+    Looks in the 200 characters after the address for "City, TX ZIP" or
+    "City, Texas ZIP".
     """
     window = text[addr_end:addr_end + 200]
 
-    # Try "CITY, [County,] TN ZIP" or "CITY, [County,] Tennessee ZIP"
+    # Try "CITY, [County,] TX ZIP" or "CITY, [County,] Texas ZIP"
     city_state_re = re.compile(
         r"[,.\s]+([\w][\w\s]*?)"
         r"(?:\s*[,.]\s*\w+\s+County)?"   # optional county
-        r"\s*[,.]\s*(?:Tennessee|Tenn\.?|TN)"
+        r"\s*[,.]\s*(?:Texas|Tex\.?|TX)"
         r"\s*[,.\s]*(\d{5}(?:-\d{4})?)?",
         re.IGNORECASE,
     )
@@ -968,7 +965,7 @@ def _extract_city_zip_near(notice: NoticeData, text: str, addr_end: int) -> None
 
     # Fallback: find a known TN city in the window
     window_upper = window.upper()
-    for city in TN_CITIES:
+    for city in TX_CITIES:
         if city.upper() in window_upper:
             notice.city = city
             break
@@ -997,7 +994,7 @@ def _extract_city_zip_fallback(notice: NoticeData, text: str) -> None:
     """
     if not notice.city:
         text_upper = text.upper()
-        for city in TN_CITIES:
+        for city in TX_CITIES:
             if city.upper() in text_upper:
                 notice.city = city
                 break
@@ -1088,7 +1085,7 @@ def _parse_pr_address(notice: NoticeData) -> None:
             street = street.title()
         notice.owner_street = street
         notice.owner_city = _clean_city(match.group(2))
-        notice.owner_state = "TN"
+        notice.owner_state = "TX"
         notice.owner_zip = match.group(3)
         logger.debug(
             "PR address: %s, %s, TN %s",

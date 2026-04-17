@@ -177,7 +177,7 @@ def build_summary(
         upload_result: DataSift upload result dict (optional).
         elapsed_min: Pipeline elapsed time in minutes.
         api_cost: Estimated Haiku API cost for this run (legacy, use cost_breakdown).
-        cost_breakdown: Dict of service -> cost, e.g. {"2Captcha": 0.09, "Tracerfy": 0.26}.
+        cost_breakdown: Dict of service -> cost, e.g. {"Anthropic": 0.05, "Tracerfy": 0.26}.
     """
     total = len(notices)
     by_county = _count_by_field(notices, "county")

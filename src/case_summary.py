@@ -200,7 +200,7 @@ def build_next_steps(notice: NoticeData) -> list[str]:
     conf = (notice.dm_confidence or "").lower()
     if conf in ("low", "medium"):
         steps.append(
-            "Verify decision-maker identity against Knox County probate filings "
+            "Verify decision-maker identity against county probate filings "
             "or obituary survivors list before committing marketing spend."
         )
 
@@ -219,7 +219,7 @@ def build_next_steps(notice: NoticeData) -> list[str]:
     # 5. Tax situation
     if notice.tax_delinquent_amount:
         steps.append(
-            "Pull the current tax ledger from the Knox County Trustee before offer — "
+            "Pull the current tax ledger from the county tax office before offer — "
             "back taxes may need to roll into the purchase price."
         )
 

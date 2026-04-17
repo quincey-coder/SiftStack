@@ -1,6 +1,6 @@
 """Classify foreclosure notices — keep only first-to-market trustee sales.
 
-Title variations observed on tnpublicnotice.com (Feb 2026):
+Title variations observed from Texas county clerk and law firm sources:
   - SUBSTITUTE TRUSTEE'S NOTICE OF SALE
   - SUBSTITUTE TRUSTEE'S SALE
   - SUBSTITUTE TRUSTEE'S NOTICE OF FORECLOSURE SALE

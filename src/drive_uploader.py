@@ -68,6 +68,7 @@ def upload_file(
             body=file_metadata,
             media_body=media,
             fields="id, webViewLink",
+            supportsAllDrives=True,
         ).execute()
 
         link = file.get("webViewLink", "")
@@ -112,6 +113,7 @@ def upload_csv(
             body=file_metadata,
             media_body=media,
             fields="id, webViewLink",
+            supportsAllDrives=True,
         ).execute()
 
         file_id = file.get("id")
@@ -174,6 +176,7 @@ def upload_summary(
             body=file_metadata,
             media_body=media,
             fields="id",
+            supportsAllDrives=True,
         ).execute()
 
         # Clean up temp file

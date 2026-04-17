@@ -1,5 +1,4 @@
 playwright>=1.40.0
-2captcha-python>=1.2.0
 python-dotenv>=1.0.0
 apify>=2.0.0
 google-api-python-client>=2.0.0
