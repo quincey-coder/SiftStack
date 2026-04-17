@@ -89,3 +89,12 @@ async def scrape_targets(
             logger.error("  %s/%s scraper failed: %s", county, notice_type, e)
 
     return all_notices
+
+
+# ── Auto-import scraper modules so @register decorators fire ──────────
+# Each module import triggers its @register("County", "type") decorator,
+# populating _REGISTRY without explicit wiring.
+try:
+    from scrapers import foreclosure_travis  # noqa: F401
+except ImportError as e:
+    logger.debug("Could not import foreclosure_travis: %s", e)

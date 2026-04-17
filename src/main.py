@@ -275,9 +275,12 @@ async def actor_main() -> None:
                     Actor.log.warning("Failed to persist seen_notice_ids to KVS: %s", e)
 
             # ── Scrape ────────────────────────────────────────────────
-            # TX scrapers not yet implemented — stub for Phase 2+
-            Actor.log.warning("TX scrapers not yet implemented — returning empty results")
-            notices = []
+            from scrapers import scrape_targets
+            notices = await scrape_targets(
+                targets=[(c, t) for c, t in targets],
+                mode=mode,
+                since_date=since_date_override or None,
+            )
             # Handle async probate lookup before pipeline (requires await)
             probate_notices = [n for n in notices if n.notice_type == "probate" and n.decedent_name and not n.address]
             if probate_notices:
@@ -1661,10 +1664,27 @@ def cli_main() -> None:
 
 def _run_scrape_pipeline(args, targets) -> None:
     """Run the daily/historical scrape → enrich → export → upload pipeline."""
-    # TX scrapers not yet implemented — stub for Phase 2+
-    logging.warning("TX scrapers not yet implemented — returning empty results")
-    logging.info("Targets: %s", ", ".join(f"{c}/{t}" for c, t in targets))
-    notices = []
+    from scrapers import scrape_targets, list_registered
+
+    registered = list_registered()
+    if registered:
+        logging.info("Registered scrapers: %s", ", ".join(f"{c}/{t}" for c, t in registered))
+
+    # Filter to only targets that have registered scrapers
+    runnable = [(c, t) for c, t in targets if (c.lower(), t.lower()) in dict.fromkeys(registered)]
+    skipped = [(c, t) for c, t in targets if (c.lower(), t.lower()) not in dict.fromkeys(registered)]
+    if skipped:
+        logging.warning(
+            "No scraper for: %s (skipping)",
+            ", ".join(f"{c}/{t}" for c, t in skipped),
+        )
+
+    notices = asyncio.run(scrape_targets(
+        targets=runnable,
+        mode=args.mode,
+        since_date=getattr(args, "since", None),
+        max_notices=getattr(args, "max_notices", None),
+    )) if runnable else []
     # Handle async probate lookup before pipeline (requires asyncio.run)
     probate_notices = [n for n in notices if n.notice_type == "probate" and n.decedent_name and not n.address]
     if probate_notices:
