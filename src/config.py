@@ -31,6 +31,7 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 LOG_DIR.mkdir(exist_ok=True)
 
 # ── Credentials ────────────────────────────────────────────────────────
+CAPTCHA_API_KEY = os.getenv("CAPTCHA_API_KEY", "")      # 2Captcha API key (for Odyssey portals)
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")  # Claude Haiku for LLM parsing
 SMARTY_AUTH_ID = os.getenv("SMARTY_AUTH_ID", "")        # Smarty address standardization
 SMARTY_AUTH_TOKEN = os.getenv("SMARTY_AUTH_TOKEN", "")
