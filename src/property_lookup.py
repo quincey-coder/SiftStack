@@ -125,7 +125,8 @@ def _maiden_name_variant(decedent_name: str) -> str | None:
 async def lookup_decedent_properties(notices: list) -> None:
     """Look up property addresses for probate notices with decedent names.
 
-    Stub — TX CAD property lookup not yet implemented (Phase 4).
+    Uses county CAD APIs/data to find the decedent's property address.
+    Currently supports Williamson County (WCAD SODA API).
 
     Args:
         notices: List of NoticeData objects (probate only, with decedent_name set)
@@ -134,8 +135,73 @@ async def lookup_decedent_properties(notices: list) -> None:
         return
 
     candidates = [n for n in notices if n.decedent_name and not n.address]
-    if candidates:
-        logger.info(
-            "Skipping property lookup for %d probate decedents (TX CAD not yet implemented)",
-            len(candidates),
+    if not candidates:
+        return
+
+    logger.info("Looking up property addresses for %d probate decedents...", len(candidates))
+
+    found = 0
+    failed = 0
+
+    for i, notice in enumerate(candidates):
+        search_name = notice.decedent_name.strip()
+        if not search_name:
+            continue
+
+        logger.debug(
+            "[%d/%d] Looking up property for %s (%s County)",
+            i + 1, len(candidates), search_name, notice.county,
         )
+
+        try:
+            from cad_lookup import lookup_property_by_name
+            result = lookup_property_by_name(search_name, notice.county)
+
+            if result and result.get("address"):
+                notice.address = result["address"]
+                notice.city = result.get("city", "")
+                notice.state = "TX"
+                notice.zip = result.get("zip", "")
+                if result.get("parcel_id"):
+                    notice.parcel_id = result["parcel_id"]
+                if result.get("value"):
+                    try:
+                        notice.estimated_value = str(int(float(result["value"])))
+                    except (ValueError, TypeError):
+                        pass
+                found += 1
+                logger.info(
+                    "  Found: %s at %s, %s %s (score: %.2f)",
+                    search_name, notice.address, notice.city, notice.zip,
+                    result.get("match_score", 0),
+                )
+            else:
+                failed += 1
+
+            # Retry with name variations if first attempt fails
+            if not notice.address:
+                short_name = _shorten_search_name(_format_name_for_search(search_name))
+                if short_name:
+                    result = lookup_property_by_name(short_name, notice.county)
+                    if result and result.get("address"):
+                        notice.address = result["address"]
+                        notice.city = result.get("city", "")
+                        notice.state = "TX"
+                        notice.zip = result.get("zip", "")
+                        if result.get("parcel_id"):
+                            notice.parcel_id = result["parcel_id"]
+                        found += 1
+                        failed -= 1
+                        logger.info("  Retry found: %s at %s", search_name, notice.address)
+
+        except Exception as e:
+            logger.warning("  Property lookup failed for %s: %s", search_name, e)
+            failed += 1
+
+        if (i + 1) % 10 == 0:
+            logger.info("Property lookup progress: %d/%d (found=%d, failed=%d)", i + 1, len(candidates), found, failed)
+
+    logger.info(
+        "Property lookup complete: %d found, %d not found (of %d total)",
+        found, failed, len(candidates),
+    )
