@@ -123,3 +123,13 @@ try:
     from scrapers import tax_sale_mvba  # noqa: F401
 except ImportError as e:
     logger.debug("Could not import tax_sale_mvba: %s", e)
+
+try:
+    from scrapers import foreclosure_wilco  # noqa: F401
+except ImportError as e:
+    logger.debug("Could not import foreclosure_wilco: %s", e)
+
+try:
+    from scrapers import foreclosure_bell  # noqa: F401
+except ImportError as e:
+    logger.debug("Could not import foreclosure_bell: %s", e)
