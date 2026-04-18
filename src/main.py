@@ -1027,6 +1027,16 @@ def cli_main() -> None:
         action="store_true",
         help="Enable debug logging",
     )
+    parser.add_argument(
+        "--skip-zip-filter",
+        action="store_true",
+        help="Skip investor zip code filtering (include all zip codes)",
+    )
+    parser.add_argument(
+        "--skip-condo-filter",
+        action="store_true",
+        help="Skip condo/townhouse filtering (include condos)",
+    )
 
     # PDF import arguments
     parser.add_argument(
@@ -1737,6 +1747,8 @@ def _run_scrape_pipeline(args, targets) -> None:
         max_heir_depth=args.max_heir_depth,
         skip_dm_address=args.skip_dm_address,
         tracerfy_tier1=getattr(args, "tracerfy_tier1", False),
+        skip_zip_filter=getattr(args, "skip_zip_filter", False),
+        skip_condo_filter=getattr(args, "skip_condo_filter", False),
         source_label=f"CLI {args.mode}",
     )
     notices = run_enrichment_pipeline(notices, opts)

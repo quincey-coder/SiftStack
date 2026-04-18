@@ -1,0 +1,17 @@
+{
+  "description": "Investor-active zip codes (10+ transactions/month). Edit to add/remove zips.",
+  "generated_from": "DataSift Market Finder 2026-04-17",
+  "threshold": "10+ investor transactions per month",
+  "Travis": [
+    "78660", "78744", "78747", "78653", "78745", "78704", "78645", "78746",
+    "78702", "78621", "78723", "78738", "78725", "78734", "78701", "78705"
+  ],
+  "Bell": [
+    "76542", "76502", "76513", "76504", "76549", "76571", "76543", "76541"
+  ],
+  "Williamson": [
+    "78634", "78628", "78633", "78641", "76537", "78642", "78613", "78681",
+    "78664", "78665"
+  ],
+  "custom": []
+}

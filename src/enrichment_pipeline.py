@@ -36,6 +36,8 @@ class PipelineOptions:
     skip_entity_filter: bool = False
     skip_entity_research: bool = True   # opt-in via --research-entities
     skip_commercial_filter: bool = False
+    skip_zip_filter: bool = False
+    skip_condo_filter: bool = False
     skip_parcel_lookup: bool = False
     skip_tax: bool = False
     skip_smarty: bool = False
@@ -156,6 +158,40 @@ def _filter_entity_owners(notices: list[NoticeData]) -> list[NoticeData]:
             logger.info("    - %s", name)
         if len(removed_names) > 10:
             logger.info("    ... and %d more", len(removed_names) - 10)
+    return result
+
+
+def _detect_condo(notice: NoticeData) -> bool:
+    """Check if a notice looks like a condo/townhouse from text and type."""
+    # Layer 1: Zillow property type (most reliable, set after Zillow enrichment)
+    if notice.property_type:
+        ptype = notice.property_type.lower()
+        if ptype in ("condo", "townhouse", "apartment"):
+            return True
+
+    # Layer 2: Address contains unit/apt indicator
+    addr = (notice.address or "").upper()
+    if re.search(r"#\s*\d+", addr) or re.search(r"\bAPT\s+\d+", addr):
+        return True
+
+    # Layer 3: Raw text / legal description keywords
+    text = (notice.raw_text or "").upper()
+    if re.search(r"\bCONDO(?:MINIUM)?\b", text):
+        return True
+    # "UNIT NNN" in legal description (but not subdivision names like "UNIT ONE")
+    if re.search(r"\bUNIT\s+\d+", text) and re.search(r"\bBLDG\b|\bBUILDING\b|\bFLOOR\b", text):
+        return True
+
+    return False
+
+
+def _filter_condos(notices: list[NoticeData]) -> list[NoticeData]:
+    """Remove condos, townhouses, and apartment units."""
+    before = len(notices)
+    result = [n for n in notices if not _detect_condo(n)]
+    removed = before - len(result)
+    if removed:
+        logger.info("  Removed %d condo/townhouse/apartment records", removed)
     return result
 
 
@@ -306,6 +342,26 @@ def run_enrichment_pipeline(
         len(notices),
         f" (removed {removed})" if removed else "",
     )
+
+    # ── Step 2a: Investor Zip Code Filter ─────────────────────────────
+    if not opts.skip_zip_filter:
+        logger.info("── Step 2a: Investor Zip Code Filter ──")
+        try:
+            from zip_filter import load_target_zips, filter_by_target_zips
+            target_zips = load_target_zips()
+            if target_zips:
+                before = len(notices)
+                notices = filter_by_target_zips(notices, target_zips)
+                logger.info("  %d records after zip filter", len(notices))
+            else:
+                logger.info("  No target zips configured — skipping")
+        except ImportError:
+            logger.warning("  zip_filter module not found — skipping")
+    else:
+        logger.info("── Step 2a: Investor Zip Code Filter (skipped) ──")
+    if not notices:
+        logger.warning("No records remaining after zip filtering")
+        return notices
 
     # ── Step 3: Vacant Land Filter ───────────────────────────────────
     if not opts.skip_vacant_filter:
@@ -507,6 +563,15 @@ def run_enrichment_pipeline(
         )
     elif opts.skip_zillow:
         logger.info("── Step 8: Zillow (skipped) ──")
+
+    # ── Step 8a: Condo Filter ─────────────────────────────────────────
+    if not opts.skip_condo_filter:
+        logger.info("── Step 8a: Condo/Townhouse Filter ──")
+        before = len(notices)
+        notices = _filter_condos(notices)
+        logger.info("  %d records after condo filter", len(notices))
+    else:
+        logger.info("── Step 8a: Condo Filter (skipped) ──")
 
     # ── Step 9: Obituary Enrichment ──────────────────────────────────
     if not opts.skip_obituary and not opts.has_obituary:
