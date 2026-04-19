@@ -24,7 +24,7 @@ PHOTO_STATE_FILE = PROJECT_ROOT / "photo_state.json"
 
 # ── Dropbox Watcher ────────────────────────────────────────────────────
 DROPBOX_POLL_INTERVAL = int(os.getenv("DROPBOX_POLL_INTERVAL", "900"))  # seconds (default 15 min)
-DROPBOX_ROOT_FOLDER = os.getenv("DROPBOX_ROOT_FOLDER", "")  # root folder path in Dropbox, e.g. "/TN Public Notice"
+DROPBOX_ROOT_FOLDER = os.getenv("DROPBOX_ROOT_FOLDER", "")  # root folder path in Dropbox, e.g. "/TX County Data"
 DROPBOX_STORAGE_WARN_PERCENT = 80  # warn when storage usage exceeds this %
 
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -62,6 +62,14 @@ OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/ap
 REQUEST_DELAY_MIN = 2.0  # seconds between requests
 REQUEST_DELAY_MAX = 3.0
 MAX_RETRIES = 3
+
+# ── Per-Run Spending Caps (USD) ────────────────────────────────────────
+# Hard limits to prevent API cost runaway. When hit, the relevant step stops
+# making more calls and logs a warning. Override via env vars if needed.
+MAX_TRACERFY_COST_USD = float(os.getenv("MAX_TRACERFY_COST_USD", "100.0"))
+MAX_ZILLOW_COST_USD = float(os.getenv("MAX_ZILLOW_COST_USD", "100.0"))
+TRACERFY_COST_PER_RECORD = 0.02  # batch endpoint pricing
+ZILLOW_COST_PER_LOOKUP = 0.01    # OpenWeb Ninja pricing after free tier
 
 # ── Image Processing ───────────────────────────────────────────────────
 BLUR_THRESHOLD = int(os.getenv("BLUR_THRESHOLD", "100"))   # Laplacian variance; below = rejected as blurry

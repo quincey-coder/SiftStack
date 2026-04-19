@@ -14,6 +14,7 @@ from datetime import date, datetime
 
 import requests
 
+import config as cfg
 from notice_parser import NoticeData
 
 logger = logging.getLogger(__name__)
@@ -297,9 +298,21 @@ def enrich_properties(
     enriched = 0
     failed = 0
     skipped = len(notices) - len(eligible)
+    cap_skipped = 0
     equity_values: list[float] = []
+    spent = 0.0
 
     for idx, (orig_idx, notice) in enumerate(eligible):
+        # Spending cap: stop calling Zillow once we'd exceed the cap
+        if spent + cfg.ZILLOW_COST_PER_LOOKUP > cfg.MAX_ZILLOW_COST_USD:
+            cap_skipped = len(eligible) - idx
+            logger.warning(
+                "Zillow spending cap of $%.2f reached after %d lookups ($%.2f spent). "
+                "Skipping remaining %d records. Increase MAX_ZILLOW_COST_USD to enrich more.",
+                cfg.MAX_ZILLOW_COST_USD, idx, spent, cap_skipped,
+            )
+            break
+
         if idx > 0:
             delay = random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX)
             time.sleep(delay)
@@ -308,6 +321,7 @@ def enrich_properties(
             notice.address, notice.city, notice.state, notice.zip,
             api_key,
         )
+        spent += cfg.ZILLOW_COST_PER_LOOKUP
 
         if data is None:
             failed += 1
@@ -334,9 +348,10 @@ def enrich_properties(
     if equity_values:
         avg = sum(equity_values) / len(equity_values)
         avg_equity = f", avg equity=${avg:,.0f}"
+    cap_msg = f", {cap_skipped} skipped (spending cap)" if cap_skipped else ""
     logger.info(
-        "Zillow enrichment complete: %d enriched, %d failed, %d skipped%s",
-        enriched, failed, skipped, avg_equity,
+        "Zillow enrichment complete: %d enriched, %d failed, %d skipped (no addr)%s, $%.2f spent",
+        enriched, failed, skipped, cap_msg + avg_equity, spent,
     )
 
     return notices

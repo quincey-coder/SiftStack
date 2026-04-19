@@ -259,6 +259,21 @@ def batch_skip_trace(
         logger.info("Tracerfy: no records to skip-trace (all have phones or no valid names)")
         return stats
 
+    # ── Spending cap enforcement ─────────────────────────────────────────
+    # Truncate batch if it would exceed MAX_TRACERFY_COST_USD.
+    estimated_cost = len(lookup_map) * cfg.TRACERFY_COST_PER_RECORD
+    if estimated_cost > cfg.MAX_TRACERFY_COST_USD:
+        max_records = int(cfg.MAX_TRACERFY_COST_USD / cfg.TRACERFY_COST_PER_RECORD)
+        logger.warning(
+            "Tracerfy batch would cost $%.2f, exceeding cap of $%.2f. "
+            "Truncating from %d to %d records. Increase MAX_TRACERFY_COST_USD to skip more.",
+            estimated_cost, cfg.MAX_TRACERFY_COST_USD,
+            len(lookup_map), max_records,
+        )
+        lookup_map = lookup_map[:max_records]
+        stats["cost_capped"] = True
+        stats["records_skipped_due_to_cap"] = stats.get("records_skipped_due_to_cap", 0) + (estimated_cost / cfg.TRACERFY_COST_PER_RECORD - max_records)
+
     stats["submitted"] = len(lookup_map)
     stats["signing_heirs_traced"] = sum(
         1 for n, _, _, _, _, _, hk in lookup_map
@@ -268,7 +283,7 @@ def batch_skip_trace(
                 len(lookup_map),
                 len(set(id(n) for n, *_ in lookup_map)),
                 stats["signing_heirs_traced"],
-                len(lookup_map) * 0.02)
+                len(lookup_map) * cfg.TRACERFY_COST_PER_RECORD)
 
     # Build in-memory CSV
     csv_buffer = io.StringIO()
