@@ -28,7 +28,7 @@ REGIONAL_MULTIPLIERS = {
     "williamson": 0.93,
     "national": 1.00,
 }
-DEFAULT_REGION = "knoxville"
+DEFAULT_REGION = "austin"
 
 # ── 4-Tier Finish System ─────────────────────────────────────────────
 # Cost per sqft by tier (national average, before regional multiplier)

@@ -9,7 +9,7 @@ Output:
   - Script templates (per notice type × channel)
 
 Usage:
-  python src/main.py playbook --blueprint wholesale --market knoxville --team-size 1
+  python src/main.py playbook --blueprint wholesale --market austin --team-size 1
 """
 
 import logging
@@ -287,7 +287,7 @@ DAILY_CHECKLIST = {
 
 # ── Playbook generation ──────────────────────────────────────────────
 
-def generate_playbook(blueprint: str = "wholesale", market: str = "knoxville",
+def generate_playbook(blueprint: str = "wholesale", market: str = "austin",
                       team_size: int = 1, output_path: str = "") -> str:
     """Generate a comprehensive acquisition playbook as Markdown.
 
@@ -425,7 +425,7 @@ def generate_playbook(blueprint: str = "wholesale", market: str = "knoxville",
 
 # ── Main entry point ──────────────────────────────────────────────────
 
-def run_playbook_generator(blueprint: str = "wholesale", market: str = "knoxville",
+def run_playbook_generator(blueprint: str = "wholesale", market: str = "austin",
                            team_size: int = 1, output_path: str = "") -> dict:
     """Generate acquisition playbook.
 

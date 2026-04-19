@@ -32,10 +32,10 @@ class PipelineOptions:
 
     # Step skip flags (default: run everything)
     skip_filter_sold: bool = True  # only CSV re-import sets False
-    skip_vacant_filter: bool = False
-    skip_entity_filter: bool = False
-    skip_entity_research: bool = True   # opt-in via --research-entities
-    skip_commercial_filter: bool = False
+    skip_vacant_filter: bool = True    # keep vacant land — investor opportunity
+    skip_entity_filter: bool = True    # keep LLC/Corp owners — manual skip trace
+    skip_entity_research: bool = True  # opt-in via --research-entities
+    skip_commercial_filter: bool = True  # keep commercial properties
     skip_zip_filter: bool = False
     skip_condo_filter: bool = False
     skip_parcel_lookup: bool = False
@@ -409,7 +409,7 @@ def run_enrichment_pipeline(
         if n.notice_type == "probate"
         and not n.address.strip()
         and n.decedent_name.strip()
-        and n.county.lower() == "knox"
+        and n.county.lower() in ("travis", "bell", "williamson")
     ]
     if probate_no_addr:
         logger.info("── Step 3c: Probate Property Lookup (%d candidates) ──", len(probate_no_addr))
@@ -428,7 +428,7 @@ def run_enrichment_pipeline(
         candidates = [
             n
             for n in notices
-            if n.parcel_id.strip() and n.county.lower() == "knox"
+            if n.parcel_id.strip() and n.county.lower() in ("travis", "bell", "williamson")
         ]
         if candidates:
             logger.info(

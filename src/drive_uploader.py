@@ -101,7 +101,7 @@ def upload_csv(
         service = _build_service(service_account_key_b64)
 
         date_str = datetime.now().strftime("%Y-%m-%d")
-        drive_filename = f"TN_Notices_{date_str}_{record_count}_records.csv"
+        drive_filename = f"TX_Notices_{date_str}_{record_count}_records.csv"
 
         file_metadata = {
             "name": drive_filename,
@@ -142,7 +142,7 @@ def upload_summary(
         service = _build_service(service_account_key_b64)
 
         date_str = datetime.now().strftime("%Y-%m-%d")
-        summary_filename = f"TN_Notices_{date_str}_summary.txt"
+        summary_filename = f"TX_Notices_{date_str}_summary.txt"
 
         # Build summary content
         lines = [

@@ -193,7 +193,7 @@ def _reverse_geocode(lat: str, lon: str) -> dict | None:
     try:
         resp = requests.get(
             url,
-            headers={"User-Agent": "TN-Notice-Scraper/1.0"},
+            headers={"User-Agent": "SiftStack/1.0"},
             timeout=10,
         )
         if resp.status_code != 200:

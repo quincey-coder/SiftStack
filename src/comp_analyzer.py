@@ -4,8 +4,8 @@ Generates appraiser-grade property valuations for real estate investment
 analysis. Fetches comparable sales from the Zillow API, applies property-
 specific adjustments, and produces a 7-tab Excel workbook.
 
-Texas is a non-disclosure state — MLS/Zillow data is the primary
-source, not public deed records.
+Texas is a disclosure state — actual sale prices are in public deed
+records. MLS/Zillow data supplements with DOM, listing history, etc.
 
 Usage:
   python src/main.py comp --address "123 Main St, Austin, TX 78701"
@@ -457,14 +457,12 @@ def _apply_adjustments(comp: CompProperty, adjustments: dict) -> float:
 def _classify_bucket(comp: CompProperty) -> str:
     """Classify comp into Bucket A or Bucket B.
 
-    Bucket A: Non-disclosure baseline comps — properties with limited price
-              transparency (typical in TN as a non-disclosure state).
-              Uses Zillow/MLS-reported data as proxy.
-    Bucket B: Disclosure/verified comps — properties with confirmed sale
+    Bucket A: Off-market baseline comps — properties with limited listing
+              data (FSBO, off-market, investor sales).
+    Bucket B: MLS-verified comps — properties with confirmed sale
               prices from MLS (listed and sold through agent).
 
-    In practice for TN (non-disclosure state), all comps come through
-    Zillow/MLS so we classify based on data completeness:
+    Classification is based on data completeness:
     - Bucket B: Has complete MLS data (sold through agent, DOM tracked)
     - Bucket A: Limited data (off-market sale, FSBO, etc.)
     """
@@ -812,7 +810,7 @@ def generate_comp_report(subject: SubjectProperty, comps: list[CompProperty],
     ws6.cell(row=3, column=1, value="Methodology").font = _SUBTITLE_FONT
     ws6.cell(row=4, column=1, value="Bucket A (Non-Disclosure): 30% weight — Off-market/FSBO sales with limited price transparency").font = _LABEL_FONT
     ws6.cell(row=5, column=1, value="Bucket B (Disclosure/MLS): 70% weight — Agent-listed sales with confirmed pricing").font = _LABEL_FONT
-    ws6.cell(row=6, column=1, value="Texas is a non-disclosure state. All data sourced via Zillow/MLS.").font = _LABEL_FONT
+    ws6.cell(row=6, column=1, value="Texas is a disclosure state. Sale prices from public records, supplemented by Zillow/MLS.").font = _LABEL_FONT
 
     ws6.cell(row=8, column=1, value="Bucket A Comps").font = _SUBTITLE_FONT
     bucket_a = [c for c in comps[:MAX_COMPS] if c.bucket == "A"]

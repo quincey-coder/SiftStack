@@ -1088,7 +1088,7 @@ def _parse_pr_address(notice: NoticeData) -> None:
         notice.owner_state = "TX"
         notice.owner_zip = match.group(3)
         logger.debug(
-            "PR address: %s, %s, TN %s",
+            "PR address: %s, %s, TX %s",
             notice.owner_street, notice.owner_city, notice.owner_zip,
         )
 

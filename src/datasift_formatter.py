@@ -229,7 +229,7 @@ def _build_tags(notice: NoticeData) -> str:
     Tags include:
     - Courthouse Data (all records — for niche sequential filter presets)
     - notice_type (foreclosure, tax_sale, probate, tax_delinquent)
-    - county (knox, blount)
+    - county (travis, bell, williamson)
     - YYYY-MM date tag
     - deceased/living status
     - DM confidence level (for deceased records)
