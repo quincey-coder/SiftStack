@@ -394,6 +394,12 @@ def _is_obituary_url(url: str) -> bool:
     return False
 
 
+# DDGS wraps primp (a Rust HTTP lib) which deadlocks under concurrent calls
+# from multiple Python threads. Serialize the search itself with this lock;
+# the expensive work (page fetch + LLM parse) still runs in parallel.
+_ddgs_lock = threading.Lock()
+
+
 def _search_obituary(name: str, city: str, extra_terms: str = "") -> list[dict]:
     """Search DuckDuckGo for obituary pages matching the person.
 
@@ -409,7 +415,8 @@ def _search_obituary(name: str, city: str, extra_terms: str = "") -> list[dict]:
     query = f'{name} {keyword} Texas' if not city else f'{name} {keyword} {city} Texas'
 
     try:
-        results = DDGS().text(query, max_results=8, backend="google,duckduckgo,brave")
+        with _ddgs_lock:
+            results = DDGS().text(query, max_results=8, backend="google,duckduckgo,brave")
     except Exception as e:
         logger.debug("Search failed for '%s': %s", query, e)
         return []
@@ -2054,6 +2061,217 @@ def _apply_obituary_match(
         notice.missing_data_flags = "|".join(flags)
 
 
+def _process_one_candidate(
+    notice: "NoticeData",
+    raw_name: str,
+    is_tax_name: bool,
+    api_key: str,
+    search_cache: dict,
+    cache_lock: threading.Lock,
+) -> dict:
+    """Phase A worker: run obituary search + LLM parse for one owner name.
+
+    Returns a result dict the main thread uses to update shared state.
+    Mutates `notice.owner_deceased` only when a match is confirmed — each
+    notice is owned by a single worker so no cross-thread write conflict.
+
+    Result dict fields:
+      status: 'confirmed' | 'cache_hit_dead' | 'cache_hit_alive' | 'no_match' | 'skipped'
+      parsed, url, source_type: set when status in {'confirmed','cache_hit_dead'}
+      raw_name, is_tax_name, notice: echoed for the caller's matches list
+      search_name: last name actually searched (for logging)
+      searched_queries: int — number of live DDG/Serper calls issued
+      miss_reason: 'no_results' | 'fetch_failed' | 'llm_rejected' | None
+    """
+    result = {
+        "notice": notice,
+        "raw_name": raw_name,
+        "is_tax_name": is_tax_name,
+        "status": None,
+        "parsed": None,
+        "url": None,
+        "source_type": None,
+        "search_name": "",
+        "searched_queries": 0,
+        "miss_reason": None,
+    }
+
+    if is_tax_name:
+        search_names = parse_tax_owner_name(raw_name)
+    else:
+        search_names = _parse_notice_owner_name(raw_name)
+    if not search_names:
+        result["status"] = "skipped"
+        return result
+
+    city = notice.city.strip() or "Austin"
+    last_cache_key = ""
+    last_results_empty = None
+    last_any_fetch_succeeded = False
+
+    for search_name in search_names[:2]:
+        cache_key = search_name.lower().strip()
+        last_cache_key = cache_key
+        result["search_name"] = search_name
+
+        with cache_lock:
+            cached_present = cache_key in search_cache
+            cached_val = search_cache.get(cache_key)
+
+        if cached_present:
+            if cached_val is not None:
+                c_parsed, c_url, c_source = cached_val
+                notice.owner_deceased = "yes"
+                result["status"] = "cache_hit_dead"
+                result["parsed"] = c_parsed
+                result["url"] = c_url
+                result["source_type"] = c_source
+                return result
+            else:
+                result["status"] = "cache_hit_alive"
+                return result
+
+        results = _search_obituary(search_name, city)
+        no_city_results = _search_obituary(search_name, "")
+        seen_urls = {r["url"] for r in results}
+        for r in no_city_results:
+            if r["url"] not in seen_urls:
+                results.append(r)
+                seen_urls.add(r["url"])
+        result["searched_queries"] += 1
+
+        if not results:
+            parts = search_name.split()
+            if len(parts) == 3:
+                name_no_mi = f"{parts[0]} {parts[2]}"
+                results = _search_obituary(name_no_mi, city)
+
+        if not results:
+            parts = search_name.split()
+            first = parts[0] if parts else ""
+            last = parts[-1] if len(parts) >= 2 else ""
+            if first and last:
+                for variant in _get_name_variants(first):
+                    nick_name = f"{variant} {last}".title()
+                    results = _search_obituary(nick_name, city)
+                    if results:
+                        break
+
+        if not results:
+            results = _search_obituary(
+                search_name, city,
+                extra_terms='"death notice" OR "funeral"',
+            )
+
+        if not results:
+            last_results_empty = True
+            last_any_fetch_succeeded = False
+            time.sleep(random.uniform(SEARCH_DELAY_MIN, SEARCH_DELAY_MAX))
+            continue
+
+        last_results_empty = False
+        best_snippet_result = None
+        any_fetch_succeeded = False
+        parsed_match = None
+        matched_url = None
+        matched_source = None
+
+        for r_item in results:
+            page_text = _fetch_page_text(r_item["url"])
+            if not page_text or len(page_text) < 100:
+                if not best_snippet_result and r_item.get("snippet"):
+                    best_snippet_result = r_item
+                continue
+            any_fetch_succeeded = True
+
+            time.sleep(random.uniform(0.5, 1.0))
+
+            parsed = _parse_obituary_with_llm(
+                obituary_text=page_text,
+                owner_name=search_name,
+                city=city,
+                address=notice.address,
+                api_key=api_key,
+            )
+
+            if parsed and parsed.get("confidence") in ("high", "medium"):
+                if not _dod_sanity_check(parsed.get("date_of_death", ""), notice):
+                    continue
+                parsed["_raw_obituary_text"] = page_text
+                parsed["_search_name"] = search_name
+                parsed_match = parsed
+                matched_url = r_item["url"]
+                matched_source = "full_page"
+                break
+
+        last_any_fetch_succeeded = any_fetch_succeeded
+
+        if parsed_match:
+            notice.owner_deceased = "yes"
+            with cache_lock:
+                search_cache[cache_key] = (parsed_match, matched_url, matched_source)
+            result["status"] = "confirmed"
+            result["parsed"] = parsed_match
+            result["url"] = matched_url
+            result["source_type"] = matched_source
+            return result
+
+        if best_snippet_result:
+            snippet_text = (
+                f"Search result title: {best_snippet_result['title']}\n"
+                f"URL: {best_snippet_result['url']}\n"
+                f"Snippet: {best_snippet_result['snippet']}"
+            )
+            for r_item in results:
+                if r_item["url"] != best_snippet_result["url"] and r_item.get("snippet"):
+                    snippet_text += f"\n\nAdditional result: {r_item['title']}\nSnippet: {r_item['snippet']}"
+
+            parsed = _parse_obituary_with_llm(
+                obituary_text=snippet_text,
+                owner_name=search_name,
+                city=city,
+                address=notice.address,
+                api_key=api_key,
+            )
+
+            _conf = parsed.get("confidence", "") if parsed else ""
+            _snippet_ok = _conf == "high" or (
+                _conf == "medium"
+                and parsed.get("full_name", "").strip()
+                and parsed.get("date_of_death", "").strip()
+            )
+            if parsed and _snippet_ok:
+                if not _dod_sanity_check(parsed.get("date_of_death", ""), notice):
+                    parsed = None
+                    _snippet_ok = False
+            if parsed and _snippet_ok:
+                notice.owner_deceased = "yes"
+                with cache_lock:
+                    search_cache[cache_key] = (parsed, best_snippet_result["url"], "snippet")
+                result["status"] = "confirmed"
+                result["parsed"] = parsed
+                result["url"] = best_snippet_result["url"]
+                result["source_type"] = "snippet"
+                return result
+
+    # No match across all attempted search_names
+    result["status"] = "no_match"
+    if last_cache_key and result["searched_queries"] > 0:
+        with cache_lock:
+            if last_cache_key not in search_cache:
+                search_cache[last_cache_key] = None
+
+    if last_results_empty is True or last_results_empty is None:
+        result["miss_reason"] = "no_results"
+    elif not last_any_fetch_succeeded:
+        result["miss_reason"] = "fetch_failed"
+    else:
+        result["miss_reason"] = "llm_rejected"
+
+    time.sleep(random.uniform(SEARCH_DELAY_MIN, SEARCH_DELAY_MAX))
+    return result
+
+
 def enrich_obituary_data(
     notices: list[NoticeData],
     api_key: str,
@@ -2062,6 +2280,7 @@ def enrich_obituary_data(
     skip_dm_address: bool = False,
     tracerfy_tier1: bool = False,
     skip_ancestry: bool = False,
+    workers: int = 4,
 ) -> None:
     """Search for obituaries and enrich notices with deceased owner data.
 
@@ -2129,10 +2348,10 @@ def enrich_obituary_data(
 
     probate_preset_count = 0
 
-    for i, (notice, raw_name, is_tax_name) in enumerate(candidates, 1):
-        # Probate executor pre-set: use named PR as DM when available.
-        # Courthouse terminal records have PR name but no address — still use preset
-        # to avoid overriding the court-named PR with a wrong obituary match.
+    # First pass (sequential): probate presets require no API calls, and pulling
+    # them out keeps the parallel section homogeneous (all do live searches).
+    parallel_candidates: list[tuple["NoticeData", str, bool]] = []
+    for notice, raw_name, is_tax_name in candidates:
         if (
             notice.notice_type == "probate"
             and notice.owner_name
@@ -2151,218 +2370,94 @@ def enrich_obituary_data(
             confirmed += 1
             probate_preset_count += 1
             logger.info(
-                "  [%d/%d] Probate preset: executor=%s, decedent=%s",
-                i, len(candidates), notice.owner_name, notice.decedent_name,
+                "  Probate preset: executor=%s, decedent=%s",
+                notice.owner_name, notice.decedent_name,
             )
             continue
+        parallel_candidates.append((notice, raw_name, is_tax_name))
 
-        if is_tax_name:
-            search_names = parse_tax_owner_name(raw_name)
-        else:
-            search_names = _parse_notice_owner_name(raw_name)
-        if not search_names:
-            skipped += 1
-            continue
+    # Parallel pass: live obituary search + LLM parse.
+    # Thread-safe cache + counter locks guard shared state.
+    cache_lock = threading.Lock()
+    counter_lock = threading.Lock()
+    total_parallel = len(parallel_candidates)
+    logger.info(
+        "Phase A parallel: %d candidates across %d workers (%d probate presets handled sequentially)",
+        total_parallel, workers, probate_preset_count,
+    )
 
-        city = notice.city.strip() or "Austin"
-        found = False
+    if parallel_candidates:
+        processed = 0
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [
+                pool.submit(
+                    _process_one_candidate,
+                    n, raw_name, is_tax_name,
+                    api_key, search_cache, cache_lock,
+                )
+                for n, raw_name, is_tax_name in parallel_candidates
+            ]
+            for future in as_completed(futures):
+                result = future.result()
+                status = result["status"]
+                search_name = result["search_name"] or result["raw_name"]
 
-        for search_name in search_names[:2]:  # Primary + secondary (joint owner)
-            # Check cache — same owner name across multiple notices
-            cache_key = search_name.lower().strip()
-            if cache_key in search_cache:
-                cached = search_cache[cache_key]
-                cache_hits += 1
-                if cached is not None:
-                    c_parsed, c_url, c_source = cached
-                    matches.append((notice, c_parsed, c_url, c_source, raw_name, is_tax_name))
-                    confirmed += 1
-                    found = True
-                    logger.debug("  [%d/%d] %s: cache hit (deceased)", i, len(candidates), search_name)
-                else:
-                    logger.debug("  [%d/%d] %s: cache hit (no match)", i, len(candidates), search_name)
-                break
+                with counter_lock:
+                    processed += 1
+                    searched += result["searched_queries"]
 
-            # Run primary + no-city searches and merge results (dedup by URL)
-            results = _search_obituary(search_name, city)
-            no_city_results = _search_obituary(search_name, "")
-            seen_urls = {r["url"] for r in results}
-            for r in no_city_results:
-                if r["url"] not in seen_urls:
-                    results.append(r)
-                    seen_urls.add(r["url"])
-            searched += 1
-
-            if not results:
-                # Fallback 2: drop middle initial ("Daniel H Williams" → "Daniel Williams")
-                # Some sites only index first + last; middle initial reduces recall
-                parts = search_name.split()
-                if len(parts) == 3:
-                    name_no_mi = f"{parts[0]} {parts[2]}"
-                    results = _search_obituary(name_no_mi, city)
-                    if results:
+                    if status == "confirmed":
+                        matches.append((
+                            result["notice"], result["parsed"], result["url"],
+                            result["source_type"], result["raw_name"], result["is_tax_name"],
+                        ))
+                        confirmed += 1
+                        logger.info(
+                            "  [%d/%d] %s: DECEASED (%s, DOD: %s)",
+                            processed, total_parallel, search_name,
+                            result["source_type"],
+                            (result["parsed"] or {}).get("date_of_death", "unknown"),
+                        )
+                    elif status == "cache_hit_dead":
+                        matches.append((
+                            result["notice"], result["parsed"], result["url"],
+                            result["source_type"], result["raw_name"], result["is_tax_name"],
+                        ))
+                        confirmed += 1
+                        cache_hits += 1
                         logger.debug(
-                            "  [%d/%d] %s: fallback query (no MI) found %d results",
-                            i, len(candidates), name_no_mi, len(results),
+                            "  [%d/%d] %s: cache hit (deceased)",
+                            processed, total_parallel, search_name,
+                        )
+                    elif status == "cache_hit_alive":
+                        cache_hits += 1
+                        logger.debug(
+                            "  [%d/%d] %s: cache hit (no match)",
+                            processed, total_parallel, search_name,
+                        )
+                    elif status == "skipped":
+                        skipped += 1
+                    elif status == "no_match":
+                        reason = result["miss_reason"]
+                        if reason == "no_results":
+                            miss_no_results += 1
+                        elif reason == "fetch_failed":
+                            miss_fetch_failed += 1
+                        elif reason == "llm_rejected":
+                            miss_llm_rejected += 1
+                        logger.debug(
+                            "  [%d/%d] %s: no obituary match (%s)",
+                            processed, total_parallel, search_name, reason,
                         )
 
-            if not results:
-                # Fallback 3: try nickname variants ("Robert" → "Bob", etc.)
-                parts = search_name.split()
-                first = parts[0] if parts else ""
-                last = parts[-1] if len(parts) >= 2 else ""
-                if first and last:
-                    for variant in _get_name_variants(first):
-                        nick_name = f"{variant} {last}".title()
-                        results = _search_obituary(nick_name, city)
-                        if results:
-                            logger.debug(
-                                "  [%d/%d] %s: nickname fallback (%s) found %d results",
-                                i, len(candidates), search_name, nick_name, len(results),
-                            )
-                            break
-
-            if not results:
-                # Fallback 4: "death notice" / funeral home query
-                results = _search_obituary(
-                    search_name, city,
-                    extra_terms='"death notice" OR "funeral"',
-                )
-                if results:
-                    logger.debug(
-                        "  [%d/%d] %s: death notice fallback found %d results",
-                        i, len(candidates), search_name, len(results),
-                    )
-
-            if not results:
-                logger.debug("  [%d/%d] %s: no obituary results", i, len(candidates), search_name)
-                time.sleep(random.uniform(SEARCH_DELAY_MIN, SEARCH_DELAY_MAX))
-                continue
-
-            # Try each result — fetch full page, then LLM parse
-            best_snippet_result = None
-            any_fetch_succeeded = False
-            for result in results:
-                page_text = _fetch_page_text(result["url"])
-                if not page_text or len(page_text) < 100:
-                    if not best_snippet_result and result.get("snippet"):
-                        best_snippet_result = result
-                    continue
-                any_fetch_succeeded = True
-
-                time.sleep(random.uniform(0.5, 1.0))
-
-                parsed = _parse_obituary_with_llm(
-                    obituary_text=page_text,
-                    owner_name=search_name,
-                    city=city,
-                    address=notice.address,
-                    api_key=api_key,
-                )
-
-                if parsed and parsed.get("confidence") in ("high", "medium"):
-                    # DOD sanity check — reject matches where death is implausibly old
-                    if not _dod_sanity_check(parsed.get("date_of_death", ""), notice):
+                    if processed % 25 == 0:
                         logger.info(
-                            "  [%d/%d] %s: Rejected obituary (DOD too far from filing date)",
-                            i, len(candidates), search_name,
+                            "Phase A progress: %d/%d (confirmed=%d, cache_hits=%d)",
+                            processed, total_parallel, confirmed, cache_hits,
                         )
-                        continue  # try next search result
-                    # Store raw text for second-pass aggressive extraction in build_heir_map()
-                    parsed["_raw_obituary_text"] = page_text
-                    parsed["_search_name"] = search_name
-                    # Mark deceased now (Phase A.5 checks this to skip resolved candidates)
-                    notice.owner_deceased = "yes"
-                    # Store for Phase B heir processing
-                    matches.append((notice, parsed, result["url"], "full_page", raw_name, is_tax_name))
-                    search_cache[cache_key] = (parsed, result["url"], "full_page")
-                    confirmed += 1
-                    found = True
-                    logger.info(
-                        "  [%d/%d] %s: DECEASED (DOD: %s)",
-                        i, len(candidates), search_name,
-                        parsed.get("date_of_death", "unknown"),
-                    )
-                    break
-
-            # Snippet fallback
-            if not found and best_snippet_result:
-                snippet_text = (
-                    f"Search result title: {best_snippet_result['title']}\n"
-                    f"URL: {best_snippet_result['url']}\n"
-                    f"Snippet: {best_snippet_result['snippet']}"
-                )
-                for r in results:
-                    if r["url"] != best_snippet_result["url"] and r.get("snippet"):
-                        snippet_text += f"\n\nAdditional result: {r['title']}\nSnippet: {r['snippet']}"
-
-                logger.debug("  Page fetches failed, trying snippet fallback for %s", search_name)
-                parsed = _parse_obituary_with_llm(
-                    obituary_text=snippet_text,
-                    owner_name=search_name,
-                    city=city,
-                    address=notice.address,
-                    api_key=api_key,
-                )
-
-                _conf = parsed.get("confidence", "") if parsed else ""
-                _snippet_ok = _conf == "high" or (
-                    _conf == "medium"
-                    and parsed.get("full_name", "").strip()
-                    and parsed.get("date_of_death", "").strip()
-                )
-                if parsed and _snippet_ok:
-                    # DOD sanity check — reject matches where death is implausibly old
-                    if not _dod_sanity_check(parsed.get("date_of_death", ""), notice):
-                        logger.info(
-                            "  [%d/%d] %s: Rejected snippet match (DOD too far from filing date)",
-                            i, len(candidates), search_name,
-                        )
-                        parsed = None
-                        _snippet_ok = False
-                if parsed and _snippet_ok:
-                    # Mark deceased now (Phase A.5 checks this to skip resolved candidates)
-                    notice.owner_deceased = "yes"
-                    matches.append((notice, parsed, best_snippet_result["url"], "snippet", raw_name, is_tax_name))
-                    search_cache[cache_key] = (parsed, best_snippet_result["url"], "snippet")
-                    confirmed += 1
-                    found = True
-                    logger.info(
-                        "  [%d/%d] %s: DECEASED (snippet/%s, DOD: %s)",
-                        i, len(candidates), search_name, _conf,
-                        parsed.get("date_of_death", "unknown"),
-                    )
-
-            if found:
-                break
-
-        # Cache miss for this name
-        if not found and cache_key and cache_key not in search_cache:
-            search_cache[cache_key] = None
-
-        if not found and searched > 0:
-            logger.debug(
-                "  [%d/%d] %s: no obituary match", i, len(candidates),
-                search_names[0] if search_names else raw_name,
-            )
-            # Track WHY the record failed (for end-of-phase diagnostic summary)
-            if not results:
-                miss_no_results += 1
-            elif not any_fetch_succeeded:
-                miss_fetch_failed += 1
-            else:
-                miss_llm_rejected += 1
-
-        if i % 25 == 0:
-            logger.info(
-                "Phase A progress: %d/%d (confirmed=%d, searched=%d)",
-                i, len(candidates), confirmed, searched,
-            )
-
-        time.sleep(random.uniform(SEARCH_DELAY_MIN, SEARCH_DELAY_MAX))
 
     logger.info(
-        "Phase A complete: %d confirmed deceased (%d probate preset), %d searched, %d skipped, %d cache hits | "
+        "Phase A complete: %d confirmed deceased (%d probate preset), %d searches, %d skipped, %d cache hits | "
         "no-match: no_results=%d, fetch_failed=%d, llm_rejected=%d",
         confirmed, probate_preset_count, searched, skipped, cache_hits,
         miss_no_results, miss_fetch_failed, miss_llm_rejected,

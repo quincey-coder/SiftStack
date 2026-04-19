@@ -51,6 +51,7 @@ class PipelineOptions:
     max_heir_depth: int = 2
     skip_dm_address: bool = False
     tracerfy_tier1: bool = False
+    obituary_workers: int = 4
 
     # Smart detection flags (set by detect_existing_enrichment)
     has_smarty: bool = False
@@ -588,6 +589,7 @@ def run_enrichment_pipeline(
                     skip_dm_address=opts.skip_dm_address,
                     tracerfy_tier1=getattr(opts, "tracerfy_tier1", False),
                     skip_ancestry=opts.skip_ancestry,
+                    workers=getattr(opts, "obituary_workers", 4),
                 )
                 confirmed = sum(1 for n in notices if n.owner_deceased)
                 logger.info(

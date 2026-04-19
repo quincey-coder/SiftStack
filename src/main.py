@@ -592,6 +592,7 @@ def _run_pdf_import(args) -> None:
         max_heir_depth=args.max_heir_depth,
         skip_dm_address=args.skip_dm_address,
         tracerfy_tier1=getattr(args, "tracerfy_tier1", False),
+        obituary_workers=getattr(args, "obituary_workers", 4),
         source_label=f"PDF import ({pdf_path.name})",
     )
     notices = run_enrichment_pipeline(notices, opts)
@@ -668,6 +669,7 @@ def _run_photo_import(args) -> None:
         max_heir_depth=args.max_heir_depth,
         skip_dm_address=args.skip_dm_address,
         tracerfy_tier1=getattr(args, "tracerfy_tier1", False),
+        obituary_workers=getattr(args, "obituary_workers", 4),
         source_label=f"Photo import ({folder.name})",
     )
     notices = run_enrichment_pipeline(notices, opts)
@@ -768,6 +770,7 @@ def _run_csv_import(args) -> None:
         max_heir_depth=args.max_heir_depth,
         skip_dm_address=args.skip_dm_address,
         tracerfy_tier1=getattr(args, "tracerfy_tier1", False),
+        obituary_workers=getattr(args, "obituary_workers", 4),
         source_label=f"CSV import ({primary_name})",
     )
     detect_existing_enrichment(notices, opts)
@@ -1196,6 +1199,12 @@ def cli_main() -> None:
         "--research-entities",
         action="store_true",
         help="Research entity-owned properties to find the person behind LLCs/Corps (web search + LLM)",
+    )
+    parser.add_argument(
+        "--obituary-workers",
+        type=int,
+        default=4,
+        help="Concurrent workers for obituary search Phase A (default: 4). Higher = faster but more rate limits.",
     )
     # Buy box / filter toggles — control which property types pass through
     # Default: keep everything in your target ZIPs. Use --exclude-* to filter out.
@@ -1748,6 +1757,7 @@ def _run_scrape_pipeline(args, targets) -> None:
         max_heir_depth=args.max_heir_depth,
         skip_dm_address=args.skip_dm_address,
         tracerfy_tier1=getattr(args, "tracerfy_tier1", False),
+        obituary_workers=getattr(args, "obituary_workers", 4),
         skip_zip_filter=getattr(args, "skip_zip_filter", False),
         skip_condo_filter=getattr(args, "skip_condo_filter", False),
         source_label=f"CLI {args.mode}",
