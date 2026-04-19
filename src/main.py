@@ -146,10 +146,10 @@ async def actor_main() -> None:
         do_tracerfy = actor_input.get("run_tracerfy", True)
         do_notify_slack = actor_input.get("notify_slack", True)
 
-        # Buy box / filter toggles
-        include_vacant = actor_input.get("include_vacant", False)
-        include_commercial = actor_input.get("include_commercial", False)
-        include_entities = actor_input.get("include_entities", False)
+        # Buy box / filter toggles (default: keep everything)
+        exclude_vacant = actor_input.get("exclude_vacant", False)
+        exclude_commercial = actor_input.get("exclude_commercial", False)
+        exclude_entities = actor_input.get("exclude_entities", False)
 
         # Filter targets
         targets = _filter_targets(counties, types)
@@ -298,9 +298,9 @@ async def actor_main() -> None:
 
             opts = PipelineOptions(
                 skip_parcel_lookup=True,  # web scrape notices don't have parcel IDs
-                skip_vacant_filter=include_vacant,
-                skip_commercial_filter=include_commercial,
-                skip_entity_filter=include_entities,
+                skip_vacant_filter=not exclude_vacant,
+                skip_commercial_filter=not exclude_commercial,
+                skip_entity_filter=not exclude_entities,
                 source_label="Apify Actor",
             )
             notices = run_enrichment_pipeline(notices, opts)
@@ -585,9 +585,9 @@ def _run_pdf_import(args) -> None:
         skip_obituary=args.skip_obituary,
         skip_ancestry=getattr(args, "skip_ancestry", False),
         skip_entity_research=not getattr(args, "research_entities", False),
-        skip_vacant_filter=getattr(args, "include_vacant", False),
-        skip_commercial_filter=getattr(args, "include_commercial", False),
-        skip_entity_filter=getattr(args, "include_entities", False),
+        skip_vacant_filter=not getattr(args, "exclude_vacant", False),
+        skip_commercial_filter=not getattr(args, "exclude_commercial", False),
+        skip_entity_filter=not getattr(args, "exclude_entities", False),
         skip_heir_verification=args.skip_heir_verification,
         max_heir_depth=args.max_heir_depth,
         skip_dm_address=args.skip_dm_address,
@@ -653,9 +653,9 @@ def _run_photo_import(args) -> None:
     # (probate from court terminals never has property address — would filter everything)
     no_address_types = {"probate", "divorce"}
     opts = PipelineOptions(
-        skip_vacant_filter=getattr(args, "include_vacant", False) or notice_type in no_address_types,
-        skip_commercial_filter=getattr(args, "include_commercial", False),
-        skip_entity_filter=getattr(args, "include_entities", False),
+        skip_vacant_filter=not getattr(args, "exclude_vacant", False) or notice_type in no_address_types,
+        skip_commercial_filter=not getattr(args, "exclude_commercial", False),
+        skip_entity_filter=not getattr(args, "exclude_entities", False),
         skip_parcel_lookup=args.skip_tax,
         skip_smarty=args.skip_smarty,
         skip_zillow=args.skip_zillow,
@@ -754,9 +754,9 @@ def _run_csv_import(args) -> None:
     primary_name = csv_paths[0].name
     opts = PipelineOptions(
         skip_filter_sold=False,
-        skip_vacant_filter=getattr(args, "include_vacant", False),
-        skip_commercial_filter=getattr(args, "include_commercial", False),
-        skip_entity_filter=getattr(args, "include_entities", False),
+        skip_vacant_filter=not getattr(args, "exclude_vacant", False),
+        skip_commercial_filter=not getattr(args, "exclude_commercial", False),
+        skip_entity_filter=not getattr(args, "exclude_entities", False),
         skip_smarty=args.skip_smarty,
         skip_zillow=args.skip_zillow,
         skip_tax=args.skip_tax,
@@ -1198,20 +1198,21 @@ def cli_main() -> None:
         help="Research entity-owned properties to find the person behind LLCs/Corps (web search + LLM)",
     )
     # Buy box / filter toggles — control which property types pass through
+    # Default: keep everything in your target ZIPs. Use --exclude-* to filter out.
     parser.add_argument(
-        "--include-vacant",
+        "--exclude-vacant",
         action="store_true",
-        help="Keep vacant land parcels (default: filtered out). Use if your buy box includes land deals.",
+        help="Remove vacant land parcels (default: kept).",
     )
     parser.add_argument(
-        "--include-commercial",
+        "--exclude-commercial",
         action="store_true",
-        help="Keep commercial properties (default: filtered out). Use if your buy box includes commercial.",
+        help="Remove commercial properties (default: kept).",
     )
     parser.add_argument(
-        "--include-entities",
+        "--exclude-entities",
         action="store_true",
-        help="Keep entity-owned records (LLC, Corp, etc.) without filtering. Default: removed unless --research-entities finds a person.",
+        help="Remove entity-owned records (LLC, Corp, etc.). Default: kept.",
     )
     parser.add_argument(
         "--upload-datasift",
@@ -1733,9 +1734,9 @@ def _run_scrape_pipeline(args, targets) -> None:
 
     opts = PipelineOptions(
         skip_parcel_lookup=True,  # web scrape notices don't have parcel IDs
-        skip_vacant_filter=getattr(args, "include_vacant", False),
-        skip_commercial_filter=getattr(args, "include_commercial", False),
-        skip_entity_filter=getattr(args, "include_entities", False),
+        skip_vacant_filter=not getattr(args, "exclude_vacant", False),
+        skip_commercial_filter=not getattr(args, "exclude_commercial", False),
+        skip_entity_filter=not getattr(args, "exclude_entities", False),
         skip_smarty=getattr(args, "skip_smarty", False),
         skip_zillow=getattr(args, "skip_zillow", False),
         skip_tax=getattr(args, "skip_tax", False),
@@ -1766,25 +1767,38 @@ def _run_scrape_pipeline(args, targets) -> None:
                 logging.exception("Slack notification for empty run failed")
         sys.exit(0)
 
-    # Tracerfy batch skip trace (phones + emails for all records)
+    # Tracerfy batch skip trace — only on DP candidates (deceased owners,
+    # heir maps, decision makers). Basic living-owner records get skip traced
+    # for free inside DataSift's unlimited plan.
     tiers_map: dict = {}
     tracerfy_stats: dict = {}
     if not getattr(args, "skip_tracerfy", False):
         import config as cfg
         if cfg.TRACERFY_API_KEY:
             from tracerfy_skip_tracer import batch_skip_trace
-            tracerfy_stats = batch_skip_trace(notices)
-            if tracerfy_stats.get("credits_exhausted"):
-                logging.error(
-                    "TRACERFY OUT OF CREDITS — skip trace disabled for this run. "
-                    "Add credits at https://tracerfy.com/billing to resume phone/email lookups."
+            dp_for_tracerfy = [
+                n for n in notices
+                if n.owner_deceased == "yes" or n.heir_map_json or n.decision_maker_name
+            ]
+            if dp_for_tracerfy:
+                logging.info(
+                    "Tracerfy: running on %d DP candidates (%d basic records skipped)",
+                    len(dp_for_tracerfy), len(notices) - len(dp_for_tracerfy),
                 )
-            logging.info(
-                "Tracerfy: %d/%d matched, %d phones, %d emails, $%.2f",
-                tracerfy_stats.get("matched", 0), tracerfy_stats.get("submitted", 0),
-                tracerfy_stats.get("phones_found", 0), tracerfy_stats.get("emails_found", 0),
-                tracerfy_stats.get("cost", 0.0),
-            )
+                tracerfy_stats = batch_skip_trace(dp_for_tracerfy)
+                if tracerfy_stats.get("credits_exhausted"):
+                    logging.error(
+                        "TRACERFY OUT OF CREDITS — skip trace disabled for this run. "
+                        "Add credits at https://tracerfy.com/billing to resume phone/email lookups."
+                    )
+                logging.info(
+                    "Tracerfy: %d/%d matched, %d phones, %d emails, $%.2f",
+                    tracerfy_stats.get("matched", 0), tracerfy_stats.get("submitted", 0),
+                    tracerfy_stats.get("phones_found", 0), tracerfy_stats.get("emails_found", 0),
+                    tracerfy_stats.get("cost", 0.0),
+                )
+            else:
+                logging.info("Tracerfy: no DP candidates — skipped (0 deceased/DM records)")
             # Score every phone (DM #1 + all heirs) — writes per-heir phone_scores
             # into heir_map_json so DataSift Notes and PDFs can surface tier badges.
             if cfg.TRESTLE_API_KEY:
