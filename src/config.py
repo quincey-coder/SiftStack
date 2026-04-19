@@ -99,6 +99,13 @@ ODYSSEY_URLS: dict[str, str] = {
 
 # Travis County direct data sources
 TRAVIS_TAX_DELINQUENT_CSV = "https://tax-office.traviscountytx.gov/voterdata/TaxDelqOpenData.csv"
+# "Tax Current Year and Prior Year Delinquent" master file: ~500K rows, has
+# owner + mailing address + parcel, but NO situs (property street). For
+# probate decedents (individuals) the mailing address is almost always their
+# home property — used as a fallback situs when the smaller delinquent CSV misses.
+TRAVIS_TAX_CURRENT_CSV = "https://tax-office.traviscountytx.gov/voterdata/TaxCurOpenData.csv"
+TRAVIS_TAX_CACHE_DIR = "data/travis_tax_cache"
+TRAVIS_TAX_CACHE_TTL_HOURS = 24  # both CSVs are refreshed daily by the county
 TRAVIS_TAX_SALES_URL = "https://tax-office.traviscountytx.gov/properties/foreclosed/upcoming-sales"
 TRAVIS_CLERK_URL = "https://www.tccsearch.org/"
 

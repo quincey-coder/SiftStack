@@ -165,29 +165,71 @@ def lookup_property_by_name(
 
     if county_lower == "williamson":
         results = _wcad_name_search(last_name, first_name)
+    elif county_lower == "travis":
+        from travis_tax_cache import search_by_name
+        # Travis probate decedent names arrive as LAST FIRST MIDDLE format
+        # (e.g. "Aynesworth Donald D"). _parse_name_parts assumes FIRST LAST
+        # and gets it wrong, so also probe the first token as an index key.
+        parts = [
+            p for p in name.strip().split()
+            if p.upper() not in {"JR", "SR", "II", "III", "IV", "ESQ"}
+        ]
+        try:
+            results = list(search_by_name(last_name, first_name))
+            if len(parts) >= 2 and parts[0].upper() != last_name.upper():
+                results += search_by_name(parts[0], "")
+        except Exception as e:
+            logger.warning("Travis tax cache lookup failed: %s", e)
+            return None
     else:
-        # Bell and Travis use bulk data (not yet implemented)
+        # Bell still uses per-record scraping (not yet implemented)
         logger.debug("CAD lookup not yet implemented for %s County", county)
         return None
 
     if not results:
         return None
 
-    # Score and rank results
-    scored = []
-    for r in results:
-        full = r.get("fullname", "")
-        score = _name_match_score(last_name, first_name, full)
-        if score >= min_score:
-            scored.append((score, r))
-
-    if not scored:
-        # Try without first name
+    # ── Scoring ──
+    # Travis: use ALL name tokens (not just last+first) and require at least
+    # 2 non-noise tokens to overlap — this kills false positives like
+    # "D & D Trust" matching "Aynesworth Donald D" on a single initial.
+    # Other counties: original last+first scoring.
+    scored: list[tuple[float, dict]] = []
+    if county_lower == "travis":
+        noise = {"&", "JR", "SR", "II", "III", "IV", "THE", "ESTATE", "OF", "TRUST", "LLC", "INC"}
+        search_tokens = {p.upper() for p in name.strip().split()} - noise
+        multi_token = len(search_tokens) >= 2
+        seen_ids: set[str] = set()
         for r in results:
-            full = r.get("fullname", "")
-            score = _name_match_score(last_name, "", full)
+            rid = r.get("quickrefid", "") or id(r)
+            if rid in seen_ids:
+                continue
+            seen_ids.add(rid)
+            api_tokens = set(r.get("fullname", "").upper().replace(",", "").split()) - noise
+            if not api_tokens or not search_tokens:
+                continue
+            overlap = search_tokens & api_tokens
+            if multi_token and len(overlap) < 2:
+                continue
+            if not multi_token and not overlap:
+                continue
+            score = len(overlap) / max(len(search_tokens), len(api_tokens))
             if score >= min_score:
                 scored.append((score, r))
+    else:
+        for r in results:
+            full = r.get("fullname", "")
+            score = _name_match_score(last_name, first_name, full)
+            if score >= min_score:
+                scored.append((score, r))
+
+        if not scored:
+            # Try without first name
+            for r in results:
+                full = r.get("fullname", "")
+                score = _name_match_score(last_name, "", full)
+                if score >= min_score:
+                    scored.append((score, r))
 
     if not scored:
         return None

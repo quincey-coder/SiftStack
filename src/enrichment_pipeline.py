@@ -415,12 +415,11 @@ def run_enrichment_pipeline(
     if probate_no_addr:
         logger.info("── Step 3c: Probate Property Lookup (%d candidates) ──", len(probate_no_addr))
         try:
-            from tax_enricher import _probate_property_lookup
-            _probate_property_lookup(probate_no_addr)
+            import asyncio
+            from property_lookup import lookup_decedent_properties
+            asyncio.run(lookup_decedent_properties(probate_no_addr))
             found = sum(1 for n in probate_no_addr if n.address.strip())
             logger.info("  Property address found: %d/%d", found, len(probate_no_addr))
-        except ImportError:
-            logger.warning("  _probate_property_lookup not available — skipping")
         except Exception as e:
             logger.warning("  Probate property lookup failed: %s", e)
 
