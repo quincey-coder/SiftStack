@@ -30,21 +30,55 @@ DATASIFT_UPLOAD_URL = "https://app.reisift.io/records/properties"
 async def _click_next_step(page: Page, timeout: int = 20000) -> bool:
     """Click the 'Next Step' button that appears in the upload wizard.
 
-    Default timeout is 20s to handle slow SPA rendering in headless/cloud
-    environments (Apify containers take longer than local desktop).
+    Dismisses popups (NPS iframe etc.) first, then tries a broad selector that
+    catches both native <button> and styled-component buttons. Uses force-click
+    with a JS fallback to bypass pointer interception. On timeout, logs a
+    diagnostic dump of all visible button-like elements before returning False.
     """
+    await _dismiss_popups(page)
     try:
         btn = page.locator(
             'button:has-text("Next Step"), '
+            '[role="button"]:has-text("Next Step"), '
+            '[class*="Button"]:has-text("Next Step"), '
             'button:has-text("Next"), '
-            'button:has-text("Continue")'
+            '[role="button"]:has-text("Next"), '
+            '[class*="Button"]:has-text("Next"), '
+            'button:has-text("Continue"), '
+            '[role="button"]:has-text("Continue")'
         )
         await btn.first.wait_for(state="visible", timeout=timeout)
-        await btn.first.click()
+        try:
+            await btn.first.click(force=True)
+        except Exception as e:
+            logger.debug("Force click failed (%s) — falling back to JS click", e)
+            handle = await btn.first.element_handle()
+            await page.evaluate("el => el.click()", handle)
         await page.wait_for_timeout(2000)
+        logger.info("Clicked Next Step")
         return True
     except PwTimeout:
         logger.warning("Next Step button not found within %dms", timeout)
+        try:
+            visible_buttons = await page.evaluate("""() => {
+                const candidates = document.querySelectorAll('button, [role="button"], [class*="Button"]');
+                const out = [];
+                for (const el of candidates) {
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width === 0 || rect.height === 0) continue;
+                    const text = (el.textContent || '').trim().slice(0, 60);
+                    if (!text) continue;
+                    out.push({text, className: el.className || '', tag: el.tagName.toLowerCase()});
+                }
+                return out.slice(0, 40);
+            }""")
+            logger.warning(
+                "Diagnostic — visible button-like elements (%d):\n%s",
+                len(visible_buttons),
+                "\n".join(f"  <{b['tag']} class='{b['className']}'>{b['text']}</{b['tag']}>" for b in visible_buttons),
+            )
+        except Exception as e:
+            logger.debug("Diagnostic dump failed: %s", e)
         return False
 
 
@@ -301,7 +335,11 @@ async def upload_csv(
     await _screenshot(page, "step1_form_filled")
 
     # Click "Next Step" to proceed to step 2
-    await _click_next_step(page, timeout=30000)
+    if not await _click_next_step(page, timeout=30000):
+        result["message"] = "Wizard Step 1→2 'Next Step' click failed"
+        logger.error(result["message"])
+        await _screenshot(page, "step1_next_failed")
+        return result
 
     # ── Wizard Step 2: Add tags ──
     logger.info("Wizard Step 2: Adding 'Courthouse Data' tag...")
@@ -371,7 +409,11 @@ async def upload_csv(
     except Exception as e:
         logger.warning("Tag addition failed: %s", e)
 
-    await _click_next_step(page)
+    if not await _click_next_step(page):
+        result["message"] = "Wizard Step 2→3 'Next Step' click failed"
+        logger.error(result["message"])
+        await _screenshot(page, "step2_next_failed")
+        return result
 
     # ── Wizard Step 3: Upload the file ──
     logger.info("Wizard Step 3: Uploading CSV file: %s", csv_path.name)
@@ -403,7 +445,11 @@ async def upload_csv(
         return result
 
     await _screenshot(page, "step3_file_uploaded")
-    await _click_next_step(page)
+    if not await _click_next_step(page):
+        result["message"] = "Wizard Step 3→4 'Next Step' click failed"
+        logger.error(result["message"])
+        await _screenshot(page, "step3_next_failed")
+        return result
 
     # ── Wizard Step 4: Map the columns ──
     logger.info("Wizard Step 4: Column mapping — mapping Tags and Lists...")
@@ -467,7 +513,11 @@ async def upload_csv(
     await _screenshot(page, "step4_after_mapping")
 
     # Click Next Step to proceed past mapping
-    await _click_next_step(page)
+    if not await _click_next_step(page):
+        result["message"] = "Wizard Step 4→5 'Next Step' click failed"
+        logger.error(result["message"])
+        await _screenshot(page, "step4_next_failed")
+        return result
     await _screenshot(page, "step4_mapping_done")
 
     # ── Wizard Step 5: Review ──
@@ -475,22 +525,38 @@ async def upload_csv(
     await page.wait_for_timeout(2000)
     await _screenshot(page, "step5_review")
 
+    await _dismiss_popups(page)
     try:
         finish_btn = page.locator(
             'button:has-text("Finish Upload"), '
+            '[role="button"]:has-text("Finish Upload"), '
+            '[class*="Button"]:has-text("Finish Upload"), '
             'button:has-text("Finish"), '
-            'button:has-text("Submit")'
+            '[role="button"]:has-text("Finish"), '
+            '[class*="Button"]:has-text("Finish"), '
+            'button:has-text("Submit"), '
+            '[role="button"]:has-text("Submit")'
         )
         if await finish_btn.count() > 0:
-            await finish_btn.first.click()
+            try:
+                await finish_btn.first.click(force=True)
+            except Exception as e:
+                logger.debug("Finish force click failed (%s) — JS fallback", e)
+                handle = await finish_btn.first.element_handle()
+                await page.evaluate("el => el.click()", handle)
             logger.info("Clicked Finish Upload")
         else:
             await _screenshot(page, "step5_no_finish_btn")
-            logger.warning("Finish Upload button not found")
+            result["message"] = "Finish Upload button not found — upload did not land"
+            logger.error(result["message"])
+            return result
     except Exception as e:
-        logger.warning("Finish step: %s", e)
+        result["message"] = f"Finish step failed: {e}"
+        logger.error(result["message"])
+        await _screenshot(page, "step5_finish_error")
+        return result
 
-    # Wait for processing confirmation
+    # Wait for processing confirmation — success only if confirmation actually appears
     try:
         success_indicator = page.locator(
             'text="Upload Complete", '
@@ -506,9 +572,11 @@ async def upload_csv(
         logger.info("DataSift upload complete: %s", result["message"])
     except PwTimeout:
         await _screenshot(page, "step5_timeout")
-        result["message"] = "Upload may have succeeded but confirmation timed out — check Activity page"
-        logger.warning(result["message"])
-        result["success"] = True
+        result["success"] = False
+        result["message"] = "Upload did not confirm success within 60s — data likely did not land"
+        logger.error(result["message"])
+        await _save_cookies(page)
+        return result
 
     await _save_cookies(page)
     return result
@@ -1161,10 +1229,15 @@ async def upload_datasift_split(
                     all_success = False
                     break
 
-                # Wait between uploads so DataSift can process/index
+                # Reset page state between uploads: dismiss popups + navigate
+                # back to records URL + dismiss again. Without this, the Beamer
+                # NPS iframe from upload #1 intercepts the Step 1 click on #2.
                 if i < len(csv_infos) - 1:
-                    logger.info("Waiting 15s before next upload...")
-                    await page.wait_for_timeout(15000)
+                    logger.info("Resetting page state before next upload...")
+                    await _dismiss_popups(page)
+                    await page.goto(DATASIFT_UPLOAD_URL, wait_until="domcontentloaded")
+                    await page.wait_for_timeout(5000)
+                    await _dismiss_popups(page)
 
             combined = {
                 "success": all_success,
