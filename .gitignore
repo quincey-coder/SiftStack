@@ -33,6 +33,9 @@ venv/
 .datasift_profile/
 .playwright/
 
+# Playwright debug screenshots (from DataSift uploader runs)
+datasift_*.png
+
 # Apify local storage
 apify_storage/
 storage/
