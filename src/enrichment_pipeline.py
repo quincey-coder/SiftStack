@@ -38,13 +38,14 @@ class PipelineOptions:
     skip_commercial_filter: bool = True  # keep commercial properties
     skip_zip_filter: bool = False
     skip_condo_filter: bool = False
+    skip_mls_filter: bool = False  # remove Active/Pending/Sold/For Rent records after Zillow
     skip_parcel_lookup: bool = False
     skip_tax: bool = False
     skip_smarty: bool = False
     skip_geocode: bool = False
     skip_zillow: bool = False
-    skip_obituary: bool = False
-    skip_ancestry: bool = False
+    skip_obituary: bool = True   # default OFF — opt in via --enable-obituary
+    skip_ancestry: bool = True   # default OFF — opt in (Ancestry is obituary-internal)
 
     # Obituary sub-options
     skip_heir_verification: bool = False
@@ -193,6 +194,31 @@ def _filter_condos(notices: list[NoticeData]) -> list[NoticeData]:
     removed = before - len(result)
     if removed:
         logger.info("  Removed %d condo/townhouse/apartment records", removed)
+    return result
+
+
+_MLS_REJECT = {"active", "pending", "sold", "for rent"}
+
+
+def _filter_by_mls_status(notices: list[NoticeData]) -> list[NoticeData]:
+    """Remove records Zillow marked as Active/Pending/Sold/For Rent.
+
+    Keep records with empty mls_status (Zillow had no listing data — most
+    records) or "Off Market" (best-fit investor candidates).
+    """
+    before = len(notices)
+    removed_by_status: dict[str, int] = {}
+    result = []
+    for n in notices:
+        status = (n.mls_status or "").strip().lower()
+        if status in _MLS_REJECT:
+            removed_by_status[n.mls_status] = removed_by_status.get(n.mls_status, 0) + 1
+        else:
+            result.append(n)
+    removed = before - len(result)
+    if removed:
+        parts = [f"{k}={v}" for k, v in sorted(removed_by_status.items())]
+        logger.info("  Removed %d listed/sold records (%s)", removed, ", ".join(parts))
     return result
 
 
@@ -572,6 +598,16 @@ def run_enrichment_pipeline(
         logger.info("  %d records after condo filter", len(notices))
     else:
         logger.info("── Step 8a: Condo Filter (skipped) ──")
+
+    # ── Step 8b: MLS Status Filter ────────────────────────────────────
+    # Remove records already listed/sold so downstream obituary + Tracerfy
+    # + Trestle + DataSift upload don't burn budget on non-investable props.
+    if not opts.skip_mls_filter:
+        logger.info("── Step 8b: MLS Status Filter ──")
+        notices = _filter_by_mls_status(notices)
+        logger.info("  %d records after MLS status filter", len(notices))
+    else:
+        logger.info("── Step 8b: MLS Status Filter (skipped) ──")
 
     # ── Step 9: Obituary Enrichment ──────────────────────────────────
     if not opts.skip_obituary and not opts.has_obituary:

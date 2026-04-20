@@ -1119,6 +1119,11 @@ def cli_main() -> None:
         action="store_true",
         help="Skip condo/townhouse filtering (include condos)",
     )
+    parser.add_argument(
+        "--keep-listed",
+        action="store_true",
+        help="Keep Active/Pending/Sold/For Rent records (default: filter out after Zillow)",
+    )
 
     # PDF import arguments
     parser.add_argument(
@@ -1230,12 +1235,22 @@ def cli_main() -> None:
     parser.add_argument(
         "--skip-obituary",
         action="store_true",
-        help="Skip obituary search for deceased owner detection",
+        help="[deprecated no-op — obituary is off by default] Skip obituary search",
+    )
+    parser.add_argument(
+        "--enable-obituary",
+        action="store_true",
+        help="Opt into obituary search + deceased owner detection (off by default)",
     )
     parser.add_argument(
         "--skip-ancestry",
         action="store_true",
-        help="Skip Ancestry.com lookup (SSDI + obituary collection)",
+        help="[deprecated no-op — ancestry is off by default] Skip Ancestry.com lookup",
+    )
+    parser.add_argument(
+        "--enable-ancestry",
+        action="store_true",
+        help="Opt into Ancestry.com lookup (off by default; requires --enable-obituary)",
     )
     parser.add_argument(
         "--skip-geocode",
@@ -1266,7 +1281,17 @@ def cli_main() -> None:
     parser.add_argument(
         "--skip-tracerfy",
         action="store_true",
-        help="Skip Tracerfy batch skip trace (phones + emails) before DataSift upload",
+        help="[deprecated no-op — Tracerfy is off by default] Skip Tracerfy batch skip trace",
+    )
+    parser.add_argument(
+        "--enable-tracerfy",
+        action="store_true",
+        help="Opt into Tracerfy batch skip trace (phones + emails) on DP candidates (off by default)",
+    )
+    parser.add_argument(
+        "--enable-trestle",
+        action="store_true",
+        help="Opt into Trestle per-phone tier scoring (requires --enable-tracerfy, off by default)",
     )
     parser.add_argument(
         "--llm-backend",
@@ -1327,7 +1352,17 @@ def cli_main() -> None:
     parser.add_argument(
         "--notify-slack",
         action="store_true",
-        help="Send run summary to Slack/Discord webhook (requires SLACK_WEBHOOK_URL)",
+        help="[deprecated no-op — Slack is on by default when SLACK_WEBHOOK_URL is set]",
+    )
+    parser.add_argument(
+        "--no-slack",
+        action="store_true",
+        help="Suppress the Slack/Discord run summary",
+    )
+    parser.add_argument(
+        "--no-drive",
+        action="store_true",
+        help="Suppress the Google Drive upload of DataSift CSVs",
     )
     parser.add_argument(
         "--audit-records",
@@ -1876,8 +1911,8 @@ def _run_scrape_pipeline(args, targets) -> None:
         skip_zillow=getattr(args, "skip_zillow", False),
         skip_tax=getattr(args, "skip_tax", False),
         skip_geocode=getattr(args, "skip_geocode", False),
-        skip_obituary=args.skip_obituary,
-        skip_ancestry=getattr(args, "skip_ancestry", False),
+        skip_obituary=not getattr(args, "enable_obituary", False),
+        skip_ancestry=not getattr(args, "enable_ancestry", False),
         skip_entity_research=not getattr(args, "research_entities", False),
         skip_heir_verification=args.skip_heir_verification,
         max_heir_depth=args.max_heir_depth,
@@ -1886,6 +1921,7 @@ def _run_scrape_pipeline(args, targets) -> None:
         obituary_workers=getattr(args, "obituary_workers", 4),
         skip_zip_filter=getattr(args, "skip_zip_filter", False),
         skip_condo_filter=getattr(args, "skip_condo_filter", False),
+        skip_mls_filter=getattr(args, "keep_listed", False),
         source_label=f"CLI {args.mode}",
     )
     notices = run_enrichment_pipeline(notices, opts)
@@ -1900,7 +1936,7 @@ def _run_scrape_pipeline(args, targets) -> None:
         # Send Slack ping even on empty runs so operators know the job
         # ran successfully (vs silently dying). Previously sys.exit(0)
         # fired before the Slack block at the bottom of this function.
-        if getattr(args, "notify_slack", False):
+        if not getattr(args, "no_slack", False) and config.SLACK_WEBHOOK_URL:
             try:
                 from slack_notifier import send_slack_notification
                 send_slack_notification([])
@@ -1913,7 +1949,7 @@ def _run_scrape_pipeline(args, targets) -> None:
     # for free inside DataSift's unlimited plan.
     tiers_map: dict = {}
     tracerfy_stats: dict = {}
-    if not getattr(args, "skip_tracerfy", False):
+    if getattr(args, "enable_tracerfy", False):
         import config as cfg
         if cfg.TRACERFY_API_KEY:
             from tracerfy_skip_tracer import batch_skip_trace
@@ -1942,7 +1978,7 @@ def _run_scrape_pipeline(args, targets) -> None:
                 logging.info("Tracerfy: no DP candidates — skipped (0 deceased/DM records)")
             # Score every phone (DM #1 + all heirs) — writes per-heir phone_scores
             # into heir_map_json so DataSift Notes and PDFs can surface tier badges.
-            if cfg.TRESTLE_API_KEY:
+            if getattr(args, "enable_trestle", False) and cfg.TRESTLE_API_KEY:
                 from phone_validator import score_record_phones
                 dp_cands = [
                     n for n in notices
@@ -2000,49 +2036,94 @@ def _run_scrape_pipeline(args, targets) -> None:
         except Exception:
             logging.exception("Report generator import failed")
 
-    # DataSift upload
+    # DataSift-ready CSV generation + Drive upload (always run).
+    # Playwright auto-upload to DataSift is opt-in via --upload-datasift.
     upload_result = None
-    if getattr(args, "upload_datasift", False):
-        from datasift_formatter import write_datasift_csv, write_datasift_split_csvs
-        from datasift_uploader import upload_to_datasift, upload_datasift_split
+    from datasift_formatter import write_datasift_split_csvs
 
+    csv_infos = write_datasift_split_csvs(notices)
+    for info in csv_infos:
+        logging.info("DataSift CSV (%s): %s", info["label"], info["path"])
+
+    # Always upload to Google Drive unless suppressed — permanent audit trail
+    # + one-click manual upload from Drive UI.
+    drive_links: list[dict] = []
+    if not getattr(args, "no_drive", False) and config.GOOGLE_DRIVE_FOLDER_ID and config.GOOGLE_SERVICE_ACCOUNT_KEY:
+        from drive_uploader import upload_file
+        logging.info("Uploading DataSift CSVs to Google Drive...")
+        for info in csv_infos:
+            link = upload_file(
+                Path(info["path"]),
+                config.GOOGLE_DRIVE_FOLDER_ID,
+                config.GOOGLE_SERVICE_ACCOUNT_KEY,
+            )
+            if link:
+                logging.info("  %s → Drive: %s", info["label"], link)
+                drive_links.append({"label": info["label"], "url": link})
+            else:
+                logging.error("  %s: Drive upload failed", info["label"])
+    elif getattr(args, "no_drive", False):
+        logging.info("Drive upload suppressed via --no-drive")
+    else:
+        logging.info(
+            "Drive creds not set — skipping Drive upload "
+            "(set GOOGLE_DRIVE_FOLDER_ID + GOOGLE_SERVICE_ACCOUNT_KEY to enable)"
+        )
+
+    upload_result = {
+        "success": True,
+        "mode": "manual",
+        "message": "DataSift CSVs ready (manual upload)",
+        "records_uploaded": len(notices),
+        "drive_links": drive_links,
+        "local_paths": [str(info["path"]) for info in csv_infos],
+    }
+
+    # Optional Playwright auto-upload to DataSift on top of the Drive flow
+    if getattr(args, "upload_datasift", False):
+        from datasift_uploader import upload_to_datasift, upload_datasift_split
         do_enrich = not getattr(args, "no_enrich", False)
         do_skip_trace = not getattr(args, "no_skip_trace", False)
 
-        # Use split flow (separate DM + Heir Map Message Board entries)
-        csv_infos = write_datasift_split_csvs(notices)
-        for info in csv_infos:
-            logging.info("DataSift CSV (%s): %s", info["label"], info["path"])
-
         if len(csv_infos) > 1:
-            upload_result = asyncio.run(
+            auto_result = asyncio.run(
                 upload_datasift_split(
-                    csv_infos,
-                    enrich=do_enrich,
-                    skip_trace=do_skip_trace,
+                    csv_infos, enrich=do_enrich, skip_trace=do_skip_trace,
                 )
             )
         else:
-            # No deceased-with-heirs — single CSV upload
-            upload_result = asyncio.run(
+            auto_result = asyncio.run(
                 upload_to_datasift(
-                    csv_infos[0]["path"],
-                    enrich=do_enrich,
-                    skip_trace=do_skip_trace,
+                    csv_infos[0]["path"], enrich=do_enrich, skip_trace=do_skip_trace,
                 )
             )
 
-        if upload_result.get("success"):
-            logging.info("DataSift upload: %s", upload_result.get("message", "OK"))
-            if upload_result.get("enrich_result"):
-                logging.info("  Enrich: %s", upload_result["enrich_result"].get("message", ""))
-            if upload_result.get("skip_trace_result"):
-                logging.info("  Skip trace: %s", upload_result["skip_trace_result"].get("message", ""))
+        if auto_result.get("success"):
+            logging.info("DataSift upload: %s", auto_result.get("message", "OK"))
+            if auto_result.get("enrich_result"):
+                logging.info("  Enrich: %s", auto_result["enrich_result"].get("message", ""))
+            if auto_result.get("skip_trace_result"):
+                logging.info("  Skip trace: %s", auto_result["skip_trace_result"].get("message", ""))
+            # Auto succeeded — promote to non-manual mode but keep Drive links
+            upload_result = {
+                **auto_result,
+                "drive_links": drive_links,
+                "local_paths": [str(info["path"]) for info in csv_infos],
+            }
         else:
-            logging.error("DataSift upload failed: %s", upload_result.get("message"))
+            # Auto failed — stay in manual mode; pop CSVs open on macOS for drag-drop
+            logging.error("DataSift upload failed: %s", auto_result.get("message"))
+            if sys.platform == "darwin":
+                import subprocess
+                for info in csv_infos:
+                    try:
+                        subprocess.run(["open", str(info["path"])], check=False)
+                        logging.info("Opened locally for manual upload: %s", info["path"])
+                    except Exception as e:
+                        logging.warning("Failed to open %s: %s", info["path"], e)
 
-    # Slack/Discord notification
-    if getattr(args, "notify_slack", False):
+    # Slack/Discord notification (default ON; suppress with --no-slack)
+    if not getattr(args, "no_slack", False) and config.SLACK_WEBHOOK_URL:
         from slack_notifier import send_slack_notification
 
         send_slack_notification(notices, upload_result=upload_result)
