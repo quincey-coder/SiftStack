@@ -95,7 +95,7 @@ def standardize_addresses(
             lookup.street = notice.address
             lookup.lastline = _build_lastline(notice)
             lookup.candidates = 1
-            lookup.match = MatchType.INVALID
+            lookup.match = MatchType.STRICT
             lookup.input_id = str(orig_idx)
             batch.add(lookup)
 
@@ -289,7 +289,7 @@ def retry_with_geocoded_city(
             lookup.street = notice.address
             lookup.lastline = _build_lastline(notice)
             lookup.candidates = 1
-            lookup.match = MatchType.INVALID
+            lookup.match = MatchType.STRICT
             lookup.input_id = str(orig_idx)
             batch.add(lookup)
 
