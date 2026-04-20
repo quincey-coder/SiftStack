@@ -7,6 +7,7 @@ Runs as either:
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -23,6 +24,84 @@ from config import (
 from data_formatter import deduplicate, write_csv, write_csv_by_type
 
 logger = logging.getLogger(__name__)
+
+
+# ── CLI incremental state ─────────────────────────────────────────────
+# Mirrors the Apify KVS `last_run_date` + `seen_notice_ids` persistence
+# into local JSON files, so CLI `daily` runs are incremental: the scraper
+# only fetches records since last run, and records already-processed get
+# filtered out before enrichment. Monotonic — nothing prunes seen.
+
+
+def _load_cli_state() -> tuple[str | None, set[str]]:
+    """Read last_run_date + seen_notice_ids from disk. Returns empty state if missing."""
+    last_run = None
+    seen: set[str] = set()
+    if config.STATE_FILE.exists():
+        try:
+            last_run = json.loads(config.STATE_FILE.read_text()).get("last_run_date")
+        except Exception as e:
+            logging.warning("Could not read %s: %s", config.STATE_FILE, e)
+    if config.SEEN_IDS_FILE.exists():
+        try:
+            seen = set(json.loads(config.SEEN_IDS_FILE.read_text()))
+            logging.info("Loaded %d previously-seen notice IDs from %s",
+                         len(seen), config.SEEN_IDS_FILE.name)
+        except Exception as e:
+            logging.warning("Could not read %s: %s", config.SEEN_IDS_FILE, e)
+    return last_run, seen
+
+
+def _save_cli_state(seen: set[str]) -> None:
+    """Persist seen IDs + today's date. Atomic write via temp file."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    config.STATE_FILE.write_text(json.dumps({"last_run_date": today}))
+    tmp = config.SEEN_IDS_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(sorted(seen)))
+    tmp.replace(config.SEEN_IDS_FILE)
+    logging.info("Saved CLI state: last_run=%s, %d seen_ids", today, len(seen))
+
+
+def _notice_dedup_key(notice) -> str:
+    """Build a stable cross-run dedup key for a notice.
+
+    Prefers a URL-derived notice ID when available (court records with
+    ?ID=... param), then falls back to parcel ID, then to a composite
+    of notice_type|county|address|zip. Tax-delinquent records from the
+    Travis bulk CSV all share a generic source_url, so the composite
+    path is what actually identifies them.
+    """
+    from data_formatter import _notice_id_from_url
+    url = getattr(notice, "source_url", "") or ""
+    nid = _notice_id_from_url(url)
+    if nid:
+        return f"id:{nid}"
+    parcel = (getattr(notice, "parcel_id", "") or "").strip()
+    if parcel:
+        return f"parcel:{parcel}"
+    addr = (getattr(notice, "address", "") or "").strip().lower()
+    ntype = (getattr(notice, "notice_type", "") or "").strip().lower()
+    county = (getattr(notice, "county", "") or "").strip().lower()
+    zipc = (getattr(notice, "zip", "") or "").strip()[:5]
+    return f"addr:{ntype}|{county}|{addr}|{zipc}"
+
+
+def _notice_dedup_key_from_row(row: dict) -> str:
+    """Same logic as _notice_dedup_key, but reads from a CSV DictReader row.
+    Used during the one-time seeding step and for stable comparison."""
+    from data_formatter import _notice_id_from_url
+    url = (row.get("source_url") or "").strip()
+    nid = _notice_id_from_url(url)
+    if nid:
+        return f"id:{nid}"
+    parcel = (row.get("parcel_id") or "").strip()
+    if parcel:
+        return f"parcel:{parcel}"
+    addr = (row.get("address") or "").strip().lower()
+    ntype = (row.get("notice_type") or "").strip().lower()
+    county = (row.get("county") or "").strip().lower()
+    zipc = (row.get("zip") or "").strip()[:5]
+    return f"addr:{ntype}|{county}|{addr}|{zipc}"
 
 
 # ── Shared helpers ────────────────────────────────────────────────────
@@ -1206,6 +1285,13 @@ def cli_main() -> None:
         default=4,
         help="Concurrent workers for obituary search Phase A (default: 4). Higher = faster but more rate limits.",
     )
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="Skeleton pipeline: skip Zillow + Obituary + Ancestry + Tracerfy. "
+             "Produces a mailable CSV with property/owner data only (no Zestimate, no deceased detection, no phone lookup). "
+             "Typical incremental daily run finishes in 2-5 minutes.",
+    )
     # Buy box / filter toggles — control which property types pass through
     # Default: keep everything in your target ZIPs. Use --exclude-* to filter out.
     parser.add_argument(
@@ -1422,6 +1508,13 @@ def cli_main() -> None:
 
     args = parser.parse_args()
 
+    # Expand --fast into the four component skip flags
+    if getattr(args, "fast", False):
+        args.skip_zillow = True
+        args.skip_obituary = True
+        args.skip_ancestry = True
+        args.skip_tracerfy = True
+
     # Apply LLM backend override from CLI flag
     if hasattr(args, "llm_backend") and args.llm_backend:
         import config as cfg
@@ -1432,6 +1525,9 @@ def cli_main() -> None:
             logging.info("LLM backend: OpenRouter (%s)", cfg.OPENROUTER_MODEL)
 
     setup_logging(args.verbose)
+
+    if getattr(args, "fast", False):
+        logging.info("── --fast mode: skipping Zillow, Obituary, Ancestry, Tracerfy ──")
 
     # ── Preflight health checks ──────────────────────────────────────
     preflight_failures = _preflight_check(args.mode)
@@ -1719,14 +1815,29 @@ def _run_scrape_pipeline(args, targets) -> None:
         scraper_kwargs["min_years"] = min_years
         scraper_kwargs["min_amount"] = min_amount
 
+    # ── CLI incremental state ────────────────────────────────────────
+    # For daily mode without an explicit --since, auto-apply the stored
+    # last_run_date. Load the persisted seen-IDs set so we can filter
+    # already-processed notices before they hit the pipeline.
+    cli_last_run, cli_seen_ids = _load_cli_state()
+    since_arg = getattr(args, "since", None)
+    if args.mode == "daily" and since_arg is None and cli_last_run:
+        since_arg = cli_last_run
+        logging.info("Daily mode: using stored last_run_date = %s", cli_last_run)
+
     notices = asyncio.run(scrape_targets(
         targets=runnable,
         mode=args.mode,
-        since_date=getattr(args, "since", None),
+        since_date=since_arg,
         max_notices=getattr(args, "max_notices", None),
         scraper_kwargs=scraper_kwargs,
     )) if runnable else []
-    # Handle async probate lookup before pipeline (requires asyncio.run)
+
+    # Handle async probate lookup before pipeline (requires asyncio.run).
+    # This runs BEFORE the incremental dedup filter so probate records get
+    # their property address populated — otherwise every scraped probate
+    # record (with empty address) would share the same composite key and
+    # incorrectly collapse against the seed set.
     probate_notices = [n for n in notices if n.notice_type == "probate" and n.decedent_name and not n.address]
     if probate_notices:
         try:
@@ -1737,6 +1848,21 @@ def _run_scrape_pipeline(args, targets) -> None:
             logging.warning("property_lookup module not found -- skipping property lookup")
         except Exception as e:
             logging.warning("Property lookup failed: %s -- continuing without lookups", e)
+
+    # Filter out notices we've already processed in a prior run. Runs AFTER
+    # probate CAD lookup so probate records have their property address
+    # populated (otherwise every scraped-but-un-located probate record would
+    # share the same empty-address composite key). Uses the same key format
+    # in the filter AND in the persist step so tomorrow's record matches.
+    if cli_seen_ids and notices:
+        before = len(notices)
+        notices = [n for n in notices if _notice_dedup_key(n) not in cli_seen_ids]
+        filtered = before - len(notices)
+        if filtered:
+            logging.info(
+                "Incremental dedup: filtered %d already-seen notices "
+                "(%d remain for processing)", filtered, len(notices),
+            )
 
     # Run unified enrichment pipeline
     from enrichment_pipeline import PipelineOptions, run_enrichment_pipeline
@@ -1766,6 +1892,11 @@ def _run_scrape_pipeline(args, targets) -> None:
 
     if not notices:
         logging.warning("No notices found")
+        # Still advance last_run.json so tomorrow's scrape window narrows —
+        # otherwise a stretch of empty days keeps re-scraping the same window.
+        # seen_ids is unchanged (no new records to add).
+        if args.mode == "daily":
+            _save_cli_state(cli_seen_ids)
         # Send Slack ping even on empty runs so operators know the job
         # ran successfully (vs silently dying). Previously sys.exit(0)
         # fired before the Slack block at the bottom of this function.
@@ -1833,6 +1964,13 @@ def _run_scrape_pipeline(args, targets) -> None:
     else:
         path = write_csv(notices)
         logging.info("Output: %s", path)
+
+    # Persist incremental state so tomorrow's daily run skips these records.
+    # Uses the same composite dedup key as the filter step — monotonic growth.
+    if args.mode == "daily":
+        for n in notices:
+            cli_seen_ids.add(_notice_dedup_key(n))
+        _save_cli_state(cli_seen_ids)
 
     # Generate deep-prospecting PDFs for deceased/DM/heir records.
     # Matches the Apify branch behavior so CLI runs get the same reports —
