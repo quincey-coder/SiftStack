@@ -137,6 +137,32 @@ def _count_by_field(notices: list[NoticeData], field: str) -> dict[str, int]:
     return counts
 
 
+def _by_county_and_type(notices: list[NoticeData]) -> dict[str, dict[str, int]]:
+    """Group notice counts by county, then by notice_type within each county."""
+    out: dict[str, dict[str, int]] = {}
+    for n in notices:
+        county = (n.county or "unknown").title()
+        ntype = n.notice_type or "unknown"
+        out.setdefault(county, {})
+        out[county][ntype] = out[county].get(ntype, 0) + 1
+    return out
+
+
+def _zillow_hit_rate(notices: list[NoticeData]) -> tuple[int, int]:
+    """Return (enriched, attempted) counts for Zillow property enrichment.
+
+    Attempted = notices with a non-empty address. Enriched = notices where
+    Zillow returned data (estimated_value or mls_status populated).
+    """
+    attempted = sum(1 for n in notices if (n.address or "").strip())
+    enriched = sum(
+        1 for n in notices
+        if (n.address or "").strip()
+        and ((n.estimated_value or "").strip() or (n.mls_status or "").strip())
+    )
+    return enriched, attempted
+
+
 def _upcoming_auctions(notices: list[NoticeData], days: int = 7) -> list[dict]:
     """Find notices with auction dates in the next N days."""
     now = datetime.now()
@@ -180,64 +206,113 @@ def build_summary(
         cost_breakdown: Dict of service -> cost, e.g. {"Anthropic": 0.05, "Tracerfy": 0.26}.
     """
     total = len(notices)
-    by_county = _count_by_field(notices, "county")
-    by_type = _count_by_field(notices, "notice_type")
+    county_type_counts = _by_county_and_type(notices)
 
-    deceased = [n for n in notices if n.owner_deceased == "yes"]
-    deceased_count = len(deceased)
-    high_conf = sum(1 for n in deceased if n.dm_confidence == "high")
-    med_conf = sum(1 for n in deceased if n.dm_confidence == "medium")
-    low_conf = sum(1 for n in deceased if n.dm_confidence == "low")
+    deceased_all = [n for n in notices if n.owner_deceased == "yes"]
+    deceased_count = len(deceased_all)
+    high_conf = sum(1 for n in deceased_all if n.dm_confidence == "high")
+    med_conf = sum(1 for n in deceased_all if n.dm_confidence == "medium")
+    low_conf = sum(1 for n in deceased_all if n.dm_confidence == "low")
     estate = sum(
-        1 for n in deceased
+        1 for n in deceased_all
         if n.decision_maker_relationship
         and "estate" in n.decision_maker_relationship.lower()
     )
 
     upcoming = _upcoming_auctions(notices)
+    zillow_enriched, zillow_attempted = _zillow_hit_rate(notices)
 
+    num_counties = len(county_type_counts)
     lines = [
         f"*SiftStack - Daily Report ({datetime.now().strftime('%Y-%m-%d')})*",
         "",
-        f"*New notices scraped:* {total}",
+        f"*New notices scraped:* {total}"
+        + (f" (across {num_counties} counties)" if num_counties else ""),
+        "",
     ]
 
-    # County breakdown
-    county_parts = [f"{v.title()}: {c}" for v, c in sorted(by_county.items())]
-    if county_parts:
-        lines.append(f"  {' | '.join(county_parts)}")
+    # Per-county nested breakdown, biggest first
+    for county, type_counts in sorted(
+        county_type_counts.items(), key=lambda kv: sum(kv[1].values()), reverse=True
+    ):
+        county_total = sum(type_counts.values())
+        county_notices = [n for n in notices if (n.county or "").title() == county]
+        county_deceased = [n for n in county_notices if n.owner_deceased == "yes"]
+        county_upcoming = [
+            n for n in county_notices
+            if n.auction_date and any(a["address"] == n.address for a in upcoming)
+        ]
 
-    # Type breakdown
-    type_parts = [f"{t}: {c}" for t, c in sorted(by_type.items())]
-    if type_parts:
-        lines.append(f"  {' | '.join(type_parts)}")
+        lines.append(f"*{county} County* — {county_total} records")
+        for ntype, count in sorted(type_counts.items(), key=lambda kv: kv[1], reverse=True):
+            lines.append(f"  • {ntype}: {count}")
+        if county_deceased:
+            c_high = sum(1 for n in county_deceased if n.dm_confidence == "high")
+            c_med = sum(1 for n in county_deceased if n.dm_confidence == "medium")
+            c_low = sum(1 for n in county_deceased if n.dm_confidence == "low")
+            conf_parts = []
+            if c_high:
+                conf_parts.append(f"High: {c_high}")
+            if c_med:
+                conf_parts.append(f"Med: {c_med}")
+            if c_low:
+                conf_parts.append(f"Low: {c_low}")
+            conf_str = f" ({', '.join(conf_parts)})" if conf_parts else ""
+            lines.append(f"  Deceased: {len(county_deceased)}{conf_str}")
+        if county_upcoming:
+            lines.append(f"  Upcoming auctions (7d): {len(county_upcoming)}")
+        lines.append("")
 
-    lines.append("")
-
-    # Deceased owners
+    # Rollup deceased line
     if deceased_count > 0:
         pct = round(deceased_count / total * 100) if total else 0
-        lines.append(f"*Deceased owners found:* {deceased_count} ({pct}%)")
-        lines.append(f"  High confidence DM: {high_conf}")
-        lines.append(f"  Medium confidence: {med_conf}")
+        roll = [f"High: {high_conf}", f"Med: {med_conf}"]
         if low_conf:
-            lines.append(f"  Low confidence: {low_conf}")
+            roll.append(f"Low: {low_conf}")
         if estate:
-            lines.append(f"  Estate fallback: {estate}")
-    else:
-        lines.append("*Deceased owners found:* 0")
+            roll.append(f"Estate: {estate}")
+        lines.append(f"*Deceased owners (total):* {deceased_count} ({pct}%) — {', '.join(roll)}")
+
+    # Zillow hit rate (signals whether Smarty is helping or hurting)
+    if zillow_attempted > 0:
+        pct = round(zillow_enriched / zillow_attempted * 100)
+        lines.append(
+            f"*Zillow enrichment:* {zillow_enriched}/{zillow_attempted} ({pct}%)"
+        )
 
     # Upload result
     if upload_result:
         lines.append("")
-        if upload_result.get("success"):
+        drive_links = upload_result.get("drive_links") or []
+        local_paths = upload_result.get("local_paths") or []
+        if upload_result.get("mode") == "manual":
+            lines.append(
+                f"*DataSift CSVs ready (manual upload):* {upload_result.get('records_uploaded', total)} records"
+            )
+            if drive_links:
+                lines.append("*Drive links:*")
+                for dl in drive_links:
+                    lines.append(f"  {dl['label']}: <{dl['url']}|Download>")
+            if local_paths:
+                lines.append("*Local files (opened on desktop):*")
+                for p in local_paths:
+                    lines.append(f"  {p}")
+        elif upload_result.get("success"):
             lines.append(
                 f"*Uploaded to DataSift:* {upload_result.get('records_uploaded', total)} records"
             )
+            if drive_links:
+                lines.append("*CSVs in Drive:*")
+                for dl in drive_links:
+                    lines.append(f"  {dl['label']}: <{dl['url']}|Download>")
         else:
             lines.append(
                 f"*DataSift upload FAILED:* {upload_result.get('message', 'unknown error')}"
             )
+            if drive_links:
+                lines.append("*Drive links (still available):*")
+                for dl in drive_links:
+                    lines.append(f"  {dl['label']}: <{dl['url']}|Download>")
 
     # Upcoming auctions
     if upcoming:
