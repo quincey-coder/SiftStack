@@ -105,12 +105,22 @@ def _get_contacts_for_trace(
     return contacts
 
 
-def _split_name(name: str) -> tuple[str, str]:
-    """Split a full name into (first, last). Returns ('', '') if unparseable."""
+def _split_name(name: str) -> tuple[str, str, str]:
+    """Split a full name into (first, last, entity_type).
+
+    Input is expected in modern `FIRST [MIDDLE] LAST` order (court-source
+    names get normalized at the scraper layer). Returns ("", "", entity_type)
+    when the name is detected as a government or business entity,
+    ("", "", "") when unparseable.
+    """
+    from notice_parser import _detect_entity_type
+    entity_type = _detect_entity_type(name)
+    if entity_type:
+        return ("", "", entity_type)
     parts = name.strip().split()
     if len(parts) < 2:
-        return ("", "")
-    return (parts[0], parts[-1])
+        return ("", "", "")
+    return (parts[0], parts[-1], "")
 
 
 # Keep backward-compatible single-contact function for callers that expect it

@@ -205,9 +205,19 @@ def _clean_and_split_name(full_name: str) -> tuple[str, str]:
     return (parts[0], " ".join(parts[1:]))
 
 
-def _split_name(full_name: str) -> tuple[str, str]:
-    """Split full name into (first, last). Alias for _clean_and_split_name."""
-    return _clean_and_split_name(full_name)
+def _split_name(full_name: str) -> tuple[str, str, str]:
+    """Split full name into (first, last, entity_type).
+
+    Delegates to _clean_and_split_name() for DataSift-specific spouse /
+    middle-initial handling, then layers entity detection on top.
+    entity_type is one of "government" | "business" | "" (person).
+    """
+    from notice_parser import _detect_entity_type
+    entity_type = _detect_entity_type(full_name)
+    if entity_type:
+        return ("", "", entity_type)
+    first, last = _clean_and_split_name(full_name)
+    return (first, last, "")
 
 
 # Map notice_type → DataSift list name for niche sequential marketing.
