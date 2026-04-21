@@ -345,7 +345,7 @@ def _get_contact_info(notice: NoticeData) -> dict:
     marking records as incomplete.
     """
     if notice.owner_deceased == "yes" and notice.decision_maker_name:
-        first, last = _split_name(notice.decision_maker_name)
+        first, last, _et = _split_name(notice.decision_maker_name)
         # Fall back to property address when DM has no mailing address
         street = notice.decision_maker_street or notice.address
         city = notice.decision_maker_city or notice.city
@@ -361,20 +361,20 @@ def _get_contact_info(notice: NoticeData) -> dict:
         }
 
     # Living owner — try owner_name first
-    first, last = _split_name(notice.owner_name)
+    first, last, _et = _split_name(notice.owner_name)
 
     # If owner_name was an entity (LLC/Trust), try fallbacks for a real person
     if not first and not last:
         # Try entity research result (signing member, registered agent, etc.)
         if notice.entity_person_name:
-            first, last = _split_name(notice.entity_person_name)
+            first, last, _et = _split_name(notice.entity_person_name)
         # Try tax API owner name (sometimes has individual behind entity)
         if not first and not last:
             if notice.tax_owner_name and not _is_entity_name(notice.tax_owner_name):
-                first, last = _split_name(notice.tax_owner_name)
+                first, last, _et = _split_name(notice.tax_owner_name)
         # Try decision maker (probate PR, etc.)
         if not first and not last and notice.decision_maker_name:
-            first, last = _split_name(notice.decision_maker_name)
+            first, last, _et = _split_name(notice.decision_maker_name)
 
     street = notice.owner_street or notice.address
     city = notice.owner_city or notice.city
@@ -783,15 +783,58 @@ def _build_row(notice: NoticeData, notes_override: str | None = None) -> dict:
     }
 
 
+_KNOWN_BAD_CITY_ZIP = {
+    # (Title-cased city, 5-digit ZIP) pairs that are definitely wrong for our
+    # target counties. Travis 78xxx ZIPs misrouted to Dallas, McKinney, etc.
+    ("Dallas", "78738"),
+    ("Dallas", "78731"),
+    ("McKinney", "78645"),
+    ("Camden", "78731"),
+    ("Wolfforth", "78734"),
+    ("Kerrville", "78731"),
+    ("Miami Beach", "78704"),
+    ("Gainesville", "78620"),
+    ("Orange", "78641"),
+    ("Troup", "78653"),
+    ("Denver", "78736"),
+}
+
+
+def _check_city_zip(notice: NoticeData) -> None:
+    """Tag city_zip_mismatch flag if (city, zip) is on the known-bad list."""
+    if not notice.city or not notice.zip:
+        return
+    pair = (notice.city.title(), notice.zip[:5])
+    if pair in _KNOWN_BAD_CITY_ZIP:
+        existing = (notice.missing_data_flags or "").split("|")
+        if "city_zip_mismatch" not in existing:
+            notice.missing_data_flags = "|".join(
+                p for p in existing + ["city_zip_mismatch"] if p
+            )
+
+
+def _is_government_owner(notice: NoticeData) -> bool:
+    """Return True when the owner string is a government/municipal entity."""
+    from notice_parser import _detect_entity_type
+    name = notice.owner_name or notice.tax_owner_name or ""
+    return _detect_entity_type(name) == "government"
+
+
 def write_datasift_csv(
     notices: list[NoticeData],
     filename: str | None = None,
+    keep_government: bool = False,
 ) -> Path:
     """Write notices to a DataSift-formatted CSV file.
+
+    Government-owned records (Travis County Trustee, City Of Lakeway, etc.)
+    are dropped by default since they aren't investable. Pass
+    keep_government=True to include them anyway (debugging / audit).
 
     Args:
         notices: List of enriched NoticeData objects.
         filename: Optional filename override.
+        keep_government: If True, include government-entity records.
 
     Returns:
         Path to the written CSV file.
@@ -803,6 +846,7 @@ def write_datasift_csv(
     output_path = OUTPUT_DIR / filename
     written = 0
     incomplete = 0
+    govt_dropped = 0
     issue_counts: dict[str, int] = {}
 
     with open(output_path, "w", newline="", encoding="utf-8") as f:
@@ -810,6 +854,10 @@ def write_datasift_csv(
         writer.writeheader()
 
         for notice in notices:
+            if not keep_government and _is_government_owner(notice):
+                govt_dropped += 1
+                continue
+            _check_city_zip(notice)
             row = _build_row(notice)
             is_complete, issues = _validate_row(row)
             if not is_complete:
@@ -819,6 +867,9 @@ def write_datasift_csv(
                 logger.debug("Incomplete record %s: %s", notice.address, issues)
             writer.writerow(row)
             written += 1
+
+    if govt_dropped:
+        logger.info("Dropped %d government-entity records (Travis County, City Of, etc.)", govt_dropped)
 
     logger.info("Wrote %d records to DataSift CSV: %s", written, output_path)
     if incomplete:
@@ -833,6 +884,7 @@ def write_datasift_csv(
 def write_datasift_split_csvs(
     notices: list[NoticeData],
     date_str: str | None = None,
+    keep_government: bool = False,
 ) -> list[dict]:
     """Generate separate DM and Heir Map CSVs for two-upload Message Board flow.
 
@@ -842,9 +894,13 @@ def write_datasift_split_csvs(
     CSV 2 ("Heirs"): Only deceased records with heir data. Notes = full heir map.
     DataSift merges by address, adding a second Message Board comment.
 
+    Government-owned records are dropped by default — pass keep_government=True
+    to include them.
+
     Args:
         notices: List of enriched NoticeData objects.
         date_str: Optional date string for filenames/list names (default: today).
+        keep_government: If True, include government-entity records.
 
     Returns:
         List of dicts: [{"path": Path, "label": str, "list_name": str}, ...]
@@ -856,15 +912,20 @@ def write_datasift_split_csvs(
     timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     results = []
 
-    # CSV 1: DMs — all records
+    # CSV 1: DMs — all records (government dropped by default)
     dm_path = OUTPUT_DIR / f"datasift_upload_DMs_{timestamp}.csv"
     dm_written = 0
     incomplete = 0
+    govt_dropped = 0
     issue_counts: dict[str, int] = {}
     with open(dm_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=DATASIFT_COLUMNS)
         writer.writeheader()
         for notice in notices:
+            if not keep_government and _is_government_owner(notice):
+                govt_dropped += 1
+                continue
+            _check_city_zip(notice)
             row = _build_row(notice, notes_override=_build_dm_notes(notice))
             is_complete, issues = _validate_row(row)
             if not is_complete:
@@ -873,6 +934,9 @@ def write_datasift_split_csvs(
                     issue_counts[issue] = issue_counts.get(issue, 0) + 1
             writer.writerow(row)
             dm_written += 1
+
+    if govt_dropped:
+        logger.info("Dropped %d government-entity records (Travis County, City Of, etc.)", govt_dropped)
 
     logger.info("DMs CSV: %d records → %s", dm_written, dm_path)
     if incomplete:
@@ -887,10 +951,11 @@ def write_datasift_split_csvs(
         "list_name": f"SiftStack {date_str} - DMs",
     })
 
-    # CSV 2: Heirs — only deceased with heir data
+    # CSV 2: Heirs — only deceased with heir data (still drops government)
     deceased_with_heirs = [
         n for n in notices
         if n.owner_deceased == "yes" and n.heir_map_json
+        and (keep_government or not _is_government_owner(n))
     ]
 
     if deceased_with_heirs:
