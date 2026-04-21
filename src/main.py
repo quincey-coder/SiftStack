@@ -1124,6 +1124,11 @@ def cli_main() -> None:
         action="store_true",
         help="Keep Active/Pending/Sold/For Rent records (default: filter out after Zillow)",
     )
+    parser.add_argument(
+        "--keep-government-records",
+        action="store_true",
+        help="Keep government-owned records in DataSift CSV (Travis County Trustee, City Of Lakeway, etc.); default drops them",
+    )
 
     # PDF import arguments
     parser.add_argument(
@@ -2041,7 +2046,10 @@ def _run_scrape_pipeline(args, targets) -> None:
     upload_result = None
     from datasift_formatter import write_datasift_split_csvs
 
-    csv_infos = write_datasift_split_csvs(notices)
+    csv_infos = write_datasift_split_csvs(
+        notices,
+        keep_government=getattr(args, "keep_government_records", False),
+    )
     for info in csv_infos:
         logging.info("DataSift CSV (%s): %s", info["label"], info["path"])
 
