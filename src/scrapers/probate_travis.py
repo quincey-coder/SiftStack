@@ -176,8 +176,9 @@ def _parse_probate_record(lines: list[str]) -> NoticeData | None:
     for line in lines:
         m = _GRANTOR_RE.search(line)
         if m:
+            from notice_parser import normalize_court_name
             raw_name = m.group(1).strip()
-            notice.decedent_name = _clean_decedent_name(raw_name)
+            notice.decedent_name = normalize_court_name(_clean_decedent_name(raw_name))
             break
 
     # Determine doc subtype from the line

@@ -110,22 +110,44 @@ def _format_date_sift(iso_date: str) -> str:
         return iso_date
 
 
-def _split_name(full_name: str) -> tuple[str, str]:
-    """Split a full name into (first_name, last_name).
+def _split_name(full_name: str) -> tuple[str, str, str]:
+    """Split a name into (first_name, last_name, entity_type).
 
-    Handles common patterns:
-      "John Doe"         → ("John", "Doe")
-      "John A. Doe"      → ("John A.", "Doe")
-      "John Doe And Jane Doe" → ("John", "Doe And Jane Doe")
+    Assumes input is in modern `FIRST [MIDDLE] LAST [SUFFIX]` order. Court-
+    convention `LAST FIRST` names should be normalized via
+    `notice_parser.normalize_court_name()` at the scraper layer first — this
+    function trusts modern order.
+
+    entity_type is one of:
+      ""           — likely a person
+      "government" — government/municipal/HOA entity (drop downstream)
+      "business"   — LLC, Inc, Trust, Estate, etc. (keep + flag downstream)
+
+    Examples:
+      "John Doe"               → ("John", "Doe", "")
+      "John A. Doe"            → ("John A.", "Doe", "")
+      "Mary Ann Smith"         → ("Mary Ann", "Smith", "")
+      "Jimmy Dan Crosby Jr"    → ("Jimmy Dan", "Crosby", "")  # Jr stripped
+      "Travis County Trustee"  → ("", "", "government")
+      "ABC Holdings LLC"       → ("", "", "business")
     """
-    if not full_name:
-        return ("", "")
-    parts = full_name.strip().split()
+    from notice_parser import _detect_entity_type, _strip_trailing_suffixes
+
+    if not full_name or not full_name.strip():
+        return ("", "", "")
+
+    entity_type = _detect_entity_type(full_name)
+    if entity_type:
+        return ("", "", entity_type)
+
+    parts, _suffixes = _strip_trailing_suffixes(full_name.strip().split())
+    if not parts:
+        return ("", "", "")
     if len(parts) == 1:
-        return (parts[0], "")
-    first = parts[0]
-    rest = parts[1:]
-    return (first, " ".join(rest))
+        return (parts[0], "", "")
+    last = parts[-1]
+    first = " ".join(parts[:-1])
+    return (first, last, "")
 
 
 def _notice_id_from_url(url: str) -> str:
@@ -213,7 +235,7 @@ def write_csv(notices: list[NoticeData], filename: str | None = None) -> Path:
         writer.writeheader()
 
         for notice in notices:
-            first, last = _split_name(notice.owner_name)
+            first, last, _entity = _split_name(notice.owner_name)
             row = {
                 "full_name": notice.owner_name,
                 "address": notice.address,

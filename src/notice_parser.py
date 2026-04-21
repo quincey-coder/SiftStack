@@ -20,6 +20,117 @@ from playwright.async_api import Page
 logger = logging.getLogger(__name__)
 
 
+# Name-suffix tokens that can trail either a court-order ("LAST FIRST JR")
+# or modern-order ("FIRST LAST JR") name. Stripped before order detection /
+# splitting and recorded separately so they don't pollute the name fields.
+_NAME_SUFFIXES = {
+    "JR", "JR.", "SR", "SR.", "II", "III", "IV", "V",
+    "ETAL", "ET AL", "LIFE ESTATE", "LIFE",
+}
+
+# Government/municipal/non-investable entities — DataSift drops these by
+# default since investors can't buy property from a government body.
+_GOVERNMENT_KEYWORDS = {
+    "COUNTY", "CITY", "TOWN", "MUNICIPAL", "MUNICIPALITY", "STATE",
+    "GOVERNMENT", "FEDERAL", "ESD", "MUD", "WCID", "DISTRICT",
+    "AUTHORITY", "HOA", "COMMITTEE", "ASSOCIATION", "CHURCH",
+    "MINISTRIES", "SCHOOL", "ISD",
+}
+
+# Business entities — investors DO want these (skip-trace the LLC manager,
+# trustee, etc.) so we keep them and tag entity_type for downstream awareness.
+_BUSINESS_KEYWORDS = {
+    "LLC", "INC", "CORP", "CORPORATION", "COMPANY", "CO", "LTD", "LP",
+    "PARTNERSHIP", "PARTNERS", "HOLDINGS", "PROPERTIES", "REALTY",
+    "INVESTMENTS", "GROUP", "ENTERPRISES", "TRUST", "TRUSTEE", "ESTATE",
+    "BANK", "CREDIT UNION",
+}
+
+
+def _strip_trailing_suffixes(parts: list[str]) -> tuple[list[str], list[str]]:
+    """Pop trailing name suffixes (JR, ETAL, LIFE ESTATE, etc.) off a name list.
+
+    Returns (cleaned_parts, removed_suffixes). Handles two-word suffixes by
+    looking at the last two tokens combined. Order-preserving for both.
+    """
+    suffixes: list[str] = []
+    parts = list(parts)
+    while parts:
+        # Try two-word suffix first ("LIFE ESTATE", "ET AL")
+        if len(parts) >= 2:
+            two = (parts[-2] + " " + parts[-1]).upper().rstrip(".,")
+            if two in _NAME_SUFFIXES:
+                suffixes.insert(0, two)
+                parts = parts[:-2]
+                continue
+        one = parts[-1].upper().rstrip(".,")
+        if one in _NAME_SUFFIXES:
+            suffixes.insert(0, one)
+            parts = parts[:-1]
+            continue
+        break
+    return parts, suffixes
+
+
+def normalize_court_name(name: str) -> str:
+    """Convert court-format `LAST FIRST [MIDDLE]` to modern `FIRST [MIDDLE] LAST`.
+
+    Strips trailing suffixes (JR/SR/II/III/IV/V/ETAL/LIFE ESTATE) before
+    flipping, then reattaches them at the end so they don't get embedded
+    inside the first-name slot.
+
+    Examples:
+        Esparza Alice           → Alice Esparza
+        Day Robert Preston      → Robert Preston Day
+        Crosby Jimmy Dan Jr     → Jimmy Dan Crosby Jr
+        Nixon-Neal Kerry        → Kerry Nixon-Neal
+        Travis County Trustee   → Travis County Trustee  (entity, returned unchanged)
+
+    Already-normalized names ("John Smith") will be wrongly flipped, so this
+    function should ONLY be called by scrapers whose source format is known
+    to be LAST FIRST. Modern-format scrapers should leave names alone.
+    """
+    if not name or not name.strip():
+        return name
+
+    # Skip flipping if the name looks like a non-person entity — those don't
+    # have a first/last to flip and "Travis County" → "County Travis" would
+    # be worse than leaving it alone.
+    if _detect_entity_type(name) != "":
+        return name
+
+    parts = name.strip().split()
+    parts, suffixes = _strip_trailing_suffixes(parts)
+    if len(parts) < 2:
+        # Single name — nothing to flip
+        return " ".join(parts + suffixes) if suffixes else (parts[0] if parts else "")
+
+    last = parts[0]
+    rest = parts[1:]
+    flipped = rest + [last]
+    if suffixes:
+        flipped += suffixes
+    return " ".join(flipped)
+
+
+def _detect_entity_type(name: str) -> str:
+    """Classify an owner-name string as 'government', 'business', or '' (person).
+
+    Government wins over business when both keywords appear (e.g., "Travis
+    County Municipal Utility District" matches both COUNTY and DISTRICT —
+    GOVERNMENT). Empty string means likely a person.
+    """
+    if not name:
+        return ""
+    upper = name.upper()
+    tokens = set(re.findall(r"[A-Z]+", upper))
+    if tokens & _GOVERNMENT_KEYWORDS:
+        return "government"
+    if tokens & _BUSINESS_KEYWORDS:
+        return "business"
+    return ""
+
+
 @dataclass
 class NoticeData:
     """Structured data extracted from a single notice."""

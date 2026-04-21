@@ -256,7 +256,8 @@ def _parse_record(row_num: str, record_text: str, lines: list[str]) -> NoticeDat
     for line in data_lines:
         m = _GRANTOR_RE.search(line)
         if m:
-            notice.owner_name = _clean_name(m.group(1))
+            from notice_parser import normalize_court_name
+            notice.owner_name = normalize_court_name(_clean_name(m.group(1)))
             break
 
     # Look for sale date in [E] field

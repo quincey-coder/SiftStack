@@ -54,7 +54,7 @@ def _get_contacts_for_trace(
         address = notice.decision_maker_street or notice.address or ""
         city_val = notice.decision_maker_city or notice.city or ""
         zip_code = notice.decision_maker_zip or notice.zip or ""
-        first, last = _split_name(dm_name)
+        first, last, _et = _split_name(dm_name)
         if first and last:
             contacts.append((first, last, address, city_val, zip_code, dm_name))
 
@@ -79,7 +79,7 @@ def _get_contacts_for_trace(
                 if not heir.get("street"):
                     continue  # No address = can't trace effectively
                 seen.add(heir_name.lower())
-                h_first, h_last = _split_name(heir_name)
+                h_first, h_last, _et = _split_name(heir_name)
                 if h_first and h_last:
                     contacts.append((
                         h_first, h_last,
@@ -92,7 +92,7 @@ def _get_contacts_for_trace(
         # Living owner — single contact
         name = (notice.owner_name or "").strip()
         if name:
-            first, last = _split_name(name)
+            first, last, _et = _split_name(name)
             if first and last:
                 contacts.append((
                     first, last,

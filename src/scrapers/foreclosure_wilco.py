@@ -167,8 +167,9 @@ def _parse_index_pdf(text: str, sale_month: str, sale_year: int) -> list[NoticeD
     # Zip owners with entries by position
     notices = []
     count = min(len(owners), len(entries))
+    from notice_parser import normalize_court_name
     for idx in range(count):
-        owner = owners[idx].title()
+        owner = normalize_court_name(owners[idx].title())
         entry = entries[idx]
         address = entry["address"].title() if entry["address"] else ""
         city = entry["city"].title() if entry["city"] else ""

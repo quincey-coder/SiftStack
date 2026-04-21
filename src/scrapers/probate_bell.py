@@ -162,7 +162,8 @@ class BellProbateScraper:
                     if max_notices and len(all_notices) >= max_notices:
                         break
 
-                    decedent = _clean_decedent_name(row.get("grantor", ""))
+                    from notice_parser import normalize_court_name
+                    decedent = normalize_court_name(_clean_decedent_name(row.get("grantor", "")))
                     if not decedent:
                         continue
 
