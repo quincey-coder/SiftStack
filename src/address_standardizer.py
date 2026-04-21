@@ -8,6 +8,7 @@ unchanged.
 """
 
 import logging
+import re
 import time
 
 from smartystreets_python_sdk import (
@@ -24,6 +25,50 @@ from notice_parser import NoticeData
 logger = logging.getLogger(__name__)
 
 MAX_BATCH_SIZE = 100
+
+# Vacant-land legal-description tokens. Address strings containing any of these
+# are kept (and still sent to Smarty — USPS sometimes indexes by subdivision
+# name) but flagged as `vacant_land_likely` so downstream knows the lookup may
+# return no match for legitimate reasons.
+_VACANT_LAND_KEYWORDS = re.compile(
+    r"\b(TRACT|LOT|BLK|BLOCK|ACRES?|ACR|SEC|SECTION|SURVEY|SUBD|SUBDIVISION|"
+    r"ABS|ABSTRACT|UNIT|RANCH|FARM|HOMESTEAD)\b",
+    re.IGNORECASE,
+)
+
+_PO_BOX_RE = re.compile(r"\bP\.?\s*O\.?\s*BOX\b", re.IGNORECASE)
+
+
+def _classify_address(addr: str) -> str:
+    """Classify a raw address string for Smarty pre-flight routing.
+
+    Returns one of:
+      STREET_NUMBERED  — starts with a digit; normal street address. Send to Smarty.
+      VACANT_LAND      — contains TRACT/LOT/BLOCK/SEC/SURVEY/etc. Send to Smarty
+                         but flag as vacant_land_likely.
+      PO_BOX           — PO Box mailing address. Skip Smarty, flag po_box_only.
+      NEEDS_REVIEW     — no number, no land keyword (e.g. "Scenic Dr"). Skip
+                         Smarty, flag needs_address_review.
+      EMPTY            — blank input.
+    """
+    if not addr or not addr.strip():
+        return "EMPTY"
+    s = addr.strip()
+    if _PO_BOX_RE.search(s):
+        return "PO_BOX"
+    if s[0].isdigit():
+        return "STREET_NUMBERED"
+    if _VACANT_LAND_KEYWORDS.search(s):
+        return "VACANT_LAND"
+    return "NEEDS_REVIEW"
+
+
+def _add_flag(notice: NoticeData, flag: str) -> None:
+    """Append a flag to notice.missing_data_flags if not already present."""
+    existing = (notice.missing_data_flags or "").split("|")
+    if flag in existing:
+        return
+    notice.missing_data_flags = "|".join(p for p in existing + [flag] if p)
 
 
 def _build_client(auth_id: str, auth_token: str):
@@ -65,14 +110,38 @@ def standardize_addresses(
         logger.info("Smarty credentials not configured -- skipping address standardization")
         return notices
 
-    # Filter to notices that have an address worth standardizing
-    eligible = [(i, n) for i, n in enumerate(notices) if n.address.strip()]
+    # Pre-flight classification: only STREET_NUMBERED + VACANT_LAND go to
+    # Smarty. PO Boxes and "no house number" addresses get tagged and skipped.
+    counts = {"STREET_NUMBERED": 0, "VACANT_LAND": 0, "PO_BOX": 0,
+              "NEEDS_REVIEW": 0, "EMPTY": 0}
+    eligible = []
+    for i, n in enumerate(notices):
+        cls = _classify_address(n.address)
+        counts[cls] += 1
+        if cls == "STREET_NUMBERED":
+            eligible.append((i, n))
+        elif cls == "VACANT_LAND":
+            eligible.append((i, n))
+            _add_flag(n, "vacant_land_likely")
+        elif cls == "PO_BOX":
+            _add_flag(n, "po_box_only")
+        elif cls == "NEEDS_REVIEW":
+            _add_flag(n, "needs_address_review")
+        # EMPTY: no flag — already lacks an address, not actionable
+
+    logger.info(
+        "Smarty pre-flight: %d STREET_NUMBERED, %d VACANT_LAND, %d PO_BOX, "
+        "%d NEEDS_REVIEW, %d EMPTY",
+        counts["STREET_NUMBERED"], counts["VACANT_LAND"], counts["PO_BOX"],
+        counts["NEEDS_REVIEW"], counts["EMPTY"],
+    )
+
     if not eligible:
         logger.info("No notices with addresses to standardize")
         return notices
 
     logger.info(
-        "Standardizing %d addresses via Smarty (%d skipped -- no address)",
+        "Standardizing %d addresses via Smarty (%d skipped — no street number / PO Box / empty)",
         len(eligible),
         len(notices) - len(eligible),
     )
