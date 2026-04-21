@@ -124,6 +124,12 @@ class TravisTaxDelinquentScraper:
             if owner_name.isupper():
                 owner_name = owner_name.title()
 
+            # Travis Tax Office CSV stores owner names in LAST FIRST order —
+            # flip to modern FIRST LAST so downstream _split_name() puts the
+            # first name in First Name column, not the last name.
+            from notice_parser import normalize_court_name
+            owner_name = normalize_court_name(owner_name)
+
             # Parse delinquency info
             delinquent_total = row.get("Delinquent Total", "0").strip()
             total_due = row.get("Total Due", "0").strip()
