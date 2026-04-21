@@ -1129,6 +1129,11 @@ def cli_main() -> None:
         action="store_true",
         help="Keep government-owned records in DataSift CSV (Travis County Trustee, City Of Lakeway, etc.); default drops them",
     )
+    parser.add_argument(
+        "--rebuild-dedup",
+        action="store_true",
+        help="One-shot: scrape all sources and seed seen_ids.json with raw-address dedup keys, then exit without running the pipeline. Use once after the pre-pipeline dedup-snapshot fix so prior-run Smarty-normalized keys get replaced by raw-address keys.",
+    )
 
     # PDF import arguments
     parser.add_argument(
@@ -1889,14 +1894,43 @@ def _run_scrape_pipeline(args, targets) -> None:
         except Exception as e:
             logging.warning("Property lookup failed: %s -- continuing without lookups", e)
 
+    # Snapshot dedup key ON EACH NOTICE BEFORE THE PIPELINE RUNS. Smarty
+    # (Step 6) rewrites notice.address in place, so computing the key at
+    # scrape time vs at pipeline-end time produces DIFFERENT keys for the
+    # same property. This bug caused ~170 same-property records to slip
+    # past the incremental dedup daily because yesterday's stored (post-
+    # Smarty) key no longer matched today's (pre-Smarty) check-time key.
+    # Snapshot now, use the snapshot for both the filter AND the save.
+    for n in notices:
+        n._dedup_key = _notice_dedup_key(n)
+
+    # --rebuild-dedup mode: seed seen_ids with every scraped record's raw
+    # key and exit without running the enrichment pipeline. Used to migrate
+    # an existing seen_ids.json from post-Smarty keys to raw-address keys
+    # after the snapshot fix ships — one-shot operation.
+    if getattr(args, "rebuild_dedup", False):
+        added = 0
+        for n in notices:
+            if n._dedup_key not in cli_seen_ids:
+                cli_seen_ids.add(n._dedup_key)
+                added += 1
+        logging.info(
+            "Rebuild dedup: scraped %d records, added %d raw-address keys "
+            "(%d already present). Total seen_ids: %d",
+            len(notices), added, len(notices) - added, len(cli_seen_ids),
+        )
+        _save_cli_state(cli_seen_ids)
+        logging.info("Rebuild complete — exiting without running pipeline.")
+        return
+
     # Filter out notices we've already processed in a prior run. Runs AFTER
     # probate CAD lookup so probate records have their property address
     # populated (otherwise every scraped-but-un-located probate record would
-    # share the same empty-address composite key). Uses the same key format
-    # in the filter AND in the persist step so tomorrow's record matches.
+    # share the same empty-address composite key). Uses the snapshot key so
+    # downstream pipeline mutations to notice.address don't poison the match.
     if cli_seen_ids and notices:
         before = len(notices)
-        notices = [n for n in notices if _notice_dedup_key(n) not in cli_seen_ids]
+        notices = [n for n in notices if n._dedup_key not in cli_seen_ids]
         filtered = before - len(notices)
         if filtered:
             logging.info(
@@ -2010,7 +2044,11 @@ def _run_scrape_pipeline(args, targets) -> None:
     # Uses the same composite dedup key as the filter step — monotonic growth.
     if args.mode == "daily":
         for n in notices:
-            cli_seen_ids.add(_notice_dedup_key(n))
+            # Use the pre-pipeline snapshot key set earlier (Smarty may have
+            # mutated notice.address since then). Fall back to recomputing
+            # if the snapshot somehow wasn't attached (defensive).
+            key = getattr(n, "_dedup_key", None) or _notice_dedup_key(n)
+            cli_seen_ids.add(key)
         _save_cli_state(cli_seen_ids)
 
     # Generate deep-prospecting PDFs for deceased/DM/heir records.
