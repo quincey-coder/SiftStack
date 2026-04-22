@@ -20,6 +20,9 @@ STATE_FILE = PROJECT_ROOT / "last_run.json"
 SEEN_IDS_FILE = PROJECT_ROOT / "seen_ids.json"
 DROPBOX_STATE_FILE = PROJECT_ROOT / "dropbox_state.json"
 PHOTO_STATE_FILE = PROJECT_ROOT / "photo_state.json"
+# Travis tax-delinquent cross-run state (skill-ported cleaner + dropped/new/repeat diff)
+TRAVIS_TEXDEL_STATE_DIR = PROJECT_ROOT / "data" / "travis_tax_state"
+TRAVIS_TEXDEL_RAW_DIR = PROJECT_ROOT / "data" / "travis_tax_raw"
 
 # ── Dropbox Watcher ────────────────────────────────────────────────────
 DROPBOX_POLL_INTERVAL = int(os.getenv("DROPBOX_POLL_INTERVAL", "900"))  # seconds (default 15 min)

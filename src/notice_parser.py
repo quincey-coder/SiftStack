@@ -176,6 +176,10 @@ class NoticeData:
     parcel_id: str = ""                # County assessor parcel ID
     tax_delinquent_amount: str = ""    # Total delinquent tax owed ($)
     tax_delinquent_years: str = ""     # Number of years delinquent
+    # Travis tax-delinquent cleaner outputs (empty for all other scrapers)
+    business_name: str = ""            # Entity name when owner_name is business (skill overflow merge result)
+    mailing_address: str = ""          # Cleaned mailing address, distinct from property address
+    tax_raw_meta: str = ""             # JSON blob: land/improvement/assessed values, sequence #, cause #, etc.
     # Deceased owner detection
     deceased_indicator: str = ""       # "life_estate", "personal_rep", "trustee", "care_of", "et_al", or ""
     tax_owner_name: str = ""           # Raw owner name from county tax API
