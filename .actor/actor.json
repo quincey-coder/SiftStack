@@ -1,12 +1,18 @@
 {
     "actorSpecification": 1,
-    "name": "tn-public-notice-scraper",
-    "title": "SiftStack — REI Operations Platform",
-    "description": "Full-stack real estate investing operations platform. Data acquisition (web scrape, PDF, courthouse photos), enrichment (Smarty, Zillow, tax, obituary, skip trace), deal analysis (comps, rehab, MAO), CRM automation (DataSift sequences, niche sequential), and lead management.",
-    "version": "1.0",
+    "name": "sift-stack",
+    "title": "SiftStack — TX REI Operations Platform",
+    "description": "REI pipeline for Travis/Bell/Williamson TX — scrapes foreclosures, probate, tax-sale, and Travis tax-delinquent. Runs Smarty + Zillow + obituary/deceased-owner detection, detects sold/paid-off properties via cross-run diff, outputs DataSift CSVs + deep-prospecting PDFs.",
+    "version": "1.1",
     "buildTag": "latest",
     "input": "./input_schema.json",
     "dockerfile": "../Dockerfile",
+    "minMemoryMbytes": 2048,
+    "maxMemoryMbytes": 4096,
+    "defaultRunOptions": {
+        "memoryMbytes": 2048,
+        "timeoutSecs": 3600
+    },
     "storages": {
         "dataset": {
             "actorSpecification": 1,

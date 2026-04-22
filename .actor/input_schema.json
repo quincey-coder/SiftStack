@@ -7,10 +7,11 @@
         "mode": {
             "title": "Scrape Mode",
             "type": "string",
-            "description": "daily = new notices since last run; historical = last 12 months",
+            "description": "daily = new notices since last run (uses stored last_run_date); historical = full 12-month backfill",
             "enum": ["daily", "historical"],
             "default": "daily",
-            "editor": "select"
+            "editor": "select",
+            "sectionCaption": "Scrape scope"
         },
         "counties": {
             "title": "Counties",
@@ -23,179 +24,316 @@
         "types": {
             "title": "Notice Types",
             "type": "array",
-            "description": "Notice types to scrape. Currently only foreclosure is supported.",
+            "description": "Notice types. Leave empty for all (foreclosure, probate, tax_sale, tax_delinquent).",
             "items": { "type": "string" },
-            "default": ["foreclosure"],
+            "default": [],
             "editor": "stringList"
         },
         "since_date": {
-            "title": "Since Date",
+            "title": "Since Date Override",
             "type": "string",
-            "description": "Pull notices published on or after this date (YYYY-MM-DD). Overrides mode-based date logic.",
+            "description": "Pull notices published on or after this date (YYYY-MM-DD). Overrides mode-based date logic and the stored last_run_date.",
             "editor": "textfield",
             "default": ""
         },
-        "start_page": {
-            "title": "Start Page",
+        "rebuild_dedup_only": {
+            "title": "Rebuild Dedup Only",
+            "type": "boolean",
+            "description": "One-shot mode: scrape all sources, seed seen_notice_ids with today's dedup keys, save state, exit WITHOUT running enrichment or sending notifications. Use once after a breaking change to dedup logic.",
+            "default": false,
+            "editor": "checkbox"
+        },
+
+        "enable_obituary": {
+            "title": "Enable Obituary / Deceased-Owner Detection",
+            "type": "boolean",
+            "description": "Search obituaries via Google + DuckDuckGo to detect deceased owners, then run heir verification + DM address lookup. Adds ~5-10 min/run. Uses Anthropic (Haiku) and Serper credits.",
+            "default": true,
+            "editor": "checkbox",
+            "sectionCaption": "Enrichment toggles"
+        },
+        "enable_ancestry": {
+            "title": "Enable Ancestry.com Lookup",
+            "type": "boolean",
+            "description": "Query Ancestry.com SSDI for heir DOD verification. Requires ANCESTRY credentials. Off by default.",
+            "default": false,
+            "editor": "checkbox"
+        },
+        "enable_tracerfy": {
+            "title": "Enable Tracerfy Batch Skip Trace",
+            "type": "boolean",
+            "description": "Run Tracerfy on deep-prospecting candidates (deceased owners / heir maps / DMs). Requires tracerfy_api_key with credits.",
+            "default": false,
+            "editor": "checkbox"
+        },
+        "enable_trestle": {
+            "title": "Enable Trestle Phone Tier Scoring",
+            "type": "boolean",
+            "description": "Score every discovered phone (DM #1 + heirs) with Trestle's 5-tier dial priority. Requires trestle_api_key and --enable-tracerfy.",
+            "default": false,
+            "editor": "checkbox"
+        },
+        "research_entities": {
+            "title": "Research Entity-Owned Properties",
+            "type": "boolean",
+            "description": "For LLC/Corp/Trust owners, run web search + LLM to find the real person behind the entity.",
+            "default": false,
+            "editor": "checkbox"
+        },
+        "skip_smarty": {
+            "title": "Skip Smarty Address Standardization",
+            "type": "boolean",
+            "description": "Skip USPS address standardization. Normally ON.",
+            "default": false,
+            "editor": "checkbox"
+        },
+        "skip_zillow": {
+            "title": "Skip Zillow Enrichment",
+            "type": "boolean",
+            "description": "Skip Zillow property enrichment (Zestimate, beds/baths, MLS status). Biggest compute consumer at ~6s/record — disable for cheaper runs.",
+            "default": false,
+            "editor": "checkbox"
+        },
+        "skip_tax": {
+            "title": "Skip Tax Delinquency Enrichment",
+            "type": "boolean",
+            "description": "Skip Travis/Bell/Williamson CAD tax enrichment step.",
+            "default": false,
+            "editor": "checkbox"
+        },
+        "skip_geocode": {
+            "title": "Skip Reverse-Geocode Retry",
+            "type": "boolean",
+            "description": "Skip the reverse-geocode retry for addresses Smarty couldn't match.",
+            "default": false,
+            "editor": "checkbox"
+        },
+        "skip_zip_filter": {
+            "title": "Skip Investor-ZIP Filter",
+            "type": "boolean",
+            "description": "Disable the investor-active ZIP code filter. Keeps records from all ZIPs.",
+            "default": false,
+            "editor": "checkbox"
+        },
+        "skip_condo_filter": {
+            "title": "Skip Condo/Townhouse Filter",
+            "type": "boolean",
+            "description": "Keep condo/townhouse records instead of dropping them.",
+            "default": false,
+            "editor": "checkbox"
+        },
+        "keep_listed": {
+            "title": "Keep Listed Properties",
+            "type": "boolean",
+            "description": "Keep Active/Pending/Sold/For-Rent records. Default OFF — Zillow-listed properties get filtered out post-enrichment.",
+            "default": false,
+            "editor": "checkbox"
+        },
+        "keep_government_records": {
+            "title": "Keep Government-Owned Records",
+            "type": "boolean",
+            "description": "Keep records owned by City Of, Travis County, State Of, etc. in the DataSift CSV. Default OFF — government records get dropped.",
+            "default": false,
+            "editor": "checkbox"
+        },
+        "skip_heir_verification": {
+            "title": "Skip Heir Alive/Dead Verification",
+            "type": "boolean",
+            "description": "Skip the heir verification loop (still runs obituary search).",
+            "default": false,
+            "editor": "checkbox"
+        },
+        "skip_dm_address": {
+            "title": "Skip DM Address Lookup",
+            "type": "boolean",
+            "description": "Skip the decision-maker mailing-address lookup.",
+            "default": false,
+            "editor": "checkbox"
+        },
+        "max_heir_depth": {
+            "title": "Max Heir Recursion Depth",
             "type": "integer",
-            "description": "Page number to start scraping from (default 1). Use to resume a previous run without re-scraping earlier pages.",
-            "default": 1,
-            "minimum": 1,
+            "description": "Max depth for heir verification (default 2).",
+            "default": 2,
+            "minimum": 0,
+            "maximum": 5,
             "editor": "number"
         },
+        "obituary_workers": {
+            "title": "Obituary Workers",
+            "type": "integer",
+            "description": "Concurrent workers for obituary Phase A (default 4). Higher = faster but more rate-limit risk.",
+            "default": 4,
+            "minimum": 1,
+            "maximum": 16,
+            "editor": "number"
+        },
+
+        "exclude_vacant": {
+            "title": "Exclude Vacant Land",
+            "type": "boolean",
+            "description": "Remove vacant land parcels. Default OFF — kept.",
+            "default": false,
+            "editor": "checkbox",
+            "sectionCaption": "Buy-box filters"
+        },
+        "exclude_commercial": {
+            "title": "Exclude Commercial Properties",
+            "type": "boolean",
+            "description": "Remove commercial properties. Default OFF — kept.",
+            "default": false,
+            "editor": "checkbox"
+        },
+        "exclude_entities": {
+            "title": "Exclude Entity-Owned Properties",
+            "type": "boolean",
+            "description": "Remove LLC/Corp/Trust owners (unless research_entities found a person). Default OFF — kept.",
+            "default": false,
+            "editor": "checkbox"
+        },
+
+        "min_delinquent_years": {
+            "title": "Min Years Delinquent (Travis Tax)",
+            "type": "integer",
+            "description": "Travis tax-delinquent: minimum years behind on taxes (default 2).",
+            "default": 2,
+            "minimum": 0,
+            "maximum": 20,
+            "editor": "number",
+            "sectionCaption": "Travis tax-delinquent filters"
+        },
+        "min_delinquent_amount": {
+            "title": "Min $ Owed (Travis Tax)",
+            "type": "integer",
+            "description": "Travis tax-delinquent: minimum total owed in dollars (default 3000).",
+            "default": 3000,
+            "minimum": 0,
+            "editor": "number"
+        },
+        "skip_texdel_cleaner": {
+            "title": "Skip Travis Tax-Delinquent Skill Cleaner",
+            "type": "boolean",
+            "description": "Bypass the skill cleaner (overflow merge, address contamination strip, blank-zip resolver). Safety valve.",
+            "default": false,
+            "editor": "checkbox"
+        },
+
         "use_residential_proxy": {
             "title": "Use Residential Proxy",
             "type": "boolean",
-            "description": "Route requests through Apify residential proxies to avoid IP blocks.",
+            "description": "Route requests through Apify residential proxies. Default OFF on Free plan (saves quota). TX county sites don't require it.",
+            "default": false,
+            "editor": "checkbox",
+            "sectionCaption": "Operational"
+        },
+        "notify_slack": {
+            "title": "Send Slack Notification",
+            "type": "boolean",
+            "description": "Post run summary + Travis tax-delinquent diff block (NEW/REPEAT/DROPPED) to Slack/Discord webhook.",
             "default": true,
             "editor": "checkbox"
         },
+
         "google_drive_folder_id": {
             "title": "Google Drive Folder ID",
             "type": "string",
-            "description": "Google Drive folder ID for CSV upload. Leave empty to skip Drive upload.",
+            "description": "Drive folder ID for CSV upload. Leave empty to skip.",
             "editor": "textfield",
-            "default": ""
+            "default": "",
+            "sectionCaption": "Google Drive"
         },
         "google_service_account_key": {
             "title": "Google Service Account Key (base64)",
             "type": "string",
-            "description": "Base64-encoded JSON key for the Google service account. Required if google_drive_folder_id is set.",
+            "description": "Base64-encoded service account JSON. Required if google_drive_folder_id is set.",
             "editor": "textarea",
             "isSecret": true
+        },
+
+        "apify_token": {
+            "title": "Apify Personal API Token",
+            "type": "string",
+            "description": "Your Apify Personal API token (Console → Settings → Integrations → Personal API token). Required — Apify's auto-injected run token cannot access the cross-run state KVS. Paste once; scheduled runs inherit it.",
+            "editor": "textfield",
+            "isSecret": true,
+            "sectionCaption": "API keys (secrets)"
         },
         "anthropic_api_key": {
             "title": "Anthropic API Key",
             "type": "string",
-            "description": "API key for Claude Haiku LLM parsing. When set, notices that fail regex parsing are sent to Claude for structured extraction. Optional but recommended.",
+            "description": "Claude Haiku for LLM parsing + obituary snippet analysis. Recommended.",
             "editor": "textfield",
             "isSecret": true
         },
         "smarty_auth_id": {
             "title": "Smarty Auth ID",
             "type": "string",
-            "description": "Auth ID from smarty.com for USPS address standardization. When set (with auth token), addresses are batch-standardized with geocoding, vacancy detection, and ZIP+4. Optional.",
+            "description": "USPS address standardization (smarty.com).",
             "editor": "textfield",
             "isSecret": true
         },
         "smarty_auth_token": {
             "title": "Smarty Auth Token",
             "type": "string",
-            "description": "Auth token from smarty.com (paired with Auth ID). Required if smarty_auth_id is set.",
+            "description": "Smarty auth token (paired with auth_id).",
             "editor": "textfield",
             "isSecret": true
         },
         "openwebninja_api_key": {
-            "title": "OpenWeb Ninja API Key (Zillow Enrichment)",
+            "title": "OpenWeb Ninja API Key (Zillow)",
             "type": "string",
-            "description": "API key from openwebninja.com for the Real-Time Zillow Data API. Enriches properties with MLS status, Zestimate, equity estimate, and property type. Free tier: 100 requests/month. Optional.",
+            "description": "Real-time Zillow Data API. Free tier 100/month.",
             "editor": "textfield",
             "isSecret": true
         },
         "serper_api_key": {
             "title": "Serper.dev API Key",
             "type": "string",
-            "description": "API key from serper.dev for Google Search. Used for DM address lookup via people search sites. Free tier: 2,500 queries. Optional.",
+            "description": "Google search (obituary lookup + DM address). Free tier 2,500 queries.",
             "editor": "textfield",
             "isSecret": true
         },
         "firecrawl_api_key": {
             "title": "Firecrawl API Key",
             "type": "string",
-            "description": "API key from firecrawl.dev for JS-rendered page scraping. Used for DM address extraction from people search sites. Free tier: 500 pages. Optional.",
+            "description": "JS-rendered page scraping for DM address extraction. Free tier 500 pages.",
             "editor": "textfield",
             "isSecret": true
         },
         "tracerfy_api_key": {
             "title": "Tracerfy API Key",
             "type": "string",
-            "description": "API key from tracerfy.com for skip tracing. Provides guaranteed DM mailing addresses at $0.02/record. Optional.",
+            "description": "Batch skip-trace service. Required only if enable_tracerfy is true.",
             "editor": "textfield",
             "isSecret": true
         },
         "trestle_api_key": {
             "title": "Trestle API Key",
             "type": "string",
-            "description": "API key from trestleiq.com for phone validation scoring. Assigns 5-tier dial priority to phone numbers. Optional.",
+            "description": "Phone validation + 5-tier dial priority. Required only if enable_trestle is true.",
             "editor": "textfield",
             "isSecret": true
         },
         "datasift_email": {
             "title": "DataSift Email",
             "type": "string",
-            "description": "Login email for DataSift.ai (app.reisift.io). Required for automatic CRM upload after scraping.",
+            "description": "app.reisift.io login (currently unused — manual upload only).",
             "editor": "textfield",
             "isSecret": true
         },
         "datasift_password": {
             "title": "DataSift Password",
             "type": "string",
-            "description": "Login password for DataSift.ai. Required for automatic CRM upload.",
+            "description": "app.reisift.io password (currently unused — manual upload only).",
             "editor": "textfield",
             "isSecret": true
         },
         "slack_webhook_url": {
-            "title": "Slack/Discord Webhook URL",
+            "title": "Slack / Discord Webhook URL",
             "type": "string",
-            "description": "Webhook URL for run summary notifications. Works with Slack incoming webhooks or Discord /slack endpoints. Optional.",
+            "description": "Webhook URL for run summary notifications.",
             "editor": "textfield",
             "isSecret": true
-        },
-        "upload_datasift": {
-            "title": "Upload to DataSift",
-            "type": "boolean",
-            "description": "Automatically upload enriched records to DataSift.ai CRM after scraping. Requires datasift_email and datasift_password.",
-            "default": true,
-            "editor": "checkbox"
-        },
-        "enrich_datasift": {
-            "title": "Enrich in DataSift",
-            "type": "boolean",
-            "description": "Run DataSift's Enrich Property Information (SiftMap) after upload. Adds beds, baths, Zestimate, etc.",
-            "default": true,
-            "editor": "checkbox"
-        },
-        "skip_trace_datasift": {
-            "title": "Skip Trace in DataSift",
-            "type": "boolean",
-            "description": "Run DataSift's built-in Skip Trace after upload. Pulls phone numbers and emails via unlimited plan.",
-            "default": true,
-            "editor": "checkbox"
-        },
-        "run_tracerfy": {
-            "title": "Run Tracerfy Skip Trace",
-            "type": "boolean",
-            "description": "Run Tracerfy batch skip trace before DataSift upload. Populates phone/email fields in the CSV. Requires tracerfy_api_key.",
-            "default": true,
-            "editor": "checkbox"
-        },
-        "notify_slack": {
-            "title": "Send Slack Notification",
-            "type": "boolean",
-            "description": "Send a run summary to Slack/Discord after pipeline completes. Also sends error alerts on failure. Requires slack_webhook_url.",
-            "default": true,
-            "editor": "checkbox"
-        },
-        "include_vacant": {
-            "title": "Include Vacant Land",
-            "type": "boolean",
-            "description": "Keep vacant land parcels (no house number). Default OFF — turn ON if your buy box includes land deals.",
-            "default": false,
-            "editor": "checkbox"
-        },
-        "include_commercial": {
-            "title": "Include Commercial Properties",
-            "type": "boolean",
-            "description": "Keep commercial properties (Smarty RDI = Commercial). Default OFF — turn ON if your buy box includes commercial.",
-            "default": false,
-            "editor": "checkbox"
-        },
-        "include_entities": {
-            "title": "Include Entity-Owned Properties",
-            "type": "boolean",
-            "description": "Keep LLC/Corp/Trust-owned records without filtering. Default OFF — entities are removed unless a person is found behind them.",
-            "default": false,
-            "editor": "checkbox"
         }
     }
 }

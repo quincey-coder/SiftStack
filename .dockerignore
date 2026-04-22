@@ -1,0 +1,61 @@
+# Version control
+.git/
+.gitignore
+.gitattributes
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.Python
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Claude Code + planning artifacts
+.claude/
+.planning/
+
+# Runtime state — must NOT be baked into the image.
+# Apify KVS is the source of truth for state; local files exist only for
+# CLI development and would overwrite KVS state if they leaked into the image.
+seen_ids.json
+seen_ids.json.bak
+last_run.json
+last_run.json.bak
+dropbox_state.json
+photo_state.json
+datasift_cookies.json
+*.bak
+
+# Secrets — triple-belt-and-suspenders (already listed in .gitignore too)
+.env
+.env.*
+!.env.example
+input.json
+
+# Output + logs (recreated per run)
+output/
+logs/
+data/
+
+# Large reference folders never needed in the container
+Skills for REI/
+docs/
+
+# Test fixtures
+test_*.py
+tests/

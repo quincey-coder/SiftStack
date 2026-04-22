@@ -177,12 +177,20 @@ def _preflight_check(mode: str) -> list[str]:
 async def actor_main() -> None:
     """Run as an Apify Actor — full automated pipeline.
 
-    Scrape → Enrich → Tracerfy → DataSift Upload → Slack Notification.
+    Scrape → Dedup → Enrich → Tracerfy (opt) → PDFs → DataSift CSVs →
+    Drive upload → Slack Notification. Mirrors `_run_scrape_pipeline()`
+    (the CLI path) feature-for-feature, reading toggles from Actor input.
+
+    State persistence across runs:
+      - `last_run_date` (KVS) — daily since_date window
+      - `seen_notice_ids` (KVS) — dedup keys monotonic growth
+      - `travis_texdel_state` (KVS) — Travis tax-delinquent APN baseline
+        for the NEW/REPEAT/DROPPED cross-run diff
     """
     from apify import Actor
     from time import time as _time
+    from scrapers import travis_texdel_state as _texdel_state
 
-    # Set up Python logging so all modules output at INFO level
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -192,9 +200,7 @@ async def actor_main() -> None:
         pipeline_start = _time()
         actor_input = await Actor.get_input() or {}
 
-        # Override config credentials from Actor input.
-        # Set both config.* AND os.environ so downstream modules that read
-        # from either source (e.g., datasift_uploader uses os.environ) pick them up.
+        # ── Credentials → config + env (downstream modules read either) ──
         _cred_map = {
             "ANTHROPIC_API_KEY": actor_input.get("anthropic_api_key", ""),
             "SMARTY_AUTH_ID": actor_input.get("smarty_auth_id", ""),
@@ -213,24 +219,56 @@ async def actor_main() -> None:
             if val:
                 os.environ[key] = val
 
+        # ── Scrape scope ────────────────────────────────────────────
         mode = actor_input.get("mode", "daily")
         counties = actor_input.get("counties") or None
         types = actor_input.get("types") or None
-        since_date_override = actor_input.get("since_date", "").strip()
-        start_page = int(actor_input.get("start_page", 1) or 1)
+        since_date_override = (actor_input.get("since_date") or "").strip()
         drive_folder_id = actor_input.get("google_drive_folder_id", "")
         drive_key_b64 = actor_input.get("google_service_account_key", "")
+        if drive_folder_id:
+            config.GOOGLE_DRIVE_FOLDER_ID = drive_folder_id
+        if drive_key_b64:
+            config.GOOGLE_SERVICE_ACCOUNT_KEY = drive_key_b64
 
-        # Pipeline toggles
-        do_tracerfy = actor_input.get("run_tracerfy", True)
-        do_notify_slack = actor_input.get("notify_slack", True)
+        # ── Scraper kwargs (tax-delinquent thresholds + skill cleaner knobs) ──
+        min_years = int(actor_input.get("min_delinquent_years", 2) or 2)
+        min_amount = float(actor_input.get("min_delinquent_amount", 3000.0) or 3000.0)
+        skip_texdel_cleaner = bool(actor_input.get("skip_texdel_cleaner", False))
+        scraper_kwargs = {"min_years": min_years, "min_amount": min_amount}
+        if skip_texdel_cleaner:
+            scraper_kwargs["skip_cleaner"] = True
 
-        # Buy box / filter toggles (default: keep everything)
-        exclude_vacant = actor_input.get("exclude_vacant", False)
-        exclude_commercial = actor_input.get("exclude_commercial", False)
-        exclude_entities = actor_input.get("exclude_entities", False)
+        # ── Enrichment flags (mirror CLI) ──
+        enable_obituary = bool(actor_input.get("enable_obituary", False))
+        enable_ancestry = bool(actor_input.get("enable_ancestry", False))
+        enable_tracerfy = bool(actor_input.get("enable_tracerfy", False))
+        enable_trestle = bool(actor_input.get("enable_trestle", False))
+        research_entities = bool(actor_input.get("research_entities", False))
+        keep_government = bool(actor_input.get("keep_government_records", False))
+        keep_listed = bool(actor_input.get("keep_listed", False))
+        skip_smarty = bool(actor_input.get("skip_smarty", False))
+        skip_zillow = bool(actor_input.get("skip_zillow", False))
+        skip_tax = bool(actor_input.get("skip_tax", False))
+        skip_geocode = bool(actor_input.get("skip_geocode", False))
+        skip_zip_filter = bool(actor_input.get("skip_zip_filter", False))
+        skip_condo_filter = bool(actor_input.get("skip_condo_filter", False))
+        skip_heir_verification = bool(actor_input.get("skip_heir_verification", False))
+        skip_dm_address = bool(actor_input.get("skip_dm_address", False))
+        max_heir_depth = int(actor_input.get("max_heir_depth", 2) or 2)
+        obituary_workers = int(actor_input.get("obituary_workers", 4) or 4)
 
-        # Filter targets
+        # Legacy buy-box toggles (kept for backwards compatibility)
+        exclude_vacant = bool(actor_input.get("exclude_vacant", False))
+        exclude_commercial = bool(actor_input.get("exclude_commercial", False))
+        exclude_entities = bool(actor_input.get("exclude_entities", False))
+
+        # ── Operational toggles ──
+        do_notify_slack = bool(actor_input.get("notify_slack", True))
+        rebuild_dedup_only = bool(actor_input.get("rebuild_dedup_only", False))
+        use_proxy = bool(actor_input.get("use_residential_proxy", False))  # Default OFF on Free plan
+
+        # ── Filter targets ──
         targets = _filter_targets(counties, types)
         if not targets:
             Actor.log.error("No scrape targets match the given counties/types filters")
@@ -243,342 +281,467 @@ async def actor_main() -> None:
             ", ".join(f"{c}/{t}" for c, t in targets),
         )
 
-        # Set up residential proxy if requested
-        proxy_url: str | None = None
-        use_proxy = actor_input.get("use_residential_proxy", True)
+        # ── Residential proxy (default OFF on Free plan) ──
         if use_proxy:
             try:
-                proxy_config = await Actor.create_proxy_configuration(
-                    groups=["RESIDENTIAL"]
-                )
-                proxy_url = await proxy_config.new_url()
+                proxy_config = await Actor.create_proxy_configuration(groups=["RESIDENTIAL"])
+                _ = await proxy_config.new_url()
                 Actor.log.info("Residential proxy configured")
             except Exception:
-                Actor.log.warning("Could not configure residential proxy — running without proxy")
+                Actor.log.warning("Could not configure residential proxy — continuing without")
 
-        # Track seen notice IDs for incremental dedup
-        seen_ids: set[str] = set()
-
-        def _notice_id(url: str) -> str:
-            import re
-            m = re.search(r"[?&]ID=(\d+)", url)
-            return m.group(1) if m else ""
-
-        async def push_batch(batch_notices):
-            """Push new unique notices to dataset immediately after each search."""
-            unique = []
-            for n in batch_notices:
-                nid = _notice_id(n.source_url)
-                if nid and nid in seen_ids:
-                    continue
-                if nid:
-                    seen_ids.add(nid)
-                unique.append(n)
-            if unique:
-                await Actor.push_data([
-                    {
-                        "date_added": n.date_added,
-                        "address": n.address,
-                        "city": n.city,
-                        "state": n.state,
-                        "zip": n.zip,
-                        "owner_name": n.owner_name,
-                        "notice_type": n.notice_type,
-                        "county": n.county,
-                        "decedent_name": n.decedent_name,
-                        "owner_street": n.owner_street,
-                        "owner_city": n.owner_city,
-                        "owner_state": n.owner_state,
-                        "owner_zip": n.owner_zip,
-                        "auction_date": n.auction_date,
-                        "zip_plus4": n.zip_plus4,
-                        "latitude": n.latitude,
-                        "longitude": n.longitude,
-                        "dpv_match_code": n.dpv_match_code,
-                        "vacant": n.vacant,
-                        "rdi": n.rdi,
-                        "mls_status": n.mls_status,
-                        "mls_listing_price": n.mls_listing_price,
-                        "mls_last_sold_date": n.mls_last_sold_date,
-                        "mls_last_sold_price": n.mls_last_sold_price,
-                        "estimated_value": n.estimated_value,
-                        "estimated_equity": n.estimated_equity,
-                        "equity_percent": n.equity_percent,
-                        "property_type": n.property_type,
-                        "bedrooms": n.bedrooms,
-                        "bathrooms": n.bathrooms,
-                        "sqft": n.sqft,
-                        "year_built": n.year_built,
-                        "lot_size": n.lot_size,
-                        "source_url": n.source_url,
-                        "raw_text": n.raw_text[:5000] if n.raw_text else "",
-                    }
-                    for n in unique
-                ])
-                Actor.log.info("Pushed %d records to dataset (incremental)", len(unique))
-
-        # Log LLM parser status
         if config.ANTHROPIC_API_KEY:
-            Actor.log.info("LLM fallback enabled (Claude Haiku) for missing fields")
+            Actor.log.info("LLM fallback enabled (Claude Haiku)")
         else:
             Actor.log.info("LLM fallback disabled — set anthropic_api_key to enable")
 
-        if start_page > 1:
-            Actor.log.info("Starting from page %d (skipping earlier pages)", start_page)
-
         try:
-            kvs = await Actor.open_key_value_store()
+            # Cross-run state lives in a user-namespace named KVS
+            # "sift-stack-state", seeded externally by scripts/seed_apify_kvs.py.
+            # The run's auto-generated token can't access user-scope stores, so
+            # use ApifyClient with the user's APIFY_TOKEN (passed via input or
+            # auto-injected by Apify in scheduled runs).
+            from apify_client import ApifyClientAsync
+            _user_token = (
+                actor_input.get("apify_token")
+                or os.environ.get("APIFY_TOKEN", "")
+            )
+            if not _user_token:
+                Actor.log.error(
+                    "apify_token not supplied — cross-run state cannot be read/written. "
+                    "Add apify_token to Actor input (Settings → Integrations → Personal API token)."
+                )
+                await Actor.fail(status_message="Missing apify_token input")
+                return
+            _user_client = ApifyClientAsync(_user_token)
+            _kvs_info = await _user_client.key_value_stores().get_or_create(
+                name="sift-stack-state",
+            )
+            _state_kvs = _user_client.key_value_store(_kvs_info["id"])
+            Actor.log.info(
+                "Cross-run KVS 'sift-stack-state' opened (id=%s)", _kvs_info["id"],
+            )
 
-            # ── Load last_run_date from Apify KVS (persists between runs) ──
+            # Thin async wrappers mirroring the Actor-SDK KVS API so downstream
+            # code reads the same way (`await kvs.get_value(...)` etc.).
+            class _UserKVS:
+                def __init__(self, client):
+                    self._c = client
+
+                async def get_value(self, key, default=None):
+                    rec = await self._c.get_record(key)
+                    if not rec:
+                        return default
+                    return rec.get("value")
+
+                async def set_value(self, key, value, content_type=None):
+                    if content_type is None:
+                        return await self._c.set_record(key, value)
+                    return await self._c.set_record(key, value, content_type=content_type)
+
+            kvs = _UserKVS(_state_kvs)
+
+            # ── Load last_run_date ──
             if mode == "daily" and not since_date_override:
                 stored = await kvs.get_value("last_run_date")
                 if stored:
                     since_date_override = stored
                     Actor.log.info("Daily mode: using stored last_run_date = %s", stored)
                 else:
-                    Actor.log.info("Daily mode: no stored last_run_date, defaulting to 7 days")
+                    Actor.log.info(
+                        "Daily mode: no stored last_run_date — scrapers fall back to "
+                        "default window (365 days). Seed KVS via scripts/seed_apify_kvs.py "
+                        "to pick up where local CLI left off."
+                    )
 
-            # ── Load cross-run seen-ID cache from KVS (makes daily re-runs idempotent) ──
-            seen_ids = await kvs.get_value("seen_notice_ids") or {}
+            # ── Load cross-run seen_notice_ids (dedup) ──
+            stored_seen = await kvs.get_value("seen_notice_ids") or []
+            if isinstance(stored_seen, dict):
+                # Legacy shape tolerance — old runs stored a dict
+                stored_seen = list(stored_seen.keys()) or list(stored_seen.values())
+            seen_ids: set[str] = set(stored_seen)
             Actor.log.info("Loaded %d previously-seen notice IDs from KVS", len(seen_ids))
 
-            async def persist_seen_ids(ids: dict) -> None:
-                """Mid-run persistence — if a later search crashes, progress is kept."""
-                try:
-                    await kvs.set_value("seen_notice_ids", ids)
-                    await kvs.set_value(
-                        "last_run_date",
-                        datetime.now().strftime("%Y-%m-%d"),
-                    )
-                except Exception as e:
-                    Actor.log.warning("Failed to persist seen_notice_ids to KVS: %s", e)
+            # ── Load Travis tax-delinquent state ──
+            stored_texdel = await kvs.get_value("travis_texdel_state") or _texdel_state._empty_state()
+            _texdel_state.inject_apify_state(stored_texdel)
+            Actor.log.info(
+                "Loaded Travis texdel state: last_run_date=%s, last_run_apns=%d",
+                stored_texdel.get("last_run_date", "(none)"),
+                len(stored_texdel.get("last_run_apns") or []),
+            )
 
-            # ── Scrape ────────────────────────────────────────────────
+            # ── Scrape ────────────────────────────────────────────
             from scrapers import scrape_targets
             notices = await scrape_targets(
                 targets=[(c, t) for c, t in targets],
                 mode=mode,
                 since_date=since_date_override or None,
+                scraper_kwargs=scraper_kwargs,
             )
-            # Handle async probate lookup before pipeline (requires await)
-            probate_notices = [n for n in notices if n.notice_type == "probate" and n.decedent_name and not n.address]
+            Actor.log.info("Scraped %d total notices before dedup/enrichment", len(notices))
+
+            # ── Probate property lookup (async) ──
+            probate_notices = [
+                n for n in notices
+                if n.notice_type == "probate" and n.decedent_name and not n.address
+            ]
             if probate_notices:
                 try:
                     from property_lookup import lookup_decedent_properties
                     Actor.log.info("Looking up property addresses for %d probate notices...", len(probate_notices))
                     await lookup_decedent_properties(probate_notices)
                 except ImportError:
-                    Actor.log.warning("property_lookup module not found -- skipping property lookup")
+                    Actor.log.warning("property_lookup module not found — skipping")
                 except Exception as e:
-                    Actor.log.warning("Property lookup failed: %s -- continuing without lookups", e)
+                    Actor.log.warning("Property lookup failed: %s — continuing", e)
 
-            # ── Enrichment ────────────────────────────────────────────
+            # ── Snapshot dedup key BEFORE enrichment ──
+            # Smarty (Step 6) rewrites notice.address in place, so computing the
+            # key at scrape time vs at pipeline-end time produces different keys
+            # for the same property. Snapshot once here; reuse for both the
+            # filter step AND the seen_ids save step.
+            for n in notices:
+                n._dedup_key = _notice_dedup_key(n)
+
+            # ── rebuild_dedup_only branch: seed seen_ids + exit ──
+            if rebuild_dedup_only:
+                added = 0
+                for n in notices:
+                    if n._dedup_key not in seen_ids:
+                        seen_ids.add(n._dedup_key)
+                        added += 1
+                Actor.log.info(
+                    "Rebuild dedup: scraped %d records, added %d raw-address keys "
+                    "(%d already present). Total seen_ids: %d",
+                    len(notices), added, len(notices) - added, len(seen_ids),
+                )
+                await kvs.set_value("seen_notice_ids", sorted(seen_ids))
+                await kvs.set_value(
+                    "travis_texdel_state",
+                    _texdel_state.snapshot_apify_state(),
+                )
+                Actor.log.info("Rebuild complete — exiting without running pipeline")
+                return
+
+            # ── Incremental dedup filter ──
+            if seen_ids and notices:
+                before = len(notices)
+                notices = [n for n in notices if n._dedup_key not in seen_ids]
+                filtered = before - len(notices)
+                if filtered:
+                    Actor.log.info(
+                        "Incremental dedup: filtered %d already-seen notices (%d remain)",
+                        filtered, len(notices),
+                    )
+
+            # ── Enrichment pipeline (full CLI parity) ──
             from enrichment_pipeline import PipelineOptions, run_enrichment_pipeline
 
             opts = PipelineOptions(
-                skip_parcel_lookup=True,  # web scrape notices don't have parcel IDs
+                skip_parcel_lookup=True,
                 skip_vacant_filter=not exclude_vacant,
                 skip_commercial_filter=not exclude_commercial,
                 skip_entity_filter=not exclude_entities,
+                skip_smarty=skip_smarty,
+                skip_zillow=skip_zillow,
+                skip_tax=skip_tax,
+                skip_geocode=skip_geocode,
+                skip_obituary=not enable_obituary,
+                skip_ancestry=not enable_ancestry,
+                skip_entity_research=not research_entities,
+                skip_heir_verification=skip_heir_verification,
+                max_heir_depth=max_heir_depth,
+                skip_dm_address=skip_dm_address,
+                tracerfy_tier1=False,
+                obituary_workers=obituary_workers,
+                skip_zip_filter=skip_zip_filter,
+                skip_condo_filter=skip_condo_filter,
+                skip_mls_filter=keep_listed,
                 source_label="Apify Actor",
             )
             notices = run_enrichment_pipeline(notices, opts)
 
             if not notices:
-                Actor.log.warning("No notices found")
+                Actor.log.warning("No notices found after enrichment")
+                # Still persist state so next run's window narrows
+                await kvs.set_value("seen_notice_ids", sorted(seen_ids))
+                await kvs.set_value(
+                    "last_run_date", datetime.now().strftime("%Y-%m-%d"),
+                )
+                await kvs.set_value(
+                    "travis_texdel_state",
+                    _texdel_state.snapshot_apify_state(),
+                )
+                if do_notify_slack and config.SLACK_WEBHOOK_URL:
+                    try:
+                        from slack_notifier import send_slack_notification
+                        send_slack_notification([])
+                    except Exception:
+                        Actor.log.exception("Empty-run Slack notification failed")
                 return
 
             total = len(notices)
 
-            # ── Tracerfy Skip Trace (DP candidates only) ────────────
-            # Only run Tracerfy on records that need deep prospecting
-            # (deceased owners, heir maps, decision makers). Basic records
-            # get skip traced for free inside DataSift's unlimited plan.
-            tracerfy_stats = None
-            if do_tracerfy and config.TRACERFY_API_KEY:
+            # ── Tracerfy (opt-in) ──
+            tracerfy_stats: dict = {}
+            tiers_map: dict = {}
+            if enable_tracerfy and config.TRACERFY_API_KEY:
                 dp_for_tracerfy = [
                     n for n in notices
                     if n.owner_deceased == "yes" or n.heir_map_json or n.decision_maker_name
                 ]
                 if dp_for_tracerfy:
-                    Actor.log.info("Running Tracerfy on %d DP candidates (%d basic records skipped)...",
-                                   len(dp_for_tracerfy), total - len(dp_for_tracerfy))
+                    Actor.log.info(
+                        "Tracerfy: running on %d DP candidates (%d basic records skipped)",
+                        len(dp_for_tracerfy), total - len(dp_for_tracerfy),
+                    )
                     try:
                         from tracerfy_skip_tracer import batch_skip_trace
                         tracerfy_stats = batch_skip_trace(dp_for_tracerfy)
+                        if tracerfy_stats.get("credits_exhausted"):
+                            Actor.log.error("TRACERFY OUT OF CREDITS — skip trace disabled this run")
                         Actor.log.info(
                             "Tracerfy: %d/%d matched, %d phones, %d emails, $%.2f",
-                            tracerfy_stats["matched"], tracerfy_stats["submitted"],
-                            tracerfy_stats["phones_found"], tracerfy_stats["emails_found"],
-                            tracerfy_stats["cost"],
+                            tracerfy_stats.get("matched", 0),
+                            tracerfy_stats.get("submitted", 0),
+                            tracerfy_stats.get("phones_found", 0),
+                            tracerfy_stats.get("emails_found", 0),
+                            tracerfy_stats.get("cost", 0.0),
                         )
                     except Exception as e:
                         Actor.log.warning("Tracerfy skip trace failed: %s — continuing", e)
                 else:
-                    Actor.log.info("No DP candidates — Tracerfy skipped (0 deceased/DM records)")
-            elif do_tracerfy:
-                Actor.log.info("Tracerfy skipped — no API key configured")
+                    Actor.log.info("Tracerfy: no DP candidates — skipped")
 
-            # ── Generate Deep Prospecting PDFs ────────────────────────
-            # Only generate PDFs for records that have deep prospecting data:
-            # deceased owners with heir/DM info, or records with signing chains.
-            # Basic records (just address + owner) don't need a PDF.
-            pdf_urls = []
+                # Trestle tier scoring (only after Tracerfy — needs phones)
+                if enable_trestle and config.TRESTLE_API_KEY:
+                    dp_cands = [
+                        n for n in notices
+                        if n.owner_deceased == "yes" or n.heir_map_json or n.decision_maker_name
+                    ]
+                    if dp_cands:
+                        try:
+                            from phone_validator import score_record_phones
+                            tiers_map = score_record_phones(dp_cands, config.TRESTLE_API_KEY)
+                            Actor.log.info(
+                                "Trestle scored %d unique phones across %d DP records",
+                                len(tiers_map), len(dp_cands),
+                            )
+                        except Exception as e:
+                            Actor.log.warning("Per-record Trestle scoring failed: %s", e)
+
+            # ── Deep Prospecting PDFs → KVS ──
+            pdf_urls: list[dict] = []
             dp_candidates = [
                 n for n in notices
                 if n.owner_deceased == "yes" or n.heir_map_json or n.decision_maker_name
             ]
-
-            # Score every phone (DM #1 + all heirs) with Trestle before rendering,
-            # so signing-chain phones get tier badges — not just DM #1's.
-            phone_tiers: dict = {}
-            if dp_candidates and config.TRESTLE_API_KEY:
-                try:
-                    from phone_validator import score_record_phones
-                    phone_tiers = score_record_phones(dp_candidates, config.TRESTLE_API_KEY)
-                    Actor.log.info("Trestle scored %d unique phones across DP candidates",
-                                   len(phone_tiers))
-                except Exception as e:
-                    Actor.log.warning("Per-record Trestle scoring failed: %s — continuing", e)
-
             if dp_candidates:
                 try:
                     from report_generator import generate_record_pdf
-                    kvs = await Actor.open_key_value_store()
-                    kvs_id = kvs._id if hasattr(kvs, '_id') else ''
+                    kvs_id = _kvs_info["id"]
                     report_dir = Path("output/reports")
-
                     for n in dp_candidates:
-                        pdf_path = generate_record_pdf(
-                            n, output_dir=report_dir, phone_tiers=phone_tiers,
-                        )
+                        try:
+                            pdf_path = generate_record_pdf(
+                                n, output_dir=report_dir, phone_tiers=tiers_map,
+                            )
+                        except Exception:
+                            Actor.log.exception("PDF generation failed for %s", n.address)
+                            continue
                         key = pdf_path.name
                         with open(pdf_path, "rb") as f:
                             await kvs.set_value(key, f.read(), content_type="application/pdf")
                         url = f"https://api.apify.com/v2/key-value-stores/{kvs_id}/records/{key}"
                         pdf_urls.append({"address": n.address, "url": url})
-
-                    Actor.log.info("Generated %d deep prospecting PDFs (%d records skipped — no DP data)",
-                                   len(pdf_urls), total - len(dp_candidates))
+                    Actor.log.info(
+                        "Generated %d deep-prospecting PDFs (%d records without DP data)",
+                        len(pdf_urls), total - len(dp_candidates),
+                    )
                 except Exception as e:
-                    Actor.log.warning("PDF generation failed: %s — continuing", e)
-            else:
-                Actor.log.info("No records need deep prospecting PDFs")
+                    Actor.log.warning("PDF generator import failed: %s", e)
 
-            # ── Write CSV ─────────────────────────────────────────────
+            # ── Legacy flat CSV + push records to Dataset ──
             csv_path = write_csv(notices)
-            if not kvs:
-                kvs = await Actor.open_key_value_store()
             with open(csv_path, "rb") as f:
                 await kvs.set_value("output.csv", f.read(), content_type="text/csv")
-            Actor.log.info("CSV saved to key-value store as 'output.csv'")
+            Actor.log.info("Legacy CSV saved to KVS as 'output.csv'")
 
-            # ── Google Drive Upload ───────────────────────────────────
-            if drive_folder_id and drive_key_b64:
-                Actor.log.info("Uploading to Google Drive...")
-                from drive_uploader import upload_csv, upload_summary
+            # Push structured records to Apify Dataset (one row per notice)
+            dataset_rows = []
+            for n in notices:
+                dataset_rows.append({
+                    "date_added": n.date_added,
+                    "address": n.address,
+                    "city": n.city,
+                    "state": n.state,
+                    "zip": n.zip,
+                    "owner_name": n.owner_name,
+                    "business_name": n.business_name,
+                    "mailing_address": n.mailing_address,
+                    "notice_type": n.notice_type,
+                    "county": n.county,
+                    "decedent_name": n.decedent_name,
+                    "owner_street": n.owner_street,
+                    "owner_city": n.owner_city,
+                    "owner_state": n.owner_state,
+                    "owner_zip": n.owner_zip,
+                    "auction_date": n.auction_date,
+                    "latitude": n.latitude,
+                    "longitude": n.longitude,
+                    "dpv_match_code": n.dpv_match_code,
+                    "vacant": n.vacant,
+                    "rdi": n.rdi,
+                    "mls_status": n.mls_status,
+                    "estimated_value": n.estimated_value,
+                    "equity_percent": n.equity_percent,
+                    "property_type": n.property_type,
+                    "bedrooms": n.bedrooms,
+                    "bathrooms": n.bathrooms,
+                    "sqft": n.sqft,
+                    "year_built": n.year_built,
+                    "parcel_id": n.parcel_id,
+                    "tax_delinquent_amount": n.tax_delinquent_amount,
+                    "tax_delinquent_years": n.tax_delinquent_years,
+                    "owner_deceased": n.owner_deceased,
+                    "date_of_death": n.date_of_death,
+                    "decision_maker_name": n.decision_maker_name,
+                    "dm_confidence": n.dm_confidence,
+                    "source_url": n.source_url,
+                })
+            if dataset_rows:
+                await Actor.push_data(dataset_rows)
+                Actor.log.info("Pushed %d records to Apify Dataset", len(dataset_rows))
 
-                by_type: dict[str, int] = {}
-                by_county: dict[str, int] = {}
-                for n in notices:
-                    by_type[n.notice_type] = by_type.get(n.notice_type, 0) + 1
-                    by_county[n.county] = by_county.get(n.county, 0) + 1
-
-                file_id = upload_csv(csv_path, drive_folder_id, drive_key_b64, total)
-                if file_id:
-                    Actor.log.info("CSV uploaded to Drive (file ID: %s)", file_id)
-                else:
-                    Actor.log.error("CSV upload to Drive failed — CSV still in key-value store")
-
-                upload_summary(by_type, by_county, total, drive_folder_id, drive_key_b64)
-            elif drive_folder_id:
-                Actor.log.warning("google_drive_folder_id set but google_service_account_key missing — skipping Drive upload")
-
-            # ── DataSift CSVs → KVS (manual upload) ─────────────────
-            # Generate DataSift-formatted CSVs and save to Apify KVS
-            # for manual download + upload to DataSift (more reliable than
-            # automated Playwright upload in headless cloud containers).
-            datasift_csv_urls = []
+            # ── DataSift CSVs (DMs + Heirs) → KVS + Drive ──
+            datasift_csv_urls: list[dict] = []
+            drive_links: list[dict] = []
             try:
                 from datasift_formatter import write_datasift_split_csvs
+                csv_infos = write_datasift_split_csvs(
+                    notices, keep_government=keep_government,
+                )
 
-                csv_infos = write_datasift_split_csvs(notices)
-                kvs = await Actor.open_key_value_store()
+                kvs_id = kvs._id if hasattr(kvs, "_id") else ""
                 for info in csv_infos:
                     key = f"datasift_{info['label'].lower().replace(' ', '_')}.csv"
                     with open(info["path"], "rb") as f:
                         await kvs.set_value(key, f.read(), content_type="text/csv")
-                    # Build public download URL
-                    kvs_id = kvs._id if hasattr(kvs, '_id') else ''
                     url = f"https://api.apify.com/v2/key-value-stores/{kvs_id}/records/{key}"
-                    datasift_csv_urls.append({"label": info["label"], "url": url, "records": info.get("count", "?")})
-                    Actor.log.info("DataSift CSV (%s) saved to KVS: %s", info["label"], key)
+                    datasift_csv_urls.append({
+                        "label": info["label"],
+                        "url": url,
+                        "records": info.get("count", "?"),
+                    })
+                    Actor.log.info("DataSift CSV (%s) → KVS: %s", info["label"], key)
+
+                # Google Drive upload (if creds set)
+                if config.GOOGLE_DRIVE_FOLDER_ID and config.GOOGLE_SERVICE_ACCOUNT_KEY:
+                    try:
+                        from drive_uploader import upload_file
+                        for info in csv_infos:
+                            link = upload_file(
+                                Path(info["path"]),
+                                config.GOOGLE_DRIVE_FOLDER_ID,
+                                config.GOOGLE_SERVICE_ACCOUNT_KEY,
+                            )
+                            if link:
+                                Actor.log.info("  %s → Drive: %s", info["label"], link)
+                                drive_links.append({"label": info["label"], "url": link})
+                            else:
+                                Actor.log.error("  %s: Drive upload failed", info["label"])
+                    except Exception as e:
+                        Actor.log.warning("Drive upload failed: %s — continuing", e)
+                else:
+                    Actor.log.info("Drive creds not set — skipping Drive upload")
             except Exception as e:
                 Actor.log.error("DataSift CSV generation failed: %s", e)
 
-            # ── Slack Notification ────────────────────────────────────
-            elapsed_min = (_time() - pipeline_start) / 60
+            # ── Drain Travis texdel buffers to KVS (raw CSVs + reports) ──
+            try:
+                for filename, text in _texdel_state.drain_apify_raw_csvs()[-7:]:
+                    # Retention: keep only the most recent 7 raw CSVs
+                    await kvs.set_value(
+                        f"travis_tax_raw_{filename}", text, content_type="text/csv",
+                    )
+                for filename, json_text in _texdel_state.drain_apify_reports():
+                    await kvs.set_value(
+                        f"travis_texdel_{filename}", json_text, content_type="application/json",
+                    )
+            except Exception as e:
+                Actor.log.warning("Failed to drain texdel buffers to KVS: %s", e)
 
-            # Compute estimated run cost
-            cost_breakdown = {}
-            # Anthropic Haiku: ~$0.001 per record (LLM parsing + obituary search)
+            # ── Slack notification ──
+            elapsed_min = (_time() - pipeline_start) / 60
+            cost_breakdown: dict[str, float] = {}
             if config.ANTHROPIC_API_KEY:
                 cost_breakdown["Anthropic (Haiku)"] = round(total * 0.001, 3)
-            # Tracerfy: actual cost from batch stats
             if tracerfy_stats and tracerfy_stats.get("cost", 0) > 0:
                 cost_breakdown["Tracerfy"] = round(tracerfy_stats["cost"], 2)
-            # Smarty: free tier 250/month, $0.01 after
             smarty_count = sum(1 for n in notices if n.dpv_match_code)
-            if smarty_count > 0:
-                cost_breakdown["Smarty"] = round(max(0, smarty_count - 250) * 0.01, 2) if smarty_count > 250 else 0.0
-            # Zillow (OpenWeb Ninja): free tier 100/month, $0.01 after
+            if smarty_count > 250:
+                cost_breakdown["Smarty"] = round((smarty_count - 250) * 0.01, 2)
             zillow_count = sum(1 for n in notices if n.estimated_value)
-            if zillow_count > 0:
-                cost_breakdown["Zillow"] = round(max(0, zillow_count - 100) * 0.01, 2) if zillow_count > 100 else 0.0
-            # Remove zero-cost entries for cleaner display
-            cost_breakdown = {k: v for k, v in cost_breakdown.items() if v > 0}
+            if zillow_count > 100:
+                cost_breakdown["Zillow"] = round((zillow_count - 100) * 0.01, 2)
 
             if do_notify_slack and config.SLACK_WEBHOOK_URL:
                 try:
                     from slack_notifier import send_slack_notification, _send_webhook
-
-                    # Send standard run summary with cost breakdown
                     send_slack_notification(
                         notices,
                         elapsed_min=elapsed_min,
                         cost_breakdown=cost_breakdown,
                     )
-
-                    # Send DataSift CSV download links as a follow-up message
                     if datasift_csv_urls:
-                        csv_lines = [
-                            "*DataSift CSVs ready for manual upload:*",
-                        ]
-                        for csv_info in datasift_csv_urls:
-                            csv_lines.append(f"  <{csv_info['url']}|{csv_info['label']}> ({csv_info['records']} records)")
-                        csv_lines.append("_Upload at app.reisift.io → Upload File → Add Data_")
-                        _send_webhook("\n".join(csv_lines))
-
-                    # Send PDF download links
+                        lines = ["*DataSift CSVs ready for manual upload:*"]
+                        for c in datasift_csv_urls:
+                            lines.append(f"  <{c['url']}|{c['label']}> ({c['records']} records)")
+                        lines.append("_Upload at app.reisift.io → Upload File → Add Data_")
+                        _send_webhook("\n".join(lines))
                     if pdf_urls:
-                        pdf_lines = [
-                            f"*Deep Prospecting PDFs ({len(pdf_urls)} records):*",
-                        ]
-                        for pdf_info in pdf_urls:
-                            pdf_lines.append(f"  <{pdf_info['url']}|{pdf_info['address']}>")
-                        pdf_lines.append("_Attach to DataSift record → Notes or Files_")
-                        _send_webhook("\n".join(pdf_lines))
+                        lines = [f"*Deep Prospecting PDFs ({len(pdf_urls)} records):*"]
+                        for p in pdf_urls:
+                            lines.append(f"  <{p['url']}|{p['address']}>")
+                        _send_webhook("\n".join(lines))
+
+                    # Travis tax-delinquent NEW/REPEAT/DROPPED diff block
+                    try:
+                        from scrapers import tax_delinquent_travis as _tx_tex
+                        if _tx_tex.LAST_RUN_DIFF is not None:
+                            from scrapers.travis_texdel_state import DiffResult as _Diff
+                            from scrapers.travis_texdel_report import format_slack_summary as _fmt_tex
+                            diff_obj = _Diff(**_tx_tex.LAST_RUN_DIFF)
+                            msg = _fmt_tex(
+                                diff_obj,
+                                _tx_tex.LAST_RUN_STATS or {},
+                                _tx_tex.LAST_RUN_REMOVED or {},
+                            )
+                            _send_webhook(msg)
+                    except Exception:
+                        Actor.log.exception("Travis tax-delinquent Slack summary failed")
 
                     Actor.log.info("Slack notification sent")
                 except Exception as e:
                     Actor.log.warning("Slack notification failed: %s", e)
 
-            # ── Save last_run_date + seen_notice_ids to Apify KVS for next run ─────
+            # ── Persist state for next run ──
+            # Use the pre-pipeline snapshot key so Smarty mutations don't poison dedup.
+            for n in notices:
+                key = getattr(n, "_dedup_key", None) or _notice_dedup_key(n)
+                seen_ids.add(key)
+            await kvs.set_value("seen_notice_ids", sorted(seen_ids))
             await kvs.set_value("last_run_date", datetime.now().strftime("%Y-%m-%d"))
-            await kvs.set_value("seen_notice_ids", seen_ids)
+            await kvs.set_value(
+                "travis_texdel_state",
+                _texdel_state.snapshot_apify_state(),
+            )
             Actor.log.info(
-                "Saved last_run_date + %d seen_notice_ids to KVS for next daily run",
+                "Saved state: last_run_date=%s, seen_notice_ids=%d, travis_texdel_state APNs=%d",
+                datetime.now().strftime("%Y-%m-%d"),
                 len(seen_ids),
+                len(_texdel_state.snapshot_apify_state().get("last_run_apns") or []),
             )
 
             Actor.log.info("Done — %d notices exported (%.1f min)", total, elapsed_min)
@@ -1103,6 +1266,24 @@ def cli_main() -> None:
         type=float,
         default=3000.0,
         help="Minimum $ owed to include for tax_delinquent records (default: 3000)",
+    )
+    parser.add_argument(
+        "--skip-texdel-cleaner",
+        action="store_true",
+        help="Bypass the Travis tax-delinquent skill cleaner (no overflow merge, no "
+             "address contamination strip, no blank-zip resolve). Safety valve.",
+    )
+    parser.add_argument(
+        "--texdel-fixture-csv",
+        type=str,
+        default=None,
+        help="Path to a local CSV that replaces the live Travis Tax Office download. "
+             "Used by the cross-run diff verification tests.",
+    )
+    parser.add_argument(
+        "--texdel-skip-target-zip",
+        action="store_true",
+        help="Disable the skill's Travis target-ZIP filter (keep all 78xxx rows).",
     )
     parser.add_argument(
         "--verbose", "-v",
@@ -1852,13 +2033,20 @@ def _run_scrape_pipeline(args, targets) -> None:
             ", ".join(f"{c}/{t}" for c, t in skipped),
         )
 
-    # Build scraper kwargs (e.g., tax delinquent thresholds)
+    # Build scraper kwargs (e.g., tax delinquent thresholds + skill cleaner knobs)
     scraper_kwargs = {}
     min_years = getattr(args, "min_delinquent_years", 2)
     min_amount = getattr(args, "min_delinquent_amount", 3000.0)
     if min_years or min_amount:
         scraper_kwargs["min_years"] = min_years
         scraper_kwargs["min_amount"] = min_amount
+    fixture_csv = getattr(args, "texdel_fixture_csv", None)
+    if fixture_csv:
+        scraper_kwargs["fixture_csv"] = fixture_csv
+    if getattr(args, "skip_texdel_cleaner", False):
+        scraper_kwargs["skip_cleaner"] = True
+    if getattr(args, "texdel_skip_target_zip", False):
+        scraper_kwargs["skip_target_zip"] = True
 
     # ── CLI incremental state ────────────────────────────────────────
     # For daily mode without an explicit --since, auto-apply the stored
@@ -2170,9 +2358,27 @@ def _run_scrape_pipeline(args, targets) -> None:
 
     # Slack/Discord notification (default ON; suppress with --no-slack)
     if not getattr(args, "no_slack", False) and config.SLACK_WEBHOOK_URL:
-        from slack_notifier import send_slack_notification
+        from slack_notifier import send_slack_notification, _send_webhook
 
         send_slack_notification(notices, upload_result=upload_result)
+
+        # Append the Travis tax-delinquent cross-run diff if the scraper ran
+        # this cycle. This is the "sold / paid off" signal the user wants —
+        # surfaced as a second webhook so the main run summary stays readable.
+        try:
+            from scrapers import tax_delinquent_travis as _tx_tex
+            from scrapers.travis_texdel_state import DiffResult as _Diff
+            from scrapers.travis_texdel_report import format_slack_summary as _fmt_tex
+            if _tx_tex.LAST_RUN_DIFF is not None:
+                diff_obj = _Diff(**_tx_tex.LAST_RUN_DIFF)
+                msg = _fmt_tex(
+                    diff_obj,
+                    _tx_tex.LAST_RUN_STATS or {},
+                    _tx_tex.LAST_RUN_REMOVED or {},
+                )
+                _send_webhook(msg)
+        except Exception:
+            logging.exception("Travis tax-delinquent Slack summary failed")
 
     # Audit DataSift for incomplete records (future daily check)
     if getattr(args, "audit_records", False):
