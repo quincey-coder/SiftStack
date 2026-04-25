@@ -122,13 +122,23 @@ def _parse_notice_text(text: str) -> NoticeData | None:
         if addr_match.group(3):
             notice.zip = addr_match.group(3)
 
-    # Extract owner
+    # Extract owner. If the "executed by" pattern picks up a known TX
+    # substitute trustee (filing attorney, not the actual borrower) leave
+    # owner_name blank so downstream CAD lookup can fill the real owner.
     owner_match = _OWNER_RE.search(text)
     if owner_match:
         name = owner_match.group(1).strip()
         if name.isupper():
             name = name.title()
-        notice.owner_name = name
+        from scrapers.trustee_blocklist import is_substitute_trustee
+        if is_substitute_trustee(name):
+            logger.info(
+                "Skipped substitute trustee %r on Bell foreclosure; "
+                "leaving owner_name blank for CAD lookup", name,
+            )
+        else:
+            notice.tax_owner_name = name  # PAPERTRAIL: preserve raw
+            notice.owner_name = name
 
     # Extract sale date
     sale_match = _SALE_DATE_RE.search(text)

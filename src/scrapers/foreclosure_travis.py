@@ -81,35 +81,11 @@ _SALE_DATE_RE = re.compile(r"\[E\]\s*(\d{2}/\d{2}/\d{4})")
 # Extract grantor name from "[R] LAST FIRST (+)" or "[R] LAST FIRST MIDDLE"
 _GRANTOR_RE = re.compile(r"\[R\]\s*(.+?)(?:\s*\(\+\))?$")
 
-# Known Travis County substitute trustees who file most foreclosure notices.
-# The tccsearch.org grid lists them as the primary "[R]" on Notice of
-# Substitute Trustee Sale documents because they are the filer — the actual
-# borrower is hidden behind the "(+)" expansion on that row. When we see any
-# of these names, we leave owner_name empty so downstream CAD-by-address
-# enrichment can fill in the real property owner from tax records.
-#
-# Stored lowercase. Both orderings ("LAST FIRST" and "FIRST LAST") are matched
-# since normalize_court_name runs later and we compare pre-normalization here.
-_SUBSTITUTE_TRUSTEES = frozenset({
-    "zavala angela", "angela zavala",
-    "saucedo israel", "israel saucedo",
-    "tabor grant", "grant tabor",
-    "arnold patrice", "patrice arnold",
-    "jones paige", "paige jones",
-    "oliver maisyn", "maisyn oliver",
-    "koponen darrick", "darrick koponen",
-})
-
-
-def _is_substitute_trustee(name: str) -> bool:
-    """Return True if the extracted grantor is a known Travis County
-    substitute trustee (i.e., the filing attorney, not the borrower)."""
-    if not name:
-        return False
-    # Strip punctuation, lowercase, collapse whitespace.
-    n = re.sub(r"[^\w\s]", "", name).lower().strip()
-    n = re.sub(r"\s+", " ", n)
-    return n in _SUBSTITUTE_TRUSTEES
+# Substitute-trustee blocklist now lives in scrapers/trustee_blocklist.py so
+# Bell + Williamson scrapers can share it. Keep a local alias so external
+# callers (scripts/reenrich_history.py) that import _is_substitute_trustee
+# from this module continue to work.
+from scrapers.trustee_blocklist import is_substitute_trustee as _is_substitute_trustee  # noqa: E402,F401
 
 
 def _doc_type_selector(index: int) -> str:

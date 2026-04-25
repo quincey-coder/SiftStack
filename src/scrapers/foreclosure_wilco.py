@@ -168,8 +168,19 @@ def _parse_index_pdf(text: str, sale_month: str, sale_year: int) -> list[NoticeD
     notices = []
     count = min(len(owners), len(entries))
     from notice_parser import normalize_court_name
+    from scrapers.trustee_blocklist import is_substitute_trustee
     for idx in range(count):
-        owner = normalize_court_name(owners[idx].title())
+        raw_owner = owners[idx].title()
+        # Drop known TX substitute trustees (filing attorneys); CAD address
+        # lookup downstream will fill the real borrower from tax records.
+        if is_substitute_trustee(raw_owner):
+            logger.info(
+                "Skipped substitute trustee %r on Williamson foreclosure; "
+                "leaving owner_name blank for CAD lookup", raw_owner,
+            )
+            owner = ""
+        else:
+            owner = normalize_court_name(raw_owner)
         entry = entries[idx]
         address = entry["address"].title() if entry["address"] else ""
         city = entry["city"].title() if entry["city"] else ""
@@ -193,6 +204,10 @@ def _parse_index_pdf(text: str, sale_month: str, sale_year: int) -> list[NoticeD
             owner_name=owner,
             source_url=f"{BASE_URL}/{sale_month}/files.aspx",
         )
+        # PAPERTRAIL: stash pristine pre-flip name for the LEGAL OWNER notes
+        # section. Skip when owner_name was blanked by trustee blocklist.
+        if owner:
+            notice.tax_owner_name = raw_owner
         notice.raw_text = f"{owners[idx]} | {entry['address']} | {entry['city']}"
         notices.append(notice)
 

@@ -213,32 +213,56 @@ def _clean_and_split_name(full_name: str) -> tuple[str, str]:
     if _is_entity_name(name):
         return ("", "")
 
-    # Split joint owners on " & " or " AND " — keep first person only
-    # "John & Jane Smith" → "John Smith"
-    # "John David & Jane Marie Smith" → "John David Smith"
+    # Split joint owners on " & " or " AND " — keep first person only.
+    # The first person may or may not already carry the surname; the trailing
+    # "& OTHER L LASTNAME" form (TX tax roll: "JULIUS W LAWSON & EDNA L"
+    # post-flip becomes "JULIUS W & EDNA L LAWSON") puts the shared last
+    # name only at the very end, so we have to detect when the first chunk
+    # lacks a real last name and pull the trailing one in.
     joint_match = re.split(r"\s+(?:&|AND)\s+", name, maxsplit=1, flags=re.IGNORECASE)
     if len(joint_match) > 1:
         first_person = joint_match[0].strip()
         second_part = joint_match[1].strip()
         second_words = second_part.split()
-        if len(second_words) >= 2:
-            last_name = second_words[-1]
-            first_words = first_person.split()
-            if len(first_words) == 1:
-                # "John" & "Jane Smith" → "John Smith"
-                name = f"{first_person} {last_name}"
-            else:
-                # "John David" & "Jane Marie Smith" → "John David Smith"
-                name = first_person
+        first_words = first_person.split()
+        last_name = second_words[-1] if second_words else ""
+
+        def _has_real_surname(words: list[str]) -> bool:
+            """A 'real' surname is the last token when it isn't a single
+            letter, isn't a generational suffix, and isn't ETAL noise."""
+            if len(words) < 2:
+                return False
+            tail = words[-1].rstrip(".").upper()
+            if len(tail) <= 1:
+                return False
+            if tail in _SUFFIX_TOKENS:
+                return False
+            if tail in {"ETAL", "ET", "AL", "ESQ"}:
+                return False
+            return True
+
+        if _has_real_surname(first_words):
+            # First person already has its own surname (e.g., "John Smith
+            # & Jane Doe"). Drop the second person; preserve first as-is.
+            name = first_person
+        elif last_name:
+            # First person lacks a real surname — appended shared one wins.
+            # "John & Jane Smith" → "John Smith"
+            # "Julius W & Edna L Lawson" → "Julius W Lawson"
+            name = f"{first_person} {last_name}"
         else:
             name = first_person
 
     # Strip ET AL and generational suffixes before any splitting.
     name = _strip_name_noise(name)
 
-    # Strip special chars and collapse whitespace.
+    # Strip special chars and trailing punctuation, collapse whitespace.
+    # Trailing comma/period leak from upstream truncation patterns
+    # (e.g. MVBA bid sheet "DONALD ZEDLER, ..." → "Donald Zedler,").
     name = re.sub(r"[&@#%]", "", name)
     name = re.sub(r"\s+", " ", name).strip()
+    # Strip per-token trailing punctuation that survived special-char filtering.
+    name = " ".join(t.rstrip(",.;:") for t in name.split() if t.rstrip(",.;:"))
 
     if not name:
         return ("", "")
