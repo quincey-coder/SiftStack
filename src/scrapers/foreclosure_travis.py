@@ -81,6 +81,36 @@ _SALE_DATE_RE = re.compile(r"\[E\]\s*(\d{2}/\d{2}/\d{4})")
 # Extract grantor name from "[R] LAST FIRST (+)" or "[R] LAST FIRST MIDDLE"
 _GRANTOR_RE = re.compile(r"\[R\]\s*(.+?)(?:\s*\(\+\))?$")
 
+# Known Travis County substitute trustees who file most foreclosure notices.
+# The tccsearch.org grid lists them as the primary "[R]" on Notice of
+# Substitute Trustee Sale documents because they are the filer — the actual
+# borrower is hidden behind the "(+)" expansion on that row. When we see any
+# of these names, we leave owner_name empty so downstream CAD-by-address
+# enrichment can fill in the real property owner from tax records.
+#
+# Stored lowercase. Both orderings ("LAST FIRST" and "FIRST LAST") are matched
+# since normalize_court_name runs later and we compare pre-normalization here.
+_SUBSTITUTE_TRUSTEES = frozenset({
+    "zavala angela", "angela zavala",
+    "saucedo israel", "israel saucedo",
+    "tabor grant", "grant tabor",
+    "arnold patrice", "patrice arnold",
+    "jones paige", "paige jones",
+    "oliver maisyn", "maisyn oliver",
+    "koponen darrick", "darrick koponen",
+})
+
+
+def _is_substitute_trustee(name: str) -> bool:
+    """Return True if the extracted grantor is a known Travis County
+    substitute trustee (i.e., the filing attorney, not the borrower)."""
+    if not name:
+        return False
+    # Strip punctuation, lowercase, collapse whitespace.
+    n = re.sub(r"[^\w\s]", "", name).lower().strip()
+    n = re.sub(r"\s+", " ", n)
+    return n in _SUBSTITUTE_TRUSTEES
+
 
 def _doc_type_selector(index: int) -> str:
     return f"#cphNoMargin_f_dclDocType_{index}"
@@ -252,12 +282,25 @@ def _parse_record(row_num: str, record_text: str, lines: list[str]) -> NoticeDat
                 pass
             break
 
-    # Look for grantor name [R]
+    # Look for grantor name [R]. When the grid lists a known substitute
+    # trustee (the attorney who filed the notice), skip it — the real
+    # borrower is hidden behind the "(+)" indicator and will be filled
+    # in downstream via CAD lookup by property address.
     for line in data_lines:
         m = _GRANTOR_RE.search(line)
         if m:
+            raw_name = _clean_name(m.group(1))
+            if _is_substitute_trustee(raw_name):
+                logger.info(
+                    "Skipped substitute trustee %r (real borrower hidden in grid); "
+                    "relying on CAD address lookup downstream", raw_name,
+                )
+                break
             from notice_parser import normalize_court_name
-            notice.owner_name = normalize_court_name(_clean_name(m.group(1)))
+            # Preserve the pristine county-record name for deep prospecting —
+            # surfaced in Notes by datasift_formatter._build_notes().
+            notice.tax_owner_name = raw_name
+            notice.owner_name = normalize_court_name(raw_name)
             break
 
     # Look for sale date in [E] field

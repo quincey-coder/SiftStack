@@ -142,12 +142,66 @@ def _is_entity_name(name: str) -> bool:
     return bool(_ENTITY_SUFFIXES.search(name))
 
 
+# Tokens that look like part of a name but aren't: generational suffixes and
+# "and others" markers that appear on tax-roll / court-record data.
+_SUFFIX_TOKENS = {"JR", "SR", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "ESQ"}
+_ETAL_TRAILING_RE = re.compile(r"\s*\b(?:ET\s+AL|ETAL)\.?\s*$", re.IGNORECASE)
+
+# Particles used in compound surnames — when one of these appears mid-name we
+# keep it glued to the final word so "Juan De La Cruz" stays ("Juan", "De La Cruz")
+# instead of collapsing to ("Juan", "Cruz"). Stored lowercase, compared lowercase.
+_SURNAME_PARTICLES = {
+    "van", "von", "de", "del", "della", "dela", "di", "du", "la", "le", "les",
+    "los", "mac", "mc", "da", "das", "do", "dos", "st", "saint", "el", "al",
+    "der", "den", "ter", "ten", "af", "av",
+}
+
+
+def _strip_name_noise(name: str) -> str:
+    """Remove ETAL / ET AL / ESQ and trailing generational suffixes from a name."""
+    # Drop trailing "ET AL" / "ETAL" (can carry a period).
+    name = _ETAL_TRAILING_RE.sub("", name).strip()
+    # Peel off trailing suffix tokens one at a time (handles "Smith JR III" etc).
+    parts = name.split()
+    while parts and parts[-1].rstrip(".").upper() in _SUFFIX_TOKENS:
+        parts.pop()
+    return " ".join(parts)
+
+
+def _collapse_middle(parts: list[str]) -> list[str]:
+    """Collapse middle tokens into either [first, last] or [first, particle..., last].
+
+    Rules:
+      - 1 or 2 tokens → return as-is.
+      - 3+ tokens → keep first token and last token. If any middle token is a
+        compound-surname particle (Van, De, La, Mc...), glue the run of
+        particles + last-token together to preserve "De La Cruz" style names.
+    """
+    if len(parts) <= 2:
+        return parts
+
+    first = parts[0]
+    # Find the first compound-particle position in parts[1:-1]; if one exists,
+    # the surname starts there and runs through the end.
+    for i, tok in enumerate(parts[1:-1], start=1):
+        if tok.lower().rstrip(".") in _SURNAME_PARTICLES:
+            return [first] + parts[i:]
+
+    # No particle → single-word last name, drop every middle token.
+    return [first, parts[-1]]
+
+
 def _clean_and_split_name(full_name: str) -> tuple[str, str]:
     """Clean a full name for DataSift upload and split into (first, last).
 
     Handles patterns that cause DataSift "incomplete" records:
     - Joint names with "&" or "AND": "John & Jane Smith" → ("John", "Smith")
     - Entity names (LLC, Trust, etc.): returns ("", "") — entity goes to Notes
+    - "ET AL" / "ETAL" trailing marker → stripped
+    - Generational suffixes (JR, SR, II, III, IV, V, ESQ) → stripped
+    - Leading initials: "A Lee Rigby" → ("Lee", "Rigby")
+    - Multi-word middle names: "Robert Preston Day" → ("Robert", "Day")
+    - Compound surnames preserved via particle list (Van, De, La, Mc, St, …)
     - Special characters: strips &, @, #, % from name parts
     """
     if not full_name:
@@ -166,42 +220,61 @@ def _clean_and_split_name(full_name: str) -> tuple[str, str]:
     if len(joint_match) > 1:
         first_person = joint_match[0].strip()
         second_part = joint_match[1].strip()
-        # Extract last name from second part (last word(s) after second person's first name)
         second_words = second_part.split()
         if len(second_words) >= 2:
-            # "Jane Smith" → last name is "Smith"
             last_name = second_words[-1]
-            # Check if first person already has a last name
             first_words = first_person.split()
             if len(first_words) == 1:
                 # "John" & "Jane Smith" → "John Smith"
                 name = f"{first_person} {last_name}"
             else:
                 # "John David" & "Jane Marie Smith" → "John David Smith"
-                # But if "John Smith" & "Jane Doe" → keep "John Smith"
                 name = first_person
         else:
-            # "John & Jane" with no last name → just use first person
             name = first_person
 
-    # Strip remaining special characters that cause incomplete status
+    # Strip ET AL and generational suffixes before any splitting.
+    name = _strip_name_noise(name)
+
+    # Strip special chars and collapse whitespace.
     name = re.sub(r"[&@#%]", "", name)
-    # Collapse multiple spaces
     name = re.sub(r"\s+", " ", name).strip()
 
     if not name:
         return ("", "")
 
     parts = name.split()
-    if len(parts) == 1:
-        return (parts[0], "")
+
+    # Drop leading single-letter initial ("A Lee Rigby" → "Lee Rigby",
+    # "D. Bruce Kruger" → "Bruce Kruger"). Track it so we know the survivor
+    # is positionally a last-name when only one token remains.
+    leading_initial_stripped = False
+    if len(parts) >= 2 and re.fullmatch(r"[A-Za-z]\.?", parts[0]):
+        parts = parts[1:]
+        leading_initial_stripped = True
+
+    # Drop trailing single-letter initial ("Alton D" → "Alton").
+    if len(parts) >= 2 and re.fullmatch(r"[A-Za-z]\.?", parts[-1]):
+        parts = parts[:-1]
+
+    # Drop any remaining single-letter middle-initial tokens.
     if len(parts) >= 3:
-        # Strip middle initials (single letter + optional period) from between
-        # first and last name parts. "Eric J. Yopp" → "Eric Yopp"
-        # Keeps multi-char prefixes like "St." in "Richard C. St. Leger"
-        middle = parts[1:-1]
-        middle = [p for p in middle if not re.match(r"^[A-Za-z]\.?$", p)]
-        parts = [parts[0]] + middle + [parts[-1]]
+        parts = [parts[0]] + [p for p in parts[1:-1] if not re.fullmatch(r"[A-Za-z]\.?", p)] + [parts[-1]]
+
+    # Collapse multi-word middle names while preserving compound surnames.
+    parts = _collapse_middle(parts)
+
+    if not parts:
+        return ("", "")
+    if len(parts) == 1:
+        token = parts[0]
+        if len(token) <= 2:  # Looked like a bare initial — drop it entirely
+            return ("", "")
+        # If a leading initial was stripped, the survivor was positioned as the
+        # middle/last element of the original name → treat as last name.
+        # Otherwise the survivor was the first word (e.g., "CHESTER III" after
+        # stripping the suffix) → treat as first name.
+        return ("", token) if leading_initial_stripped else (token, "")
     return (parts[0], " ".join(parts[1:]))
 
 
@@ -547,6 +620,20 @@ def _build_property_section(notice: NoticeData) -> str:
     return " | ".join(parts)
 
 
+def _build_legal_owner_section(notice: NoticeData) -> str:
+    """Surface the pristine county-record owner name in Notes for deep
+    prospecting. Only emits when tax_owner_name is populated AND meaningfully
+    differs from the cleaned owner_name (catches ETAL / JR / III / trust
+    markers that _clean_and_split_name strips for the First/Last columns)."""
+    raw = (notice.tax_owner_name or "").strip()
+    if not raw:
+        return ""
+    # Skip when the raw value is just a case-folded version of the display name.
+    if raw.lower() == (notice.owner_name or "").lower().strip():
+        return ""
+    return f"=== LEGAL OWNER (COUNTY RECORD) ===\n{raw}"
+
+
 def _build_notes(notice: NoticeData) -> str:
     """Build a structured notes string for DataSift records.
 
@@ -593,23 +680,37 @@ def _build_notes(notice: NoticeData) -> str:
         if prop_section:
             sections.append(f"=== PROPERTY ===\n{prop_section}")
 
+        # Section 5: pristine county-record owner name (deep-prospecting signal)
+        legal_section = _build_legal_owner_section(notice)
+        if legal_section:
+            sections.append(legal_section)
+
         if notice.report_url:
             sections.append(f"=== REPORT ===\n{notice.report_url}")
 
         return "\n\n".join(sections)
 
-    # Living owner — simple format
-    return _build_property_section(notice)
+    # Living owner — property section + optional legal-owner section
+    parts = [_build_property_section(notice)]
+    legal_section = _build_legal_owner_section(notice)
+    if legal_section:
+        parts.append(legal_section)
+    return "\n\n".join(p for p in parts if p)
 
 
 def _build_dm_notes(notice: NoticeData) -> str:
     """Build Notes for CSV 1: deceased owner header + DM breakdown + property.
 
-    For living records, returns the simple property section.
+    For living records, returns the simple property section (plus optional
+    legal-owner section when raw county name differs from cleaned owner_name).
     Used by write_datasift_split_csvs() for the DMs upload.
     """
     if notice.owner_deceased != "yes":
-        return _build_property_section(notice)
+        parts = [_build_property_section(notice)]
+        legal_section = _build_legal_owner_section(notice)
+        if legal_section:
+            parts.append(legal_section)
+        return "\n\n".join(p for p in parts if p)
 
     sections = []
 
@@ -644,6 +745,11 @@ def _build_dm_notes(notice: NoticeData) -> str:
     prop_section = _build_property_section(notice)
     if prop_section:
         sections.append(f"=== PROPERTY ===\n{prop_section}")
+
+    # Pristine county-record owner name (deep-prospecting signal)
+    legal_section = _build_legal_owner_section(notice)
+    if legal_section:
+        sections.append(legal_section)
 
     return "\n\n".join(sections)
 
@@ -984,6 +1090,150 @@ def write_datasift_split_csvs(
             "path": heir_path,
             "label": "Heirs",
             "list_name": f"SiftStack {date_str} - Heirs",
+        })
+    else:
+        logger.info("No deceased records with heir data — skipping Heirs CSV")
+
+    return results
+
+
+def write_datasift_by_notice_type(
+    notices: list[NoticeData],
+    date_str: str | None = None,
+    keep_government: bool = False,
+) -> list[dict]:
+    """One CSV per distress type (notice_type), plus a combined Heirs CSV.
+
+    DataSift's upload wizard assigns every record in a CSV to a single list
+    (the list name entered in Step 1 of the wizard). The per-record `Lists`
+    column often stays unmapped during Step 4, so to land records in the
+    right DataSift list we must upload one CSV per distress type.
+
+    Output layout:
+      - One CSV per notice_type present in `notices`, named `datasift_{type}_
+        {timestamp}.csv`, with list name from NOTICE_TYPE_TO_LIST
+        ("Foreclosure", "Probate", "Tax Sale", ...).
+      - One final `datasift_heirs_{timestamp}.csv` (list name "Heirs")
+        containing only deceased-with-heirs records with the full heir-map
+        Notes — uploaded last so DataSift merges a second Message Board
+        comment onto the records created by the earlier per-type uploads.
+        Skipped if no deceased records have heir data.
+
+    Government-entity owners (Travis County Trustee, City Of Lakeway, etc.)
+    are dropped by default. Pass keep_government=True to include them.
+
+    Args:
+        notices: List of enriched NoticeData objects.
+        date_str: Unused for list names (bare list names per OCTOLIST), kept
+            for call-site parity with write_datasift_split_csvs(). Default: today.
+        keep_government: If True, include government-entity records.
+
+    Returns:
+        List of dicts: [{"path": Path, "label": str, "list_name": str,
+        "count": int}, ...]. One entry per notice_type present plus optional
+        Heirs entry. Returns empty list if no records survive filtering.
+    """
+    if date_str is None:
+        date_str = datetime.now().strftime("%Y-%m-%d")
+
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    results: list[dict] = []
+
+    # Filter government-entity owners once up front.
+    govt_dropped = 0
+    filtered: list[NoticeData] = []
+    for n in notices:
+        if not keep_government and _is_government_owner(n):
+            govt_dropped += 1
+            continue
+        filtered.append(n)
+
+    if govt_dropped:
+        logger.info("Dropped %d government-entity records (Travis County, City Of, etc.)", govt_dropped)
+
+    # Group by notice_type. Preserve the canonical order from NOTICE_TYPE_TO_LIST
+    # so the uploader processes them in a predictable sequence; any unknown
+    # notice_type values get appended after in insertion order.
+    groups: dict[str, list[NoticeData]] = {}
+    for n in filtered:
+        ntype = (n.notice_type or "").strip().lower()
+        groups.setdefault(ntype, []).append(n)
+
+    ordered_types = [t for t in NOTICE_TYPE_TO_LIST if t in groups]
+    ordered_types += [t for t in groups if t not in NOTICE_TYPE_TO_LIST]
+
+    for ntype in ordered_types:
+        group = groups[ntype]
+        if not group:
+            continue
+
+        list_name = NOTICE_TYPE_TO_LIST.get(ntype)
+        if not list_name:
+            # Unknown notice_type — derive a sensible list name from the value.
+            logger.warning("Unknown notice_type '%s' — deriving list name", ntype)
+            list_name = ntype.replace("_", " ").title() if ntype else "Unknown"
+
+        # Filename-safe slug: lowercase with underscores.
+        slug = re.sub(r"[^a-z0-9]+", "_", ntype or "unknown").strip("_") or "unknown"
+        csv_path = OUTPUT_DIR / f"datasift_{slug}_{timestamp}.csv"
+
+        written = 0
+        incomplete = 0
+        issue_counts: dict[str, int] = {}
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=DATASIFT_COLUMNS)
+            writer.writeheader()
+            for notice in group:
+                _check_city_zip(notice)
+                row = _build_row(notice, notes_override=_build_dm_notes(notice))
+                is_complete, issues = _validate_row(row)
+                if not is_complete:
+                    incomplete += 1
+                    for issue in issues:
+                        issue_counts[issue] = issue_counts.get(issue, 0) + 1
+                writer.writerow(row)
+                written += 1
+
+        logger.info("%s CSV: %d records → %s", list_name, written, csv_path)
+        if incomplete:
+            logger.warning(
+                "  completeness: %d/%d clean, %d incomplete (%s)",
+                written - incomplete, written, incomplete,
+                ", ".join(f"{k}={v}" for k, v in issue_counts.items()),
+            )
+
+        results.append({
+            "path": csv_path,
+            "label": list_name,
+            "list_name": list_name,
+            "count": written,
+        })
+
+    # Final Heirs CSV — deceased-with-heirs across all notice_types, uploaded
+    # last so DataSift layers the heir-map Message Board comment onto records
+    # created by the per-type uploads above.
+    deceased_with_heirs = [
+        n for n in filtered
+        if n.owner_deceased == "yes" and n.heir_map_json
+    ]
+
+    if deceased_with_heirs:
+        heir_path = OUTPUT_DIR / f"datasift_heirs_{timestamp}.csv"
+        heir_written = 0
+        with open(heir_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=DATASIFT_COLUMNS)
+            writer.writeheader()
+            for notice in deceased_with_heirs:
+                row = _build_row(notice, notes_override=_build_heir_notes(notice))
+                writer.writerow(row)
+                heir_written += 1
+
+        logger.info("Heirs CSV: %d records → %s", heir_written, heir_path)
+        results.append({
+            "path": heir_path,
+            "label": "Heirs",
+            "list_name": "Heirs",
+            "count": heir_written,
         })
     else:
         logger.info("No deceased records with heir data — skipping Heirs CSV")

@@ -105,30 +105,103 @@ def _clean_name_for_search(name: str) -> list[str]:
     return list(dict.fromkeys(searches))
 
 
-def lookup_parcel_addresses(notices: list[NoticeData]) -> None:
-    """Replace OCR addresses with official county addresses from parcel IDs.
+def _add_flag(notice: NoticeData, flag: str) -> None:
+    """Append a missing_data_flags token idempotently."""
+    existing = [p for p in (notice.missing_data_flags or "").split("|") if p]
+    if flag not in existing:
+        notice.missing_data_flags = "|".join(existing + [flag])
 
-    Stub — TX CAD lookup not yet implemented (Phase 4).
+
+def _apply_cad_result(notice: NoticeData, result: dict) -> None:
+    """Copy CAD lookup fields onto a NoticeData without clobbering existing data."""
+    owner_raw = (result.get("owner_raw") or "").strip()
+    if owner_raw and not notice.tax_owner_name:
+        notice.tax_owner_name = owner_raw
+    if result.get("parcel_id") and not notice.parcel_id:
+        notice.parcel_id = result["parcel_id"]
+    if result.get("property_type") and not notice.property_type:
+        notice.property_type = result["property_type"]
+    if result.get("value") and not notice.estimated_value:
+        notice.estimated_value = result["value"]
+    if result.get("delinquent_total") and not notice.tax_delinquent_amount:
+        notice.tax_delinquent_amount = result["delinquent_total"]
+    if result.get("years_delinquent") and not notice.tax_delinquent_years:
+        notice.tax_delinquent_years = result["years_delinquent"]
+
+
+def lookup_parcel_addresses(notices: list[NoticeData]) -> None:
+    """Fill property situs from CAD when the scraper left it blank.
+
+    Runs before Smarty so downstream address validation sees the cleaner
+    county-record situs. Handles Travis + Williamson; Bell is flagged.
     """
-    candidates = [n for n in notices if n.parcel_id.strip()]
-    if candidates:
-        logger.info(
-            "Skipping parcel address lookup for %d notices (TX CAD not yet implemented)",
-            len(candidates),
-        )
+    from cad_lookup import lookup_property_by_address
+    from collections import Counter
+
+    counts = Counter()
+    for n in notices:
+        # Only fill situs when address is blank — never overwrite scraper data.
+        if n.address.strip():
+            continue
+        if not n.parcel_id.strip():
+            continue
+        county = (n.county or "").strip().lower()
+        if county == "bell":
+            _add_flag(n, "bcad_not_implemented")
+            counts["bell_flagged"] += 1
+            continue
+        # Travis + Williamson parcel→situs requires the opposite direction
+        # (address is what we use as the key today). If we have parcel only,
+        # no fill for now — leave for a future CAD dataset addition.
+        counts["parcel_only_skipped"] += 1
+
+    if counts:
+        logger.info("Parcel situs backfill: %s", dict(counts))
 
 
 def enrich_tax_delinquency(notices: list[NoticeData]) -> None:
-    """Enrich notices with tax delinquency data from county CAD portals.
+    """Enrich notices with tax delinquency data + owner fallback via CAD lookup.
 
-    Stub — TX CAD lookup not yet implemented (Phase 4).
+    TCAD: pulls authoritative owner, parcel ID, delinquent amount/years, value.
+    WCAD: pulls authoritative owner, parcel ID, property type, value (no tax).
+    BCAD: not implemented — records tagged with ``bcad_not_implemented`` flag.
     """
-    candidates = [
-        n for n in notices
-        if n.parcel_id.strip() or n.address.strip()
-    ]
-    if candidates:
-        logger.info(
-            "Skipping tax delinquency enrichment for %d notices (TX CAD not yet implemented)",
-            len(candidates),
-        )
+    from cad_lookup import lookup_property_by_address
+    from collections import Counter
+
+    counts = Counter()
+    for n in notices:
+        if not n.address.strip():
+            continue
+        county = (n.county or "").strip().lower()
+
+        if county == "bell":
+            _add_flag(n, "bcad_not_implemented")
+            counts["bell_flagged"] += 1
+            continue
+        if county not in ("travis", "williamson"):
+            continue
+
+        try:
+            result = lookup_property_by_address(n.address, n.county, zip_code=n.zip)
+        except Exception as e:
+            logger.debug("CAD lookup failed for %s: %s", n.address, e)
+            counts[f"{county}_error"] += 1
+            continue
+
+        if not result:
+            counts[f"{county}_miss"] += 1
+            continue
+
+        _apply_cad_result(n, result)
+        counts[f"{county}_hit"] += 1
+
+        # Fire deceased-indicator detection against the fresh CAD owner name —
+        # catches LIFE ESTATE / PERSONAL REP / ET AL / TRUSTEE patterns the
+        # scraper may have missed.
+        indicator = detect_deceased_indicator(n.tax_owner_name)
+        if indicator:
+            _add_flag(n, f"cad_{indicator}")
+
+    if counts:
+        logger.info("CAD enrichment: %s", dict(counts))

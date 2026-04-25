@@ -215,8 +215,8 @@ async def actor_main() -> None:
             "TRESTLE_API_KEY": actor_input.get("trestle_api_key", ""),
         }
         for key, val in _cred_map.items():
-            setattr(config, key, val)
             if val:
+                setattr(config, key, val)
                 os.environ[key] = val
 
         # ── Scrape scope ────────────────────────────────────────────
@@ -618,8 +618,8 @@ async def actor_main() -> None:
             datasift_csv_urls: list[dict] = []
             drive_links: list[dict] = []
             try:
-                from datasift_formatter import write_datasift_split_csvs
-                csv_infos = write_datasift_split_csvs(
+                from datasift_formatter import write_datasift_by_notice_type
+                csv_infos = write_datasift_by_notice_type(
                     notices, keep_government=keep_government,
                 )
 
@@ -1030,13 +1030,13 @@ def _run_csv_import(args) -> None:
 
     # DataSift upload (same logic as daily/historical mode)
     if getattr(args, "upload_datasift", False):
-        from datasift_formatter import write_datasift_split_csvs
+        from datasift_formatter import write_datasift_by_notice_type
         from datasift_uploader import upload_datasift_split, upload_to_datasift
 
         do_enrich = not getattr(args, "no_enrich", False)
         do_skip_trace = not getattr(args, "no_skip_trace", False)
 
-        csv_infos = write_datasift_split_csvs(notices)
+        csv_infos = write_datasift_by_notice_type(notices)
         for info in csv_infos:
             logging.info("DataSift CSV (%s): %s", info["label"], info["path"])
 
@@ -2270,9 +2270,9 @@ def _run_scrape_pipeline(args, targets) -> None:
     # DataSift-ready CSV generation + Drive upload (always run).
     # Playwright auto-upload to DataSift is opt-in via --upload-datasift.
     upload_result = None
-    from datasift_formatter import write_datasift_split_csvs
+    from datasift_formatter import write_datasift_by_notice_type
 
-    csv_infos = write_datasift_split_csvs(
+    csv_infos = write_datasift_by_notice_type(
         notices,
         keep_government=getattr(args, "keep_government_records", False),
     )

@@ -363,6 +363,11 @@ class TravisTaxDelinquentScraper:
             notice.business_name = business_name
             notice.mailing_address = mail_addr
             notice.tax_raw_meta = _build_tax_raw_meta(row)
+            # Preserve the pristine "Owner Name" column (pre-flip, pre-cleanup)
+            # so deep prospecting can see ETAL / JR / SR / trust markers.
+            # If the row had the name-overflow pattern (name spilled into
+            # Address 1), stash the merged raw string so nothing is lost.
+            notice.tax_owner_name = full_owner
 
             # Mailing address components (used by DataSift formatter when
             # mailing differs from property)

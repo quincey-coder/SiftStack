@@ -128,8 +128,11 @@ def _parse_bid_sheet(text: str, county: str) -> list[NoticeData]:
             except ValueError:
                 continue
 
-    # Extract all owners from "County v OWNER" patterns
-    owners = []
+    # Extract all owners from "County v OWNER" patterns. Keep the pristine
+    # pre-title-case string alongside the display version so the DataSift
+    # notes section can surface the original legal name for deep prospecting.
+    owners = []      # display (title-cased) names
+    owners_raw = []  # pristine pre-title-case copies aligned by index
     for m in re.finditer(
         r"(?:County of \w+|Tax Appraisal District)[^v]+v\s+(.+?)(?=\n\s*\n|\d{1,3}\s*\n\s*\n|\Z)",
         text, re.IGNORECASE | re.DOTALL,
@@ -140,10 +143,12 @@ def _parse_bid_sheet(text: str, county: str) -> list[NoticeData]:
             r"(?:PROPERTY DESCRIPTION|\d+\.\d+ Acre|Lot \d|East part|West part|A Manufactured|MINIMUM)",
             owner,
         )[0].strip()
+        raw_owner = owner
         if owner.isupper():
             owner = owner.title()
         if owner and len(owner) > 2:
             owners.append(owner)
+            owners_raw.append(raw_owner)
 
     # Extract all addresses
     addresses = []
@@ -165,6 +170,7 @@ def _parse_bid_sheet(text: str, county: str) -> list[NoticeData]:
     count = max(len(owners), len(addresses), len(accounts))
     for i in range(count):
         owner = owners[i] if i < len(owners) else ""
+        owner_raw = owners_raw[i] if i < len(owners_raw) else ""
         addr, city, zip_code = addresses[i] if i < len(addresses) else ("", "", "")
         acct = accounts[i] if i < len(accounts) else ""
 
@@ -184,6 +190,8 @@ def _parse_bid_sheet(text: str, county: str) -> list[NoticeData]:
             parcel_id=acct,
             source_url="https://mvbalaw.com/tax-sales/",
         )
+        # Preserve the pristine "County of X v NAME" string from the PDF.
+        notice.tax_owner_name = owner_raw
 
         notice.raw_text = f"Tract {i+1}: {owner} | {addr}, {city} TX {zip_code} | Acct: {acct}"
         notices.append(notice)

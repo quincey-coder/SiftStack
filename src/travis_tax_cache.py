@@ -38,7 +38,26 @@ logger = logging.getLogger(__name__)
 # Lazy-loaded, process-wide index: {normalized_last_name: [property dicts]}
 _INDEX: dict[str, list[dict]] | None = None
 
+# Lazy-loaded address index: {(normalized_street, zip5): property dict}
+# Built from both delinquent (authoritative situs) and current CSVs.
+# Delinquent entries overwrite current-mailing entries at the same key
+# because they carry real tax data.
+_ADDR_INDEX: dict[tuple[str, str], dict] | None = None
+
 _FIELD_LIMIT = 10 * 1024 * 1024  # 10 MB — TaxCurOpenData has long quoted rows
+
+
+def _normalize_street(street: str) -> str:
+    """Uppercase, collapse whitespace, strip punctuation. Output aligns with
+    TCAD's `Street Number + Street Name` concatenation format (e.g.
+    `'1512 W 9TH ST'`)."""
+    if not street:
+        return ""
+    import re as _re
+    s = street.upper()
+    s = _re.sub(r"[.,]", "", s)
+    s = _re.sub(r"\s+", " ", s).strip()
+    return s
 
 
 def _cache_path(filename: str) -> Path:
@@ -103,9 +122,16 @@ def _normalize_last(name: str) -> str:
     return parts[0] if parts else ""
 
 
-def _load_delq(path: Path, idx: dict[str, list[dict]]) -> int:
-    """Parse TaxDelqOpenData.csv — has true situs address columns."""
+def _load_delq(
+    path: Path,
+    idx: dict[str, list[dict]],
+    addr_idx: dict[tuple[str, str], dict],
+) -> int:
+    """Parse TaxDelqOpenData.csv — has true situs address columns and the
+    Delinquent Total + 1st Year Delinquent fields used by CAD-LIFT."""
+    from datetime import datetime as _dt
     count = 0
+    this_year = _dt.now().year
     with open(path, encoding="utf-8-sig", errors="replace", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
@@ -120,29 +146,55 @@ def _load_delq(path: Path, idx: dict[str, list[dict]]) -> int:
             situs = f"{street_num} {street_name}".strip()
             if not situs or not street_num:
                 continue  # vacant land / missing situs
-            idx.setdefault(key, []).append({
+
+            # Delinquency fields used by tax_enricher.enrich_tax_delinquency()
+            delq_total = (row.get("Delinquent Total") or "").strip()
+            first_year_raw = (row.get("1st Year Delinquent") or "").strip()
+            years_delinquent = ""
+            if first_year_raw.isdigit():
+                y = this_year - int(first_year_raw)
+                if 0 <= y <= 100:
+                    years_delinquent = str(y)
+
+            zip5 = (row.get("Property Zip") or "").strip()[:5]
+            record = {
                 "fullname": owner,
                 "situsaddress": situs,
                 # Property city is not in the delinquent CSV; Travis Tax Office
                 # situs defaults to Austin for the overwhelming majority.
                 "scity": "AUSTIN",
-                "szip": (row.get("Property Zip") or "").strip()[:5],
+                "szip": zip5,
                 "quickrefid": (row.get("Account #") or "").strip(),
                 "totalpropmktvalue": (row.get("Appraisal Value") or "").strip(),
                 "propertytypedesc": (row.get("Property Type Code") or "").strip(),
+                "delinquent_total": delq_total,
+                "years_delinquent": years_delinquent,
                 "source": "delinquent_situs",
-            })
+            }
+            idx.setdefault(key, []).append(record)
+
+            # Address index — authoritative situs, always wins over current_mailing
+            addr_key = (_normalize_street(situs), zip5)
+            addr_idx[addr_key] = record
+
             count += 1
     return count
 
 
-def _load_cur(path: Path, idx: dict[str, list[dict]]) -> int:
+def _load_cur(
+    path: Path,
+    idx: dict[str, list[dict]],
+    addr_idx: dict[tuple[str, str], dict],
+) -> int:
     """Parse TaxCurOpenData.csv — owner + mailing address only, no situs.
 
     Mailing address is used as situs (the decedent's home IS their property
     for individual-owned parcels — the vast majority of probate candidates).
     Records are tagged `source="current_mailing"` so scoring can deprioritize
     them when a situs-tagged match also exists.
+
+    Populates the address index only when no delinquent-situs record already
+    owns the key — delinquent data always wins.
     """
     count = 0
     # The Cur file has very long legal descriptions; bump csv field size limit.
@@ -166,7 +218,7 @@ def _load_cur(path: Path, idx: dict[str, list[dict]]) -> int:
             state = (row.get("STATE") or "").strip().upper()
             if state and state != "TX":
                 continue  # out-of-state mailing = not a TX probate property
-            idx.setdefault(key, []).append({
+            record = {
                 "fullname": owner,
                 "situsaddress": mailing,
                 "scity": (row.get("CITY") or "").strip().upper() or "AUSTIN",
@@ -174,29 +226,40 @@ def _load_cur(path: Path, idx: dict[str, list[dict]]) -> int:
                 "quickrefid": (row.get("PARCEL") or "").strip().strip() or "",
                 "totalpropmktvalue": "",
                 "propertytypedesc": "",
+                "delinquent_total": "",
+                "years_delinquent": "",
                 "source": "current_mailing",
-            })
+            }
+            idx.setdefault(key, []).append(record)
+            # Only populate address index if delinquent load didn't already.
+            addr_key = (_normalize_street(mailing), zipc)
+            addr_idx.setdefault(addr_key, record)
             count += 1
     return count
 
 
 def load_index(force_download: bool = False) -> dict[str, list[dict]]:
-    """Return the lazy-built owner-name index, downloading CSVs if stale."""
-    global _INDEX
+    """Return the lazy-built owner-name index, downloading CSVs if stale.
+
+    Also populates the sibling address index (see `search_by_address`).
+    """
+    global _INDEX, _ADDR_INDEX
     if _INDEX is not None and not force_download:
         return _INDEX
     delq_path, cur_path = download_if_stale(force=force_download)
     idx: dict[str, list[dict]] = {}
+    addr_idx: dict[tuple[str, str], dict] = {}
     logger.info("Loading Travis tax delinquent CSV into index…")
-    n_delq = _load_delq(delq_path, idx)
+    n_delq = _load_delq(delq_path, idx, addr_idx)
     logger.info("  %d delinquent-situs records indexed", n_delq)
     logger.info("Loading Travis tax current CSV into index (large file, ~60s)…")
-    n_cur = _load_cur(cur_path, idx)
+    n_cur = _load_cur(cur_path, idx, addr_idx)
     logger.info("  %d current-mailing records indexed", n_cur)
     _INDEX = idx
+    _ADDR_INDEX = addr_idx
     logger.info(
-        "Travis tax cache ready: %d unique keys, %d total records",
-        len(idx), sum(len(v) for v in idx.values()),
+        "Travis tax cache ready: %d name keys, %d address keys, %d total records",
+        len(idx), len(addr_idx), sum(len(v) for v in idx.values()),
     )
     return idx
 
@@ -216,3 +279,22 @@ def search_by_name(last_name: str, first_name: str = "") -> list[dict]:
     # Probe both directions: tax rolls use LAST FIRST; caller may pass either.
     # We indexed on first-token which for LAST-FIRST format IS the last name.
     return idx.get(key, [])
+
+
+def search_by_address(street: str, zip5: str) -> dict | None:
+    """Return the property record matching a normalized street+ZIP key.
+
+    The delinquent CSV is authoritative — if a delinquent_situs record
+    exists at this address, it wins over a current_mailing record. Returns
+    None when no TCAD record matches.
+    """
+    global _ADDR_INDEX
+    if _ADDR_INDEX is None:
+        load_index()
+    if _ADDR_INDEX is None:  # still None = load failed
+        return None
+    zip5 = (zip5 or "").strip()[:5]
+    if not street or not zip5:
+        return None
+    key = (_normalize_street(street), zip5)
+    return _ADDR_INDEX.get(key)

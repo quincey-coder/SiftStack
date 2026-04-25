@@ -270,27 +270,51 @@ def lookup_property_by_name(
 def lookup_property_by_address(
     address: str,
     county: str,
+    zip_code: str = "",
 ) -> dict | None:
     """Search county CAD for property data by address.
 
-    Returns dict with: owner, value, parcel_id, tax_status
-    or None if not found.
+    Returns dict with: owner, value, parcel_id, property_type, delinquent_total,
+    years_delinquent, source — or None if not found.
     """
     county_lower = county.lower()
 
     if county_lower == "williamson":
         results = _wcad_address_search(address)
-    else:
-        logger.debug("CAD address lookup not yet implemented for %s County", county)
-        return None
+        if not results:
+            return None
+        best = results[0]
+        return {
+            "owner": best.get("fullname", "").title(),
+            "owner_raw": best.get("fullname", ""),
+            "value": best.get("totalpropmktvalue", ""),
+            "parcel_id": best.get("quickrefid", ""),
+            "property_type": best.get("propertytypedesc", ""),
+            "delinquent_total": "",  # WCAD SODA datasets don't carry tax
+            "years_delinquent": "",
+            "source": "wcad_soda",
+        }
 
-    if not results:
-        return None
+    if county_lower == "travis":
+        try:
+            from travis_tax_cache import search_by_address
+            rec = search_by_address(address, zip_code)
+        except Exception as e:
+            logger.warning("Travis CAD address lookup failed: %s", e)
+            return None
+        if not rec:
+            return None
+        return {
+            "owner": rec.get("fullname", "").title(),
+            "owner_raw": rec.get("fullname", ""),
+            "value": rec.get("totalpropmktvalue", ""),
+            "parcel_id": rec.get("quickrefid", ""),
+            "property_type": rec.get("propertytypedesc", ""),
+            "delinquent_total": rec.get("delinquent_total", ""),
+            "years_delinquent": rec.get("years_delinquent", ""),
+            "source": rec.get("source", "travis_tax_cache"),
+        }
 
-    best = results[0]
-    return {
-        "owner": best.get("fullname", "").title(),
-        "value": best.get("totalpropmktvalue", ""),
-        "parcel_id": best.get("quickrefid", ""),
-        "property_type": best.get("propertytypedesc", ""),
-    }
+    # Bell — no data source wired yet. Return None; caller flags the notice.
+    logger.debug("CAD address lookup not yet implemented for %s County", county)
+    return None
