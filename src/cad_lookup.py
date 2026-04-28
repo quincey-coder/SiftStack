@@ -181,8 +181,23 @@ def lookup_property_by_name(
         except Exception as e:
             logger.warning("Travis tax cache lookup failed: %s", e)
             return None
+    elif county_lower == "bell":
+        # TRIROLL: BellCAD has no live API, so the master cross-reference is
+        # served from `bell_tax_cache` which lazy-loads the appraisal master
+        # XLSX (full county) + delinquent overlay.
+        from bell_tax_cache import search_by_name
+        parts = [
+            p for p in name.strip().split()
+            if p.upper() not in {"JR", "SR", "II", "III", "IV", "ESQ"}
+        ]
+        try:
+            results = list(search_by_name(last_name, first_name))
+            if len(parts) >= 2 and parts[0].upper() != last_name.upper():
+                results += search_by_name(parts[0], "")
+        except Exception as e:
+            logger.warning("Bell tax cache lookup failed: %s", e)
+            return None
     else:
-        # Bell still uses per-record scraping (not yet implemented)
         logger.debug("CAD lookup not yet implemented for %s County", county)
         return None
 
@@ -195,8 +210,12 @@ def lookup_property_by_name(
     # "D & D Trust" matching "Aynesworth Donald D" on a single initial.
     # Other counties: original last+first scoring.
     scored: list[tuple[float, dict]] = []
-    if county_lower == "travis":
-        noise = {"&", "JR", "SR", "II", "III", "IV", "THE", "ESTATE", "OF", "TRUST", "LLC", "INC"}
+    if county_lower in ("travis", "bell"):
+        # Both Travis tax cache and Bell tax cache return records keyed off a
+        # local roll where the API name format ("LAST, FIRST ETUX ...") doesn't
+        # match the typical FIRST LAST search input. Use whole-token overlap
+        # with a multi-token floor to avoid initials-only false positives.
+        noise = {"&", "JR", "SR", "II", "III", "IV", "THE", "ESTATE", "OF", "TRUST", "LLC", "INC", "ETUX", "ETVIR", "ETAL"}
         search_tokens = {p.upper() for p in name.strip().split()} - noise
         multi_token = len(search_tokens) >= 2
         seen_ids: set[str] = set()
@@ -254,6 +273,10 @@ def lookup_property_by_name(
         "state": "TX",
         "zip": zip_code,
         "owner": best.get("fullname", "").title(),
+        # Pristine raw all-caps owner — callers that want a clean display
+        # name should pass this through their own ETAL strip + title-case
+        # (Python's `.title()` lowercases LLC/III/JR — see property_lookup.py).
+        "owner_raw": best.get("fullname", ""),
         "value": best.get("totalpropmktvalue", ""),
         "parcel_id": best.get("quickrefid", ""),
         "property_type": best.get("propertytypedesc", ""),
@@ -315,6 +338,26 @@ def lookup_property_by_address(
             "source": rec.get("source", "travis_tax_cache"),
         }
 
-    # Bell — no data source wired yet. Return None; caller flags the notice.
+    if county_lower == "bell":
+        # TRIROLL: Bell uses the same local-cache shape as Travis.
+        try:
+            from bell_tax_cache import search_by_address
+            rec = search_by_address(address, zip_code)
+        except Exception as e:
+            logger.warning("Bell CAD address lookup failed: %s", e)
+            return None
+        if not rec:
+            return None
+        return {
+            "owner": rec.get("fullname", "").title(),
+            "owner_raw": rec.get("fullname", ""),
+            "value": rec.get("totalpropmktvalue", ""),
+            "parcel_id": rec.get("quickrefid", ""),
+            "property_type": rec.get("propertytypedesc", ""),
+            "delinquent_total": rec.get("delinquent_total", ""),
+            "years_delinquent": rec.get("years_delinquent", ""),
+            "source": rec.get("source", "bell_tax_cache"),
+        }
+
     logger.debug("CAD address lookup not yet implemented for %s County", county)
     return None

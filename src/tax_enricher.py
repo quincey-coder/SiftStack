@@ -133,26 +133,19 @@ def lookup_parcel_addresses(notices: list[NoticeData]) -> None:
     """Fill property situs from CAD when the scraper left it blank.
 
     Runs before Smarty so downstream address validation sees the cleaner
-    county-record situs. Handles Travis + Williamson; Bell is flagged.
+    county-record situs. Handles Travis + Williamson + Bell (TRIROLL).
     """
-    from cad_lookup import lookup_property_by_address
     from collections import Counter
 
     counts = Counter()
     for n in notices:
-        # Only fill situs when address is blank — never overwrite scraper data.
         if n.address.strip():
             continue
         if not n.parcel_id.strip():
             continue
-        county = (n.county or "").strip().lower()
-        if county == "bell":
-            _add_flag(n, "bcad_not_implemented")
-            counts["bell_flagged"] += 1
-            continue
-        # Travis + Williamson parcel→situs requires the opposite direction
-        # (address is what we use as the key today). If we have parcel only,
-        # no fill for now — leave for a future CAD dataset addition.
+        # Parcel→situs lookup currently keys off address rather than parcel ID
+        # (we only have parcel ID inverted indices for Bell + Travis caches).
+        # Defer until a parcel→situs index exists.
         counts["parcel_only_skipped"] += 1
 
     if counts:
@@ -164,7 +157,9 @@ def enrich_tax_delinquency(notices: list[NoticeData]) -> None:
 
     TCAD: pulls authoritative owner, parcel ID, delinquent amount/years, value.
     WCAD: pulls authoritative owner, parcel ID, property type, value (no tax).
-    BCAD: not implemented — records tagged with ``bcad_not_implemented`` flag.
+    BCAD: TRIROLL — pulls owner, parcel, property type, value via the
+      `bell_tax_cache` master appraisal XLSX, with delinquent fields
+      overlaid from the delinquent XLSX where they match.
     """
     from cad_lookup import lookup_property_by_address
     from collections import Counter
@@ -175,11 +170,7 @@ def enrich_tax_delinquency(notices: list[NoticeData]) -> None:
             continue
         county = (n.county or "").strip().lower()
 
-        if county == "bell":
-            _add_flag(n, "bcad_not_implemented")
-            counts["bell_flagged"] += 1
-            continue
-        if county not in ("travis", "williamson"):
+        if county not in ("travis", "williamson", "bell"):
             continue
 
         try:

@@ -224,21 +224,63 @@ def is_business(name: str) -> bool:
     return bool(name and (BIZ_KW.search(name) or BIZ_EXTRA.search(name)))
 
 
+def strip_etux_etal(name: str) -> str:
+    """Strip trailing ETUX/ETVIR/ETAL clauses + spousal `& <name>` tails.
+
+    Mirrors Bell + Wilco behavior so Travis names also lose their tail
+    markers for the marketing CSV. The pristine raw name is preserved
+    separately on `notice.tax_owner_name` for deep prospecting / Notes.
+
+    Examples:
+      "AUSTIN MUSEUM OF ART INC ETAL"   → "AUSTIN MUSEUM OF ART INC"
+      "ROSENDO GOMEZ JR ETAL"           → "ROSENDO GOMEZ JR"
+      "SMITH JOHN ETUX MARY"            → "SMITH JOHN"
+      "DOE JANE & JOHN K"               → "DOE JANE"
+    """
+    if not name:
+        return ""
+    return re.sub(
+        r"\s+(?:(?:ETUX|ETVIR|ETAL)\b|&\s).*$",
+        "",
+        name,
+        flags=re.IGNORECASE,
+    ).strip()
+
+
+# Suffixes that Python's .title() / .capitalize() mangles — these stay
+# upper-cased after `title_case()` post-processing. Includes legal-entity
+# suffixes, Roman numerals (II–X), professional credentials.
+_KEEP_UPPER_SUFFIXES = frozenset({
+    "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X",
+    "JR", "SR",
+    "LLC", "LP", "LLP", "INC", "LTD", "CORP", "PLLC", "PA", "PC", "CO",
+    "MD", "DDS", "DVM", "CPA", "ESQ",
+    "USA", "TX", "HOA", "HUD", "VA", "FBO",
+    "ETUX", "ETVIR", "ETAL",  # only seen if strip_etux_etal didn't run
+})
+
+
 def title_case(s: str) -> str:
-    """Title-case a name, preserving Mc/O'/II/III/IV/JR/SR and biz suffixes."""
+    """Title-case a name, preserving Mc/O'/Roman numerals and biz suffixes."""
     if not s:
         return ""
     result = []
     for w in s.split():
-        wu = w.upper()
-        if wu in ("II", "III", "IV", "JR", "SR", "LLC", "LP", "INC", "LTD"):
-            result.append(wu)
+        # Strip trailing punctuation for the suffix-check, but re-attach later.
+        trail = ""
+        core = w
+        while core and core[-1] in ".,;":
+            trail = core[-1] + trail
+            core = core[:-1]
+        wu = core.upper()
+        if wu in _KEEP_UPPER_SUFFIXES:
+            result.append(wu + trail)
         elif wu.startswith("MC") and len(wu) > 2:
-            result.append("Mc" + wu[2:].capitalize())
+            result.append("Mc" + wu[2:].capitalize() + trail)
         elif wu.startswith("O'") and len(wu) > 2:
-            result.append("O'" + wu[2:].capitalize())
+            result.append("O'" + wu[2:].capitalize() + trail)
         else:
-            result.append(w.capitalize())
+            result.append(core.capitalize() + trail)
     return " ".join(result)
 
 

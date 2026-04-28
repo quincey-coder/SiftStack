@@ -613,6 +613,86 @@ def _build_dm_section(notice: NoticeData) -> str:
     return "=== DECISION MAKERS ===\n" + "\n".join(dms)
 
 
+_DM_RELATIONSHIP_LABELS = {
+    "care_of_caretaker":  "care-of caretaker",
+    "joint_owner":        "joint owner",
+    "obituary_survivor":  "surviving family member",
+    "spouse":             "spouse",
+    "child":              "child",
+    "executor":           "executor",
+    "trustee":            "trustee",
+}
+
+_DM_SOURCE_LABELS = {
+    "tax_record_c_o":         "BellCAD tax record (C/O)",
+    "tax_record_joint_owner": "county tax record",
+    "obituary_survivors":     "obituary search",
+    "snippet":                "obituary snippet",
+}
+
+
+def _build_caretaker_section(notice: NoticeData) -> str:
+    """RAWCALL: surface the live decision-maker for non-deceased records.
+
+    Tax-delinquent records routinely encode a C/O caretaker (the person who
+    actually handles the property's mail) — typically because the legal owner
+    is elderly, absentee, or in a trust. Without this section the DataSift
+    Notes column shows only the property summary and the C/O name is buried
+    in the (rarely surfaced) decision-maker columns.
+
+    Returns "" when there's no DM, or when the owner is deceased — the
+    deceased branch of `_build_notes()` already emits a multi-section
+    `=== DECISION MAKERS ===` block via `_build_dm_section()`, so we don't
+    duplicate.
+    """
+    if notice.owner_deceased == "yes":
+        return ""
+    name = (notice.decision_maker_name or "").strip()
+    if not name:
+        return ""
+
+    rel_raw = (notice.dm_relationship or notice.decision_maker_relationship or "").strip()
+    rel_label = _DM_RELATIONSHIP_LABELS.get(rel_raw, rel_raw or "live decision-maker")
+
+    src_raw = (notice.decision_maker_source or "").strip()
+    src_label = _DM_SOURCE_LABELS.get(src_raw, src_raw)
+
+    header_attr = "from " + src_label if src_label else "live contact"
+
+    lines = [
+        "=== CONTACT FIRST ===",
+        f"{name} ({rel_label}, {header_attr})",
+    ]
+
+    # Optional caretaker mailing address — saves a skip-trace step when known.
+    addr = (notice.decision_maker_street or "").strip()
+    if addr:
+        addr_parts = [addr]
+        if notice.decision_maker_city:
+            addr_parts.append(notice.decision_maker_city)
+        if notice.decision_maker_state:
+            tail = notice.decision_maker_state
+            if notice.decision_maker_zip:
+                tail = f"{tail} {notice.decision_maker_zip}"
+            addr_parts.append(tail)
+        lines.append(f"Mail: {', '.join(addr_parts)}")
+
+    # Action language — this is the headline of the section. Tailor to C/O.
+    if rel_raw == "care_of_caretaker":
+        action = (
+            "Action: Skip-trace this name first → call them. They handle this "
+            "property's mail and likely make decisions for the legal owner."
+        )
+    else:
+        action = (
+            "Action: Skip-trace and contact this person — they're the live "
+            "decision-maker for this property."
+        )
+    lines.append(action)
+
+    return "\n".join(lines)
+
+
 def _build_property_section(notice: NoticeData) -> str:
     """Build the property/notice details section for Notes."""
     parts = []
@@ -714,8 +794,12 @@ def _build_notes(notice: NoticeData) -> str:
 
         return "\n\n".join(sections)
 
-    # Living owner — property section + optional legal-owner section
-    parts = [_build_property_section(notice)]
+    # Living owner — caretaker (RAWCALL) on top, then property + optional legal owner
+    parts = []
+    caretaker_section = _build_caretaker_section(notice)
+    if caretaker_section:
+        parts.append(caretaker_section)
+    parts.append(_build_property_section(notice))
     legal_section = _build_legal_owner_section(notice)
     if legal_section:
         parts.append(legal_section)
@@ -730,7 +814,11 @@ def _build_dm_notes(notice: NoticeData) -> str:
     Used by write_datasift_split_csvs() for the DMs upload.
     """
     if notice.owner_deceased != "yes":
-        parts = [_build_property_section(notice)]
+        parts = []
+        caretaker_section = _build_caretaker_section(notice)
+        if caretaker_section:
+            parts.append(caretaker_section)
+        parts.append(_build_property_section(notice))
         legal_section = _build_legal_owner_section(notice)
         if legal_section:
             parts.append(legal_section)

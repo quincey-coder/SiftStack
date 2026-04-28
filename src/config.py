@@ -116,8 +116,28 @@ TRAVIS_CLERK_URL = "https://www.tccsearch.org/"
 # Bell County data sources
 BELL_FORECLOSURES_URL = "https://www.bellcountytx.com/county_government/county_clerk/foreclosures.php"
 
+# Bell tax delinquent (BellCAD data portal). Filenames carry rotating date stamps;
+# scraper fetches the portal index page each run and regexes the latest XLSX.
+# - Delinquent file: parcel-level "Delinquent Roll All Years" — primary scrape target.
+# - Appraisal file: full-county owner+situs+parcel — used as master cross-reference
+#   for probate/foreclosure address backfill (BellCAD has no live API).
+BELLCAD_DATA_PORTAL_URL = "https://bellcad.org/data-portal/"
+BELLCAD_DELINQUENT_ROLL_PATTERN = r"BellCAD_Delinquent_Roll_Condensed_\d{8}\.xlsx"
+BELLCAD_APPRAISAL_ROLL_PATTERN = r"\d{4}_BellCAD_Appraisal_Data_Condensed_\d{8}\.xlsx"
+BELL_TAX_CACHE_DIR = "data/bell_tax_cache"
+BELL_TAX_CACHE_TTL_HOURS = 24
+
 # Williamson County data sources
 WILCO_TRUSTEE_SALES_URL = "https://apps.wilco.org/countyclerk/trustee_sales/"
+
+# Williamson tax delinquent (Wilco TAC). Index page lists CivicPlus DocumentCenter
+# files; URL date tokens rotate weekly so scraper resolves the live link each run.
+# Master cross-reference uses the existing live WCAD SODA API in cad_lookup.py
+# (no separate master download — the API is free, real-time, and full-county).
+WILCO_TAX_ROLL_PAGE = "https://www.wilcotx.gov/761/Property-Tax-Roll-Information-Request"
+WILCO_DELINQUENT_DOC_ID = "8553"   # Current Year and Prior Taxes Due (Excel)
+WILCO_TAX_CACHE_DIR = "data/wilco_tax_cache"
+WILCO_TAX_CACHE_TTL_HOURS = 24
 
 # MVBA Law Firm — handles tax sales for Bell + Williamson
 MVBA_TAX_SALES_URL = "https://mvbalaw.com/tax-sales/"

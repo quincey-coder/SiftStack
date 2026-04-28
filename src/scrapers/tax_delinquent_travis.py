@@ -233,16 +233,24 @@ class TravisTaxDelinquentScraper:
                 addr1_for_mail = addr1
 
             # ── Step 2 — Business vs person ──────────────────────
+            # Strip ETUX/ETVIR/ETAL/spousal-tails before classification —
+            # mirrors Bell + Wilco. Pristine raw owner is preserved on
+            # `notice.tax_owner_name` below for the legal-owner Notes line.
+            owner_clean = (
+                cleaner.strip_etux_etal(full_owner)
+                if not self.skip_cleaner
+                else full_owner
+            )
             business_name = ""
             person_name = ""
-            if not self.skip_cleaner and cleaner.is_business(full_owner):
-                business_name = cleaner.title_case(full_owner)
+            if not self.skip_cleaner and cleaner.is_business(owner_clean):
+                business_name = cleaner.title_case(owner_clean)
             else:
                 # Hybrid: SiftStack's normalize_court_name handles TX
-                # LAST FIRST flipping + JR/SR/II/III/IV/ETAL suffixes.
+                # LAST FIRST flipping + JR/SR/II/III/IV suffixes.
                 # Skill's title_case is just a safety pass if the
                 # normalizer returned an uppercase string.
-                flipped = normalize_court_name(full_owner)
+                flipped = normalize_court_name(owner_clean)
                 person_name = (
                     cleaner.title_case(flipped)
                     if not self.skip_cleaner

@@ -18,6 +18,26 @@ import re
 logger = logging.getLogger(__name__)
 
 
+def _clean_cad_owner_for_display(raw_upper: str) -> str:
+    """Convert a raw all-caps CAD owner name into a clean display name.
+
+    `cad_lookup.lookup_property_by_name` returns a naively `.title()`-cased
+    owner string ("SCOTT, JAMES A III" → "Scott, James A Iii"), which lowers
+    Roman numerals and legal-entity suffixes. Probate flow then writes that
+    string into `notice.owner_name`, polluting the marketing CSV.
+
+    This helper:
+      1. Strips trailing ETUX/ETVIR/ETAL clauses and spousal `& ...` tails.
+      2. Title-cases the result via `travis_texdel_cleaner.title_case`,
+         which preserves LLC/III/JR/CO etc.
+    """
+    if not raw_upper:
+        return ""
+    from scrapers import travis_texdel_cleaner as _cleaner
+    stripped = _cleaner.strip_etux_etal(raw_upper)
+    return _cleaner.title_case(stripped)
+
+
 # ── Property selection logic ──────────────────────────────────────────
 
 RESIDENTIAL_KEYWORDS = {
@@ -169,6 +189,17 @@ async def lookup_decedent_properties(notices: list) -> None:
                         notice.estimated_value = str(int(float(result["value"])))
                     except (ValueError, TypeError):
                         pass
+                # Probate scraper leaves owner_name empty (it captures decedent_name
+                # only). The CAD owner-of-record IS our marketing target — typically
+                # the heir who took title — so populate owner_name + tax_owner_name
+                # when the scraper didn't set them. Strip ETUX/ETAL tails and
+                # re-title-case so the suffix uppercasing (LLC/III/etc.) sticks.
+                cad_owner_raw = result.get("owner_raw") or (result.get("owner") or "").upper()
+                cad_owner_clean = _clean_cad_owner_for_display(cad_owner_raw)
+                if cad_owner_clean and not (notice.owner_name or "").strip():
+                    notice.owner_name = cad_owner_clean
+                    if not (notice.tax_owner_name or "").strip():
+                        notice.tax_owner_name = cad_owner_raw
                 found += 1
                 logger.info(
                     "  Found: %s at %s, %s %s (score: %.2f)",
@@ -190,6 +221,12 @@ async def lookup_decedent_properties(notices: list) -> None:
                         notice.zip = result.get("zip", "")
                         if result.get("parcel_id"):
                             notice.parcel_id = result["parcel_id"]
+                        cad_owner_raw = result.get("owner_raw") or (result.get("owner") or "").upper()
+                        cad_owner_clean = _clean_cad_owner_for_display(cad_owner_raw)
+                        if cad_owner_clean and not (notice.owner_name or "").strip():
+                            notice.owner_name = cad_owner_clean
+                            if not (notice.tax_owner_name or "").strip():
+                                notice.tax_owner_name = cad_owner_raw
                         found += 1
                         failed -= 1
                         logger.info("  Retry found: %s at %s", search_name, notice.address)

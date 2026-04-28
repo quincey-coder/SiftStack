@@ -9,8 +9,10 @@ Scraper modules (to be implemented in subsequent phases):
   tax_sale_travis.py        — RealAuction HTML tables
   tax_sale_mvba.py          — MVBA Law Firm PDFs (Bell + Williamson)
   probate_odyssey.py        — Odyssey Portal (all 3 counties)
-  tax_delinquent_travis.py  — CSV download (trivial)
-  tax_delinquent_cad.py     — CAD portal scraper (Bell + Williamson)
+  tax_delinquent_travis.py   — Travis CSV download
+  tax_delinquent_bell.py     — Bell BellCAD delinquent XLSX (TRIROLL)
+  tax_delinquent_wilco.py    — Williamson TAC delinquent XLSX (TRIROLL)
+  tax_delinquent_state.py    — Generic cross-run state/diff for Bell + Wilco
 """
 
 import logging
@@ -147,3 +149,14 @@ try:
     from scrapers import foreclosure_bell  # noqa: F401
 except ImportError as e:
     logger.debug("Could not import foreclosure_bell: %s", e)
+
+# TRIROLL — Bell + Williamson tax-delinquent scrapers
+try:
+    from scrapers import tax_delinquent_bell  # noqa: F401
+except ImportError as e:
+    logger.debug("Could not import tax_delinquent_bell: %s", e)
+
+try:
+    from scrapers import tax_delinquent_wilco  # noqa: F401
+except ImportError as e:
+    logger.debug("Could not import tax_delinquent_wilco: %s", e)

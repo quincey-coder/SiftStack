@@ -722,6 +722,26 @@ async def actor_main() -> None:
                     except Exception:
                         Actor.log.exception("Travis tax-delinquent Slack summary failed")
 
+                    # TRIROLL: Bell + Williamson tax-delinquent diff blocks
+                    for _county_name, _mod_name in (("Bell", "tax_delinquent_bell"), ("Williamson", "tax_delinquent_wilco")):
+                        try:
+                            from importlib import import_module
+                            _mod = import_module(f"scrapers.{_mod_name}")
+                            if _mod.LAST_RUN_DIFF is not None:
+                                from scrapers.tax_delinquent_state import (
+                                    DiffResult as _GDiff,
+                                    format_slack_summary as _fmt_g,
+                                )
+                                diff_obj = _GDiff(**_mod.LAST_RUN_DIFF)
+                                msg = _fmt_g(
+                                    _county_name, diff_obj,
+                                    _mod.LAST_RUN_STATS or {},
+                                    _mod.LAST_RUN_REMOVED or {},
+                                )
+                                _send_webhook(msg)
+                        except Exception:
+                            Actor.log.exception("%s tax-delinquent Slack summary failed", _county_name)
+
                     Actor.log.info("Slack notification sent")
                 except Exception as e:
                     Actor.log.warning("Slack notification failed: %s", e)
@@ -1416,7 +1436,14 @@ def cli_main() -> None:
     parser.add_argument(
         "--skip-zillow",
         action="store_true",
-        help="Skip Zillow property enrichment",
+        help="[deprecated no-op — Zillow is off by default; use --enable-zillow to opt in]",
+    )
+    parser.add_argument(
+        "--enable-zillow",
+        action="store_true",
+        help="Run Zillow property enrichment (off by default — DataSift's "
+             "'Enrich Property Information' step fills the same fields post-upload "
+             "for free, so paying the per-record Zillow API cost is usually wasted)",
     )
     parser.add_argument(
         "--skip-tax",
@@ -1740,6 +1767,11 @@ def cli_main() -> None:
         args.skip_obituary = True
         args.skip_ancestry = True
         args.skip_tracerfy = True
+
+    # Zillow is now opt-in. DataSift's 'Enrich Property Information' step
+    # fills beds/baths/zestimate/sqft/sale-history during upload — running
+    # Zillow upstream just doubles the cost. Pass --enable-zillow to override.
+    args.skip_zillow = not getattr(args, "enable_zillow", False)
 
     # Apply LLM backend override from CLI flag
     if hasattr(args, "llm_backend") and args.llm_backend:
@@ -2379,6 +2411,26 @@ def _run_scrape_pipeline(args, targets) -> None:
                 _send_webhook(msg)
         except Exception:
             logging.exception("Travis tax-delinquent Slack summary failed")
+
+        # TRIROLL: Bell + Williamson tax-delinquent diff blocks
+        for _county_name, _mod_name in (("Bell", "tax_delinquent_bell"), ("Williamson", "tax_delinquent_wilco")):
+            try:
+                from importlib import import_module
+                _mod = import_module(f"scrapers.{_mod_name}")
+                if _mod.LAST_RUN_DIFF is not None:
+                    from scrapers.tax_delinquent_state import (
+                        DiffResult as _GDiff,
+                        format_slack_summary as _fmt_g,
+                    )
+                    diff_obj = _GDiff(**_mod.LAST_RUN_DIFF)
+                    msg = _fmt_g(
+                        _county_name, diff_obj,
+                        _mod.LAST_RUN_STATS or {},
+                        _mod.LAST_RUN_REMOVED or {},
+                    )
+                    _send_webhook(msg)
+            except Exception:
+                logging.exception("%s tax-delinquent Slack summary failed", _county_name)
 
     # Audit DataSift for incomplete records (future daily check)
     if getattr(args, "audit_records", False):
