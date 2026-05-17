@@ -1558,6 +1558,12 @@ def cli_main() -> None:
         help="Upload results to DataSift.ai via Playwright (requires DATASIFT_EMAIL/PASSWORD)",
     )
     parser.add_argument(
+        "--upload-datasift-api",
+        action="store_true",
+        help="RAWPIPE: upload + enrich + skip-trace via direct REST API to apiv2.reisift.io "
+             "(no browser, ~4s vs 2-3min). Same credentials as --upload-datasift.",
+    )
+    parser.add_argument(
         "--no-enrich",
         action="store_true",
         help="Skip DataSift property enrichment after upload",
@@ -2344,6 +2350,144 @@ def _run_scrape_pipeline(args, targets) -> None:
         "drive_links": drive_links,
         "local_paths": [str(info["path"]) for info in csv_infos],
     }
+
+    # RAWPIPE — direct API upload (no browser). Preferred over Playwright when
+    # --upload-datasift-api is set. Falls through to the Playwright path on
+    # failure so the existing manual-fallback logic still kicks in.
+    if getattr(args, "upload_datasift_api", False):
+        from datetime import datetime as _dt
+        from datasift_api_client import DataSiftAPIClient, DataSiftAPIError
+
+        do_enrich = not getattr(args, "no_enrich", False)
+        # Skip-trace endpoint is not yet captured for the API path. If the
+        # user wants skip-trace, fall back to the Playwright path after upload.
+        do_skip_trace = not getattr(args, "no_skip_trace", False)
+        api_failed = False
+
+        try:
+            client = DataSiftAPIClient.from_env()
+            base_list_name = f"SiftStack {_dt.now().strftime('%Y-%m-%d')}"
+            api_results = []
+            for info in csv_infos:
+                # When split: append the label so each notice type gets its own list.
+                list_name = (
+                    f"{base_list_name} - {info['label']}"
+                    if len(csv_infos) > 1 else base_list_name
+                )
+                logging.info(
+                    "RAWPIPE: uploading %s as list %r…", info["label"], list_name,
+                )
+                r = client.upload_csv(
+                    Path(info["path"]),
+                    list_name=list_name,
+                    tags=["Courthouse Data"],
+                    upload_type="new_properties",
+                    enrich_property=do_enrich,
+                    enrich_owner=False,  # protect our PR/DM contact mapping
+                )
+                api_results.append({"label": info["label"], **r})
+                logging.info(
+                    "  list=%r  records=%s  verified=%s  time=%s",
+                    list_name, r.get("line_count"),
+                    r.get("verified_in_lists"), r.get("storage_key", "")[:12],
+                )
+
+            ok = all(r.get("success") for r in api_results)
+            upload_result = {
+                "success": ok,
+                "mode": "rawpipe_api",
+                "message": "RAWPIPE upload complete" if ok else "RAWPIPE partial failure",
+                "records_uploaded": sum(r.get("line_count") or 0 for r in api_results),
+                "drive_links": drive_links,
+                "local_paths": [str(info["path"]) for info in csv_infos],
+                "api_results": api_results,
+            }
+            if ok:
+                logging.info("RAWPIPE: %d list(s) uploaded successfully", len(api_results))
+            else:
+                logging.error("RAWPIPE upload: partial failure — see api_results")
+                api_failed = True
+
+        except DataSiftAPIError as e:
+            logging.error("RAWPIPE upload failed (%s): %s", e.status, e.body[:200])
+            api_failed = True
+        except Exception as e:
+            logging.exception("RAWPIPE crashed: %s", e)
+            api_failed = True
+
+        # Skip-trace via the direct API. Endpoint: POST /api/internal/property/skip-trace/
+        # Body filters by `all_lists` for each uploaded list. Defaults to `clean`
+        # records only (skips already-traced). Will 400 with "Insufficient
+        # balance!" if the account is out of skip-trace credits — that error
+        # is logged but doesn't crash the run.
+        if not api_failed and do_skip_trace:
+            try:
+                from datasift_api_client import DataSiftAPIError
+                from datetime import datetime as _dt
+
+                # Re-fetch lists to map title → uuid (uploaded names → uuids)
+                live_lists = client.list_lists(limit=200)
+                by_title = {l["title"]: l["uuid"] for l in live_lists}
+
+                st_tag = f"skip_traced_{_dt.now().strftime('%Y-%m')}"
+                st_results = []
+                for r in api_results:
+                    title = r["list_name"]
+                    list_uuid = by_title.get(title)
+                    if not list_uuid:
+                        st_results.append({
+                            "list_name": title, "success": False,
+                            "message": "list not found in account after upload"
+                        })
+                        continue
+                    try:
+                        api_resp = client.skip_trace_list(
+                            list_uuid, tags=[st_tag], estimate=False,
+                        )
+                        st_results.append({
+                            "list_name": title, "list_uuid": list_uuid,
+                            "success": True, "response": api_resp,
+                        })
+                        logging.info(
+                            "RAWPIPE: skip-trace queued for %r (records=%s, cost=$%s)",
+                            title,
+                            api_resp.get("number_of_records"),
+                            api_resp.get("cost"),
+                        )
+                    except DataSiftAPIError as e:
+                        # Treat "Insufficient balance!" as a soft failure —
+                        # log loudly but don't abort the run.
+                        is_balance = "Insufficient balance" in (e.body or "")
+                        level = logging.WARNING if is_balance else logging.ERROR
+                        logging.log(
+                            level,
+                            "RAWPIPE skip-trace for %r: HTTP %d — %s",
+                            title, e.status, e.body[:200],
+                        )
+                        st_results.append({
+                            "list_name": title, "list_uuid": list_uuid,
+                            "success": False, "status": e.status,
+                            "message": e.body[:200],
+                        })
+
+                upload_result["skip_trace_result"] = {
+                    "success": all(x.get("success") for x in st_results),
+                    "tag": st_tag,
+                    "results": st_results,
+                }
+            except Exception as e:
+                logging.exception("RAWPIPE skip-trace crashed: %s", e)
+                upload_result["skip_trace_result"] = {
+                    "success": False, "message": str(e),
+                }
+
+        # If RAWPIPE failed, fall through to the Playwright --upload-datasift
+        # path below (if the user passed both flags) or stay in manual mode.
+        if api_failed and not getattr(args, "upload_datasift", False):
+            logging.info(
+                "RAWPIPE failed — staying in manual mode. "
+                "Pass --upload-datasift to also try the Playwright path as a fallback."
+            )
 
     # Optional Playwright auto-upload to DataSift on top of the Drive flow
     if getattr(args, "upload_datasift", False):
