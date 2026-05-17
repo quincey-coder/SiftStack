@@ -43,6 +43,15 @@
             "default": false,
             "editor": "checkbox"
         },
+        "max_notices": {
+            "title": "Max Notices (smoke-test cap)",
+            "type": "integer",
+            "description": "Stop scraping after this many raw notices across all sources. 0 = no cap (default). Useful for smoke-testing the full pipeline without scraping thousands of records.",
+            "default": 0,
+            "minimum": 0,
+            "maximum": 10000,
+            "editor": "number"
+        },
 
         "enable_obituary": {
             "title": "Enable Obituary / Deceased-Owner Detection",

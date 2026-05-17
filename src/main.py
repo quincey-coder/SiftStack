@@ -235,6 +235,7 @@ async def actor_main() -> None:
         min_years = int(actor_input.get("min_delinquent_years", 2) or 2)
         min_amount = float(actor_input.get("min_delinquent_amount", 3000.0) or 3000.0)
         skip_texdel_cleaner = bool(actor_input.get("skip_texdel_cleaner", False))
+        max_notices = int(actor_input.get("max_notices", 0) or 0) or None
         scraper_kwargs = {"min_years": min_years, "min_amount": min_amount}
         if skip_texdel_cleaner:
             scraper_kwargs["skip_cleaner"] = True
@@ -382,9 +383,12 @@ async def actor_main() -> None:
                 targets=[(c, t) for c, t in targets],
                 mode=mode,
                 since_date=since_date_override or None,
+                max_notices=max_notices,
                 scraper_kwargs=scraper_kwargs,
             )
             Actor.log.info("Scraped %d total notices before dedup/enrichment", len(notices))
+            if max_notices and len(notices) >= max_notices:
+                Actor.log.info("Hit max_notices=%d smoke-test cap", max_notices)
 
             # ── Probate property lookup (async) ──
             probate_notices = [
