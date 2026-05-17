@@ -268,6 +268,11 @@ async def actor_main() -> None:
         rebuild_dedup_only = bool(actor_input.get("rebuild_dedup_only", False))
         use_proxy = bool(actor_input.get("use_residential_proxy", False))  # Default OFF on Free plan
 
+        # ── DataSift auto-upload (RAWPIPE) toggles ──
+        upload_datasift_api = bool(actor_input.get("upload_datasift_api", False))
+        datasift_do_enrich = not bool(actor_input.get("datasift_no_enrich", False))
+        datasift_do_skip_trace = not bool(actor_input.get("datasift_no_skip_trace", True))
+
         # ── Filter targets ──
         targets = _filter_targets(counties, types)
         if not targets:
@@ -658,6 +663,114 @@ async def actor_main() -> None:
             except Exception as e:
                 Actor.log.error("DataSift CSV generation failed: %s", e)
 
+            # ── RAWPIPE: direct API upload to apiv2.reisift.io ──
+            # Runs only when the user explicitly enables it. Each CSV
+            # (one per notice type) becomes its own DataSift list named
+            # "SiftStack {YYYY-MM-DD} - {label}". Skip-trace is opt-in
+            # via datasift_no_skip_trace=False because it costs $0.15/owner
+            # and requires account balance.
+            rawpipe_results: list[dict] = []
+            if upload_datasift_api and 'csv_infos' in dir() and csv_infos:
+                try:
+                    from datasift_api_client import DataSiftAPIClient, DataSiftAPIError
+                    from datetime import datetime as _dt
+
+                    Actor.log.info("RAWPIPE: connecting to apiv2.reisift.io…")
+                    api_client = DataSiftAPIClient.from_env()
+                    base_name = f"SiftStack {_dt.now().strftime('%Y-%m-%d')}"
+
+                    for info in csv_infos:
+                        # Always suffix with label even for single CSV so
+                        # the list name is self-describing in the DataSift UI.
+                        list_name = f"{base_name} - {info['label']}"
+                        try:
+                            r = api_client.upload_csv(
+                                Path(info["path"]),
+                                list_name=list_name,
+                                tags=["Courthouse Data"],
+                                upload_type="new_properties",
+                                enrich_property=datasift_do_enrich,
+                                enrich_owner=False,  # protect PR/DM mapping
+                            )
+                            rawpipe_results.append({
+                                "label": info["label"],
+                                "list_name": list_name,
+                                "success": r.get("success"),
+                                "line_count": r.get("line_count"),
+                                "verified_in_lists": r.get("verified_in_lists"),
+                            })
+                            Actor.log.info(
+                                "RAWPIPE: %s → list=%r records=%s verified=%s",
+                                info["label"], list_name,
+                                r.get("line_count"), r.get("verified_in_lists"),
+                            )
+                        except DataSiftAPIError as e:
+                            Actor.log.error(
+                                "RAWPIPE: %s upload failed (%d): %s",
+                                info["label"], e.status, e.body[:200],
+                            )
+                            rawpipe_results.append({
+                                "label": info["label"],
+                                "list_name": list_name,
+                                "success": False,
+                                "error": f"HTTP {e.status}: {e.body[:200]}",
+                            })
+
+                    # Skip-trace (opt-in). Soft-fails on "Insufficient balance!".
+                    if datasift_do_skip_trace and any(r.get("success") for r in rawpipe_results):
+                        try:
+                            live_lists = api_client.list_lists(limit=200)
+                            by_title = {l["title"]: l["uuid"] for l in live_lists}
+                            st_tag = f"skip_traced_{_dt.now().strftime('%Y-%m')}"
+                            for r in rawpipe_results:
+                                if not r.get("success"):
+                                    continue
+                                uuid = by_title.get(r["list_name"])
+                                if not uuid:
+                                    Actor.log.warning(
+                                        "Skip-trace: list %r not found post-upload",
+                                        r["list_name"],
+                                    )
+                                    continue
+                                try:
+                                    st_resp = api_client.skip_trace_list(
+                                        uuid, tags=[st_tag], estimate=False,
+                                    )
+                                    Actor.log.info(
+                                        "Skip-trace queued for %r: records=%s cost=$%s",
+                                        r["list_name"],
+                                        st_resp.get("number_of_records"),
+                                        st_resp.get("cost"),
+                                    )
+                                    r["skip_trace"] = {
+                                        "success": True,
+                                        "records": st_resp.get("number_of_records"),
+                                        "cost": st_resp.get("cost"),
+                                    }
+                                except DataSiftAPIError as e:
+                                    is_balance = "Insufficient balance" in (e.body or "")
+                                    log_fn = Actor.log.warning if is_balance else Actor.log.error
+                                    log_fn(
+                                        "Skip-trace for %r: HTTP %d — %s",
+                                        r["list_name"], e.status, e.body[:200],
+                                    )
+                                    r["skip_trace"] = {
+                                        "success": False,
+                                        "error": f"HTTP {e.status}: {e.body[:200]}",
+                                    }
+                        except Exception as e:
+                            Actor.log.exception("Skip-trace stage crashed: %s", e)
+
+                except DataSiftAPIError as e:
+                    Actor.log.error(
+                        "RAWPIPE auth failed (%d): %s — manual upload still available via the KVS links",
+                        e.status, e.body[:200],
+                    )
+                except Exception as e:
+                    Actor.log.exception("RAWPIPE crashed: %s — manual upload still available", e)
+            elif upload_datasift_api:
+                Actor.log.warning("upload_datasift_api=true but no DataSift CSVs were generated")
+
             # ── Drain Travis texdel buffers to KVS (raw CSVs + reports) ──
             try:
                 for filename, text in _texdel_state.drain_apify_raw_csvs()[-7:]:
@@ -694,11 +807,34 @@ async def actor_main() -> None:
                         elapsed_min=elapsed_min,
                         cost_breakdown=cost_breakdown,
                     )
-                    if datasift_csv_urls:
+                    # RAWPIPE auto-upload summary (when it actually ran)
+                    if rawpipe_results:
+                        ok = [r for r in rawpipe_results if r.get("success")]
+                        fail = [r for r in rawpipe_results if not r.get("success")]
+                        lines = [
+                            f"*RAWPIPE upload to DataSift: {len(ok)}/{len(rawpipe_results)} list(s) succeeded*"
+                        ]
+                        for r in ok:
+                            st = r.get("skip_trace") or {}
+                            st_note = ""
+                            if st:
+                                if st.get("success"):
+                                    st_note = f" • skip-trace queued ({st.get('records', '?')} records, ${st.get('cost', '?')})"
+                                else:
+                                    st_note = f" • skip-trace failed: {st.get('error', '')[:80]}"
+                            lines.append(
+                                f"  ✓ `{r['list_name']}` — {r.get('line_count', '?')} records{st_note}"
+                            )
+                        for r in fail:
+                            lines.append(
+                                f"  ✗ `{r['list_name']}` — {r.get('error', 'unknown error')[:120]}"
+                            )
+                        _send_webhook("\n".join(lines))
+                    elif datasift_csv_urls:
                         lines = ["*DataSift CSVs ready for manual upload:*"]
                         for c in datasift_csv_urls:
                             lines.append(f"  <{c['url']}|{c['label']}> ({c['records']} records)")
-                        lines.append("_Upload at app.reisift.io → Upload File → Add Data_")
+                        lines.append("_Upload at app.reisift.io → Upload File → Add Data, or enable `upload_datasift_api` for auto-upload_")
                         _send_webhook("\n".join(lines))
                     if pdf_urls:
                         lines = [f"*Deep Prospecting PDFs ({len(pdf_urls)} records):*"]

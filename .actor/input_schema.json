@@ -234,6 +234,28 @@
             "editor": "checkbox"
         },
 
+        "upload_datasift_api": {
+            "title": "Auto-upload to DataSift (RAWPIPE)",
+            "type": "boolean",
+            "description": "Push each per-notice-type CSV directly to DataSift via apiv2.reisift.io (REST API, no browser). Uses datasift_email + datasift_password secrets. ~4s/list. Lists are named SiftStack {date} - {notice_type}.",
+            "default": false,
+            "editor": "checkbox",
+            "sectionCaption": "DataSift auto-upload (RAWPIPE)"
+        },
+        "datasift_no_enrich": {
+            "title": "Skip DataSift Property Enrichment",
+            "type": "boolean",
+            "description": "Disable DataSift's server-side property enrichment (free SiftMap data: beds/baths/Zestimate/sqft). Only applies when upload_datasift_api is on.",
+            "default": false,
+            "editor": "checkbox"
+        },
+        "datasift_no_skip_trace": {
+            "title": "Skip DataSift Skip-Trace",
+            "type": "boolean",
+            "description": "Disable post-upload skip-trace via the API. Skip-trace costs $0.15/owner and requires account balance. Only applies when upload_datasift_api is on.",
+            "default": true,
+            "editor": "checkbox"
+        },
         "google_drive_folder_id": {
             "title": "Google Drive Folder ID",
             "type": "string",
@@ -317,14 +339,14 @@
         "datasift_email": {
             "title": "DataSift Email",
             "type": "string",
-            "description": "app.reisift.io login (currently unused — manual upload only).",
+            "description": "app.reisift.io login. Required when upload_datasift_api is on.",
             "editor": "textfield",
             "isSecret": true
         },
         "datasift_password": {
             "title": "DataSift Password",
             "type": "string",
-            "description": "app.reisift.io password (currently unused — manual upload only).",
+            "description": "app.reisift.io password. Required when upload_datasift_api is on.",
             "editor": "textfield",
             "isSecret": true
         },
