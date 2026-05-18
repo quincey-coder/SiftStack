@@ -7,7 +7,6 @@ Discord webhook URLs should use the /slack suffix:
   https://discord.com/api/webhooks/{id}/{token}/slack
 """
 
-import json
 import logging
 import os
 from datetime import datetime
@@ -189,171 +188,199 @@ def _upcoming_auctions(notices: list[NoticeData], days: int = 7) -> list[dict]:
 def build_summary(
     notices: list[NoticeData],
     *,
-    upload_result: dict | None = None,
-    elapsed_min: float = 0,
-    api_cost: float = 0,
+    upload_result: dict | None = None,   # accepted for backward-compat; unused
+    elapsed_min: float = 0,               # accepted for backward-compat; unused
+    api_cost: float = 0,                  # accepted for backward-compat; unused
     cost_breakdown: dict | None = None,
-    csv_link: str | None = None,
-    pdf_links: list[tuple[str, str]] | None = None,
+    csv_link: str | None = None,          # accepted for backward-compat; unused
+    pdf_links: list[tuple[str, str]] | None = None,  # accepted for backward-compat; unused
 ) -> str:
-    """Build a plain-text run summary for Slack/Discord.
+    """Build the TIGHTFEED daily-report block.
 
-    Args:
-        notices: All notices from this run.
-        upload_result: DataSift upload result dict (optional).
-        elapsed_min: Pipeline elapsed time in minutes.
-        api_cost: Estimated Haiku API cost for this run (legacy, use cost_breakdown).
-        cost_breakdown: Dict of service -> cost, e.g. {"Anthropic": 0.05, "Tracerfy": 0.26}.
+    Slim by design: header + scrape totals + per-county counts + a one-line
+    cost rundown. Everything else (deceased rollups, Zillow ratios, upload
+    status, PDF links, upcoming auctions) is either cut entirely or moved
+    to its own dedicated `_send_webhook` call so the operator can scan the
+    main report in a glance.
+
+    Returns an empty string if there are no notices — caller can use that
+    to suppress the webhook entirely on idle days.
     """
     total = len(notices)
+    if total == 0:
+        return ""
+
     county_type_counts = _by_county_and_type(notices)
-
-    deceased_all = [n for n in notices if n.owner_deceased == "yes"]
-    deceased_count = len(deceased_all)
-    high_conf = sum(1 for n in deceased_all if n.dm_confidence == "high")
-    med_conf = sum(1 for n in deceased_all if n.dm_confidence == "medium")
-    low_conf = sum(1 for n in deceased_all if n.dm_confidence == "low")
-    estate = sum(
-        1 for n in deceased_all
-        if n.decision_maker_relationship
-        and "estate" in n.decision_maker_relationship.lower()
-    )
-
-    upcoming = _upcoming_auctions(notices)
-    zillow_enriched, zillow_attempted = _zillow_hit_rate(notices)
-
     num_counties = len(county_type_counts)
+
     lines = [
-        f"*SiftStack - Daily Report ({datetime.now().strftime('%Y-%m-%d')})*",
-        "",
-        f"*New notices scraped:* {total}"
-        + (f" (across {num_counties} counties)" if num_counties else ""),
+        f"*SiftStack — {datetime.now().strftime('%Y-%m-%d')}*",
+        f"*New notices:* {total}"
+        + (f" (across {num_counties} {'county' if num_counties == 1 else 'counties'})" if num_counties else ""),
         "",
     ]
+
+    # Use the friendly labels ("Foreclosure", "Tax Delinquent", ...) rather
+    # than internal slugs ("foreclosure", "tax_delinquent") so the daily
+    # report matches the DataSift list names exactly.
+    try:
+        from datasift_formatter import NOTICE_TYPE_TO_LIST
+    except ImportError:
+        NOTICE_TYPE_TO_LIST = {}
 
     # Per-county nested breakdown, biggest first
     for county, type_counts in sorted(
         county_type_counts.items(), key=lambda kv: sum(kv[1].values()), reverse=True
     ):
         county_total = sum(type_counts.values())
-        county_notices = [n for n in notices if (n.county or "").title() == county]
-        county_deceased = [n for n in county_notices if n.owner_deceased == "yes"]
-        county_upcoming = [
-            n for n in county_notices
-            if n.auction_date and any(a["address"] == n.address for a in upcoming)
-        ]
-
-        lines.append(f"*{county} County* — {county_total} records")
+        lines.append(f"*{county} County* — {county_total}")
         for ntype, count in sorted(type_counts.items(), key=lambda kv: kv[1], reverse=True):
-            lines.append(f"  • {ntype}: {count}")
-        if county_deceased:
-            c_high = sum(1 for n in county_deceased if n.dm_confidence == "high")
-            c_med = sum(1 for n in county_deceased if n.dm_confidence == "medium")
-            c_low = sum(1 for n in county_deceased if n.dm_confidence == "low")
-            conf_parts = []
-            if c_high:
-                conf_parts.append(f"High: {c_high}")
-            if c_med:
-                conf_parts.append(f"Med: {c_med}")
-            if c_low:
-                conf_parts.append(f"Low: {c_low}")
-            conf_str = f" ({', '.join(conf_parts)})" if conf_parts else ""
-            lines.append(f"  Deceased: {len(county_deceased)}{conf_str}")
-        if county_upcoming:
-            lines.append(f"  Upcoming auctions (7d): {len(county_upcoming)}")
+            label = NOTICE_TYPE_TO_LIST.get(ntype, ntype.replace("_", " ").title())
+            lines.append(f"  • {label}: {count}")
         lines.append("")
 
-    # Rollup deceased line
-    if deceased_count > 0:
-        pct = round(deceased_count / total * 100) if total else 0
-        roll = [f"High: {high_conf}", f"Med: {med_conf}"]
-        if low_conf:
-            roll.append(f"Low: {low_conf}")
-        if estate:
-            roll.append(f"Estate: {estate}")
-        lines.append(f"*Deceased owners (total):* {deceased_count} ({pct}%) — {', '.join(roll)}")
-
-    # Zillow hit rate (signals whether Smarty is helping or hurting)
-    if zillow_attempted > 0:
-        pct = round(zillow_enriched / zillow_attempted * 100)
-        lines.append(
-            f"*Zillow enrichment:* {zillow_enriched}/{zillow_attempted} ({pct}%)"
-        )
-
-    # Upload result
-    if upload_result:
-        lines.append("")
-        drive_links = upload_result.get("drive_links") or []
-        local_paths = upload_result.get("local_paths") or []
-        if upload_result.get("mode") == "manual":
-            lines.append(
-                f"*DataSift CSVs ready (manual upload):* {upload_result.get('records_uploaded', total)} records"
-            )
-            if drive_links:
-                lines.append("*Drive links:*")
-                for dl in drive_links:
-                    lines.append(f"  {dl['label']}: <{dl['url']}|Download>")
-            if local_paths:
-                lines.append("*Local files (opened on desktop):*")
-                for p in local_paths:
-                    lines.append(f"  {p}")
-        elif upload_result.get("success"):
-            lines.append(
-                f"*Uploaded to DataSift:* {upload_result.get('records_uploaded', total)} records"
-            )
-            if drive_links:
-                lines.append("*CSVs in Drive:*")
-                for dl in drive_links:
-                    lines.append(f"  {dl['label']}: <{dl['url']}|Download>")
-        else:
-            lines.append(
-                f"*DataSift upload FAILED:* {upload_result.get('message', 'unknown error')}"
-            )
-            if drive_links:
-                lines.append("*Drive links (still available):*")
-                for dl in drive_links:
-                    lines.append(f"  {dl['label']}: <{dl['url']}|Download>")
-
-    # Upcoming auctions
-    if upcoming:
-        lines.append("")
-        lines.append(f"*Upcoming auctions (next 7 days):* {len(upcoming)}")
-        for a in upcoming[:5]:
-            lines.append(f"  {a['address']}, {a['city']} - {a['date']} ({a['days_out']}d)")
-        if len(upcoming) > 5:
-            lines.append(f"  ... and {len(upcoming) - 5} more")
-
-    # Pipeline stats
-    lines.append("")
-    stats = []
-    if elapsed_min > 0:
-        stats.append(f"Pipeline: {elapsed_min:.0f} min")
-    if api_cost > 0 and not cost_breakdown:
-        stats.append(f"Haiku API: ${api_cost:.2f}")
-    if stats:
-        lines.append(" | ".join(stats))
-
-    # File links (CSV + deep-prospecting PDFs)
-    if csv_link or pdf_links:
-        lines.append("")
-        lines.append("*Files*")
-        if csv_link:
-            lines.append(f"  CSV: <{csv_link}|Download>")
-        if pdf_links:
-            lines.append(f"  PDFs ({len(pdf_links)}):")
-            for addr, url in pdf_links[:10]:
-                lines.append(f"    <{url}|{addr}>")
-            if len(pdf_links) > 10:
-                lines.append(f"    ... and {len(pdf_links) - 10} more")
-
-    # Cost breakdown
+    # One-line cost rundown at the bottom
     if cost_breakdown:
         total_cost = sum(cost_breakdown.values())
+        if total_cost > 0:
+            parts = [f"{svc} ${cost:.2f}" for svc, cost in cost_breakdown.items() if cost > 0]
+            lines.append(f"*Run cost:* ${total_cost:.2f}  ({' · '.join(parts)})")
+
+    return "\n".join(lines).rstrip()
+
+
+DATASIFT_LIST_URL_TMPL = "https://app.reisift.io/records/properties?list={uuid}"
+DATASIFT_LIST_URL_FALLBACK = "https://app.reisift.io/records/properties"
+
+
+def build_rawpipe_block(
+    rawpipe_results: list[dict],
+    *,
+    notices: list[NoticeData] | None = None,
+    drive_links: list[dict] | None = None,
+    max_addresses: int = 10,
+) -> str:
+    """Build the *RAWPIPE upload to DataSift* webhook block.
+
+    Each successfully-uploaded list gets a clickable header (list URL),
+    a Drive CSV link if one exists, and up to `max_addresses` of the
+    actual property addresses that landed in it. Failed lists get a
+    one-line error with status code + truncated body.
+
+    Returns "" if no results — caller should skip the webhook.
+    """
+    if not rawpipe_results:
+        return ""
+
+    ok = [r for r in rawpipe_results if r.get("success")]
+    fail = [r for r in rawpipe_results if not r.get("success")]
+    total_records = sum(r.get("line_count") or 0 for r in ok)
+
+    # Build a label -> drive-link lookup so we can append the Drive CSV.
+    # `info["label"]` is the list name (e.g. "Foreclosure"), so the keys
+    # already match what's in rawpipe_results.
+    drive_by_label: dict[str, str] = {
+        d["label"]: d["url"] for d in (drive_links or []) if d.get("label") and d.get("url")
+    }
+
+    # Group notices by notice_type → list_name so we can show addresses
+    # per uploaded list.
+    notices_by_list: dict[str, list[NoticeData]] = {}
+    if notices:
+        try:
+            from datasift_formatter import NOTICE_TYPE_TO_LIST
+        except ImportError:
+            NOTICE_TYPE_TO_LIST = {}
+        for n in notices:
+            label = NOTICE_TYPE_TO_LIST.get(n.notice_type or "", "")
+            if label:
+                notices_by_list.setdefault(label, []).append(n)
+
+    lines = [
+        f"*RAWPIPE upload to DataSift:* {len(ok)}/{len(rawpipe_results)} "
+        f"list(s) succeeded · {total_records} record(s) total"
+    ]
+
+    for r in ok:
+        list_name = r.get("list_name", "?")
+        uuid = r.get("list_uuid")
+        url = DATASIFT_LIST_URL_TMPL.format(uuid=uuid) if uuid else DATASIFT_LIST_URL_FALLBACK
+        records = r.get("line_count", "?")
         lines.append("")
-        lines.append(f"*Estimated run cost:* ${total_cost:.2f}")
-        for service, cost in cost_breakdown.items():
-            if cost > 0:
-                lines.append(f"  {service}: ${cost:.2f}")
+        lines.append(f"*<{url}|{list_name}>* — {records} record(s)")
+
+        # Skip-trace status (if it was triggered)
+        st = r.get("skip_trace") or {}
+        if st:
+            if st.get("success"):
+                lines.append(
+                    f"  :mag: skip-trace queued ({st.get('records', '?')} records, ${st.get('cost', '?')})"
+                )
+            else:
+                lines.append(f"  :warning: skip-trace failed: {str(st.get('error', ''))[:80]}")
+
+        # Drive CSV link (if uploaded to Drive)
+        drive_url = drive_by_label.get(list_name)
+        if drive_url:
+            lines.append(f"  :bookmark: Full CSV in Drive: <{drive_url}|{list_name}.csv>")
+
+        # Per-record address sample
+        list_notices = notices_by_list.get(list_name, [])
+        for n in list_notices[:max_addresses]:
+            addr_parts = [
+                p for p in [n.address, n.city, n.state, (n.zip or "")[:5]]
+                if (p or "").strip()
+            ]
+            addr_str = ", ".join(addr_parts)
+            owner_parts = [p for p in [n.owner_first_name, n.owner_last_name] if (p or "").strip()]
+            owner = " ".join(owner_parts)
+            line = f"  • {addr_str}"
+            if owner:
+                line += f" — {owner}"
+            lines.append(line)
+        if len(list_notices) > max_addresses:
+            lines.append(f"  …and {len(list_notices) - max_addresses} more")
+
+    for r in fail:
+        list_name = r.get("list_name", "?")
+        err = str(r.get("error") or r.get("message") or "unknown error")[:120]
+        lines.append("")
+        lines.append(f"  ✗ `{list_name}` — {err}")
+
+    return "\n".join(lines)
+
+
+def build_pdf_block(
+    pdf_links: list[dict],
+    *,
+    drive_links: list[dict] | None = None,
+    max_pdfs: int = 10,
+) -> str:
+    """Build the Deep Prospecting block.
+
+    Leads with the relevant DataSift CSV in Drive (the full reference
+    for these candidates), then lists up to `max_pdfs` per-record PDF
+    links by address.
+
+    Returns "" if no PDFs — caller should skip the webhook.
+    """
+    if not pdf_links:
+        return ""
+
+    lines = [f"*Deep Prospecting ({len(pdf_links)} records):*"]
+
+    # Top-line Drive CSV links — one per notice type that has data.
+    if drive_links:
+        csv_parts = [f"<{d['url']}|{d['label']}.csv>" for d in drive_links if d.get("url")]
+        if csv_parts:
+            lines.append(f":bookmark: Full CSV in Drive: {' · '.join(csv_parts)}")
+
+    for p in pdf_links[:max_pdfs]:
+        addr = p.get("address") or "?"
+        url = p.get("url") or ""
+        lines.append(f"  • <{url}|{addr}>")
+    if len(pdf_links) > max_pdfs:
+        lines.append(f"  …and {len(pdf_links) - max_pdfs} more")
 
     return "\n".join(lines)
 
@@ -396,6 +423,11 @@ def send_slack_notification(
         csv_link=csv_link,
         pdf_links=pdf_links,
     )
+    if not text:
+        # TIGHTFEED: build_summary returns "" for empty runs — suppress the
+        # webhook entirely. Quiet days stay quiet.
+        logger.info("No notices this run — suppressing daily report")
+        return True
 
     sent = _send_webhook(text, webhook_url)
     if sent:

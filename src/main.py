@@ -807,46 +807,31 @@ async def actor_main() -> None:
 
             if do_notify_slack and config.SLACK_WEBHOOK_URL:
                 try:
-                    from slack_notifier import send_slack_notification, _send_webhook
+                    from slack_notifier import (
+                        send_slack_notification, _send_webhook,
+                        build_rawpipe_block, build_pdf_block,
+                    )
+                    # TIGHTFEED message ①: slim daily report. Suppressed
+                    # internally when notices is empty.
                     send_slack_notification(
                         notices,
-                        elapsed_min=elapsed_min,
                         cost_breakdown=cost_breakdown,
                     )
-                    # RAWPIPE auto-upload summary (when it actually ran)
-                    if rawpipe_results:
-                        ok = [r for r in rawpipe_results if r.get("success")]
-                        fail = [r for r in rawpipe_results if not r.get("success")]
-                        lines = [
-                            f"*RAWPIPE upload to DataSift: {len(ok)}/{len(rawpipe_results)} list(s) succeeded*"
-                        ]
-                        for r in ok:
-                            st = r.get("skip_trace") or {}
-                            st_note = ""
-                            if st:
-                                if st.get("success"):
-                                    st_note = f" • skip-trace queued ({st.get('records', '?')} records, ${st.get('cost', '?')})"
-                                else:
-                                    st_note = f" • skip-trace failed: {st.get('error', '')[:80]}"
-                            lines.append(
-                                f"  ✓ `{r['list_name']}` — {r.get('line_count', '?')} records{st_note}"
-                            )
-                        for r in fail:
-                            lines.append(
-                                f"  ✗ `{r['list_name']}` — {r.get('error', 'unknown error')[:120]}"
-                            )
-                        _send_webhook("\n".join(lines))
-                    elif datasift_csv_urls:
-                        lines = ["*DataSift CSVs ready for manual upload:*"]
-                        for c in datasift_csv_urls:
-                            lines.append(f"  <{c['url']}|{c['label']}> ({c['records']} records)")
-                        lines.append("_Upload at app.reisift.io → Upload File → Add Data, or enable `upload_datasift_api` for auto-upload_")
-                        _send_webhook("\n".join(lines))
-                    if pdf_urls:
-                        lines = [f"*Deep Prospecting PDFs ({len(pdf_urls)} records):*"]
-                        for p in pdf_urls:
-                            lines.append(f"  <{p['url']}|{p['address']}>")
-                        _send_webhook("\n".join(lines))
+                    # TIGHTFEED message ②: RAWPIPE upload summary with
+                    # clickable list URLs + per-record addresses + Drive
+                    # CSV links. Manual-fallback message (old ③) is gone.
+                    rawpipe_block = build_rawpipe_block(
+                        rawpipe_results,
+                        notices=notices,
+                        drive_links=drive_links,
+                    )
+                    if rawpipe_block:
+                        _send_webhook(rawpipe_block)
+                    # TIGHTFEED message ④: Deep Prospecting with Drive
+                    # CSV link header + per-record PDF links.
+                    pdf_block = build_pdf_block(pdf_urls, drive_links=drive_links)
+                    if pdf_block:
+                        _send_webhook(pdf_block)
 
                     # Travis tax-delinquent NEW/REPEAT/DROPPED diff block
                     try:
@@ -2675,9 +2660,23 @@ def _run_scrape_pipeline(args, targets) -> None:
 
     # Slack/Discord notification (default ON; suppress with --no-slack)
     if not getattr(args, "no_slack", False) and config.SLACK_WEBHOOK_URL:
-        from slack_notifier import send_slack_notification, _send_webhook
+        from slack_notifier import (
+            send_slack_notification, _send_webhook,
+            build_rawpipe_block,
+        )
 
-        send_slack_notification(notices, upload_result=upload_result)
+        # TIGHTFEED ①: slim daily report (suppressed when notices is empty)
+        send_slack_notification(notices)
+
+        # TIGHTFEED ②: RAWPIPE upload summary (CLI-side, fired when
+        # --upload-datasift-api was used and produced api_results).
+        cli_rawpipe = locals().get("api_results") or []
+        if cli_rawpipe:
+            rawpipe_block = build_rawpipe_block(
+                cli_rawpipe, notices=notices, drive_links=drive_links,
+            )
+            if rawpipe_block:
+                _send_webhook(rawpipe_block)
 
         # Append the Travis tax-delinquent cross-run diff if the scraper ran
         # this cycle. This is the "sold / paid off" signal the user wants —

@@ -449,14 +449,20 @@ class DataSiftAPIClient:
 
         # 5. Verify the list landed (catch silent-success regressions)
         verified = None
+        list_uuid: str | None = None
         if verify_landed:
             # DataSift creates the list asynchronously; give it a moment.
             import time
             time.sleep(2)
             try:
                 lists = self.list_lists(limit=200)
-                verified = any(l.get("title") == list_name for l in lists)
-                if not verified:
+                matching = next(
+                    (l for l in lists if l.get("title") == list_name), None,
+                )
+                verified = matching is not None
+                if matching:
+                    list_uuid = matching.get("uuid")
+                else:
                     logger.warning(
                         "Upload returned %d but list %r is not visible yet. "
                         "It may still be processing — check the DataSift UI.",
@@ -469,6 +475,7 @@ class DataSiftAPIClient:
             "success": resp.status_code in (200, 201, 202, 204),
             "storage_key": storage_key,
             "list_name": list_name,
+            "list_uuid": list_uuid,
             "filename": csv_path.name,
             "line_count": line_count,
             "verified_in_lists": verified,

@@ -136,11 +136,12 @@ def format_slack_summary(
 
     if diff.is_first_run:
         lines.append(f"First run — seeding state with *{diff.new_count:,}* APNs.")
-        lines.append(f"Records parsed: {stats.get('record_count', 0):,}")
     else:
+        # TIGHTFEED: drop the REPEAT counter (boring stable middle) and
+        # the financial + filter blocks below. NEW + DROPPED + the
+        # actual dropped-APN list is the operational signal.
         lines.append(
             f":new: NEW: *{diff.new_count:,}*  |  "
-            f":repeat: REPEAT: *{diff.repeat_count:,}*  |  "
             f":white_check_mark: DROPPED (sold/paid off): *{diff.dropped_count:,}*"
         )
 
@@ -153,18 +154,5 @@ def format_slack_summary(
             lines.append(
                 f"Dropped APNs (first 10 of {diff.dropped_count}): {preview} … see report JSON for the full list."
             )
-
-    # Financial summary
-    if stats.get("total_owed"):
-        lines.append(
-            f"Total owed across output: ${stats['total_owed']:,.0f} "
-            f"(avg ${stats['avg_owed']:,.0f}, median ${stats['median_owed']:,.0f})"
-        )
-
-    # Filter reasons
-    if removed:
-        filt_bits = [f"{k}={v}" for k, v in removed.items() if v]
-        if filt_bits:
-            lines.append("Filtered: " + ", ".join(filt_bits))
 
     return "\n".join(lines)
