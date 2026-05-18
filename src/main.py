@@ -681,12 +681,14 @@ async def actor_main() -> None:
 
                     Actor.log.info("RAWPIPE: connecting to apiv2.reisift.io…")
                     api_client = DataSiftAPIClient.from_env()
-                    base_name = f"SiftStack {_dt.now().strftime('%Y-%m-%d')}"
 
                     for info in csv_infos:
-                        # Always suffix with label even for single CSV so
-                        # the list name is self-describing in the DataSift UI.
-                        list_name = f"{base_name} - {info['label']}"
+                        # List name is the bare notice-type label, e.g.
+                        # "Foreclosure", "Tax Delinquent", "Probate". Records
+                        # from different runs merge into a single per-type
+                        # list — the date lives on each record's Date Added
+                        # column, not on the list name.
+                        list_name = info["label"]
                         try:
                             r = api_client.upload_csv(
                                 Path(info["path"]),
@@ -2506,14 +2508,13 @@ def _run_scrape_pipeline(args, targets) -> None:
 
         try:
             client = DataSiftAPIClient.from_env()
-            base_list_name = f"SiftStack {_dt.now().strftime('%Y-%m-%d')}"
             api_results = []
             for info in csv_infos:
-                # When split: append the label so each notice type gets its own list.
-                list_name = (
-                    f"{base_list_name} - {info['label']}"
-                    if len(csv_infos) > 1 else base_list_name
-                )
+                # List name is the bare notice-type label, e.g. "Foreclosure",
+                # "Tax Delinquent", "Probate". Records from different runs
+                # merge into a single per-type list; the date lives on each
+                # record's Date Added column.
+                list_name = info["label"]
                 logging.info(
                     "RAWPIPE: uploading %s as list %r…", info["label"], list_name,
                 )
