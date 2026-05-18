@@ -195,6 +195,8 @@ def _clean_and_split_name(full_name: str) -> tuple[str, str]:
     """Clean a full name for DataSift upload and split into (first, last).
 
     Handles patterns that cause DataSift "incomplete" records:
+    - "LAST, FIRST [MIDDLE]" comma format (probate court records, CAD lookups):
+        "Patterson, Rebecca Gayle" → ("Rebecca", "Patterson")
     - Joint names with "&" or "AND": "John & Jane Smith" → ("John", "Smith")
     - Entity names (LLC, Trust, etc.): returns ("", "") — entity goes to Notes
     - "ET AL" / "ETAL" trailing marker → stripped
@@ -208,6 +210,26 @@ def _clean_and_split_name(full_name: str) -> tuple[str, str]:
         return ("", "")
 
     name = full_name.strip()
+
+    # ── Flip "LAST, FIRST MIDDLE" → "FIRST MIDDLE LAST" ──
+    # Probate court records and county appraisal lookups frequently store
+    # owner names in "Patterson, Rebecca Gayle" format. Without this flip,
+    # positional parsing below would treat "Patterson" as first name and
+    # "Gayle" as last name (after middle-token collapse drops "Rebecca").
+    #
+    # Don't flip if the chunk after the comma is just a generational
+    # suffix ("Smith, Jr." → drop suffix, keep "Smith") — those are
+    # punctuation noise, not name reordering.
+    if "," in name and not _is_entity_name(name):
+        head, _, tail = name.partition(",")
+        head = head.strip()
+        tail = tail.strip()
+        tail_upper = tail.upper().rstrip(".")
+        is_suffix_only = tail_upper in _SUFFIX_TOKENS or tail_upper in {
+            "ESQ", "ESQUIRE", "ETAL", "ET AL", "ET. AL.", "JR.", "SR.", "II.", "III.", "IV.",
+        }
+        if head and tail and not is_suffix_only:
+            name = f"{tail} {head}"
 
     # Entity names → empty (don't put business names in person fields)
     if _is_entity_name(name):
