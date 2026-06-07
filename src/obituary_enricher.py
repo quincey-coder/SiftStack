@@ -247,6 +247,79 @@ Obituary text:
 {obituary_text}"""
 
 
+def _person_tokens(name: str) -> set[str]:
+    """Significant (>1 char) alphabetic tokens of a name, upper-cased, with
+    legal suffixes removed. Single-letter middle initials are dropped so they
+    don't block a match between e.g. 'James D Slawson' and 'James Slawson'."""
+    if not name:
+        return set()
+    cleaned = _SUFFIX_RE.sub("", name.upper())
+    return {t for t in re.findall(r"[A-Z]+", cleaned) if len(t) > 1}
+
+
+def _is_same_person(a: str, b: str) -> bool:
+    """True if two names denote the same person regardless of word order.
+
+    Handles the CAD/probate case where the appraisal owner is the decedent
+    themselves stored surname-first ('Cash Margot Suzanne') vs the court
+    decedent name ('Margot Suzanne Cash'). Tolerant of a missing middle name:
+    matches when one name's token set is a subset of the other's.
+    """
+    ta, tb = _person_tokens(a), _person_tokens(b)
+    if not ta or not tb:
+        return False
+    return ta <= tb or tb <= ta
+
+
+_GEN_SUFFIXES = {"JR", "SR", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "ESQ"}
+
+
+def _surname(name: str) -> str:
+    """Last significant (>1 char) token of a FIRST [MIDDLE] LAST name, upper-cased,
+    with legal and generational suffixes (Jr/Sr/III/...) removed. '' when no
+    usable token exists."""
+    if not name:
+        return ""
+    cleaned = _SUFFIX_RE.sub("", name)
+    toks = [t.upper() for t in re.findall(r"[A-Za-z]+", cleaned) if len(t) > 1]
+    while toks and toks[-1] in _GEN_SUFFIXES:
+        toks.pop()
+    return toks[-1] if toks else ""
+
+
+def _probate_dm_relationship(notice) -> tuple[str, str]:
+    """Classify a probate-preset decision maker and explain the call.
+
+    The DM here is the CAD owner-of-record, not a court-confirmed executor — the
+    scraper never captures an executor. Use the appraisal deed to label honestly:
+
+      • Joint deed ("SLAWSON JAMES D & VERNA") + survivor shares the decedent's
+        surname  → "surviving spouse" (the obvious married-couple-on-title case)
+      • Joint deed, different surname                → "surviving co-owner"
+      • No joint marker (survivor already holds sole title) → "owner of record"
+
+    Returns (relationship, dm_confidence_reason).
+    """
+    raw = f" {(notice.tax_owner_name or '').upper()} "
+    is_joint = "&" in raw or " AND " in raw
+    dm_surname = _surname(notice.owner_name)
+    same_surname = bool(dm_surname) and dm_surname == _surname(notice.decedent_name)
+    if is_joint and same_surname:
+        return (
+            "surviving spouse",
+            "surviving spouse — joint owner on the appraisal deed sharing the decedent's surname",
+        )
+    if is_joint:
+        return (
+            "surviving co-owner",
+            "surviving co-owner on the appraisal deed",
+        )
+    return (
+        "owner of record",
+        "current owner of record on the appraisal deed (not a court-confirmed executor)",
+    )
+
+
 def parse_tax_owner_name(raw: str) -> list[str]:
     """Convert tax API owner name to search-friendly format(s).
 
@@ -2356,7 +2429,7 @@ def enrich_obituary_data(
             notice.notice_type == "probate"
             and notice.owner_name
             and notice.decedent_name
-            and notice.owner_name.strip().upper() != notice.decedent_name.strip().upper()
+            and not _is_same_person(notice.owner_name, notice.decedent_name)
         ):
             synthetic_parsed = {
                 "confidence": "high",
@@ -2370,7 +2443,7 @@ def enrich_obituary_data(
             confirmed += 1
             probate_preset_count += 1
             logger.info(
-                "  Probate preset: executor=%s, decedent=%s",
+                "  Probate preset: survivor=%s, decedent=%s",
                 notice.owner_name, notice.decedent_name,
             )
             continue
@@ -2677,11 +2750,12 @@ def enrich_obituary_data(
                         j, len(matches), co_owner_name,
                     )
 
-        # Path 0: Probate preset — executor is the DM, address from notice
+        # Path 0: Probate preset — CAD owner-of-record is the DM, address from notice
         if parsed.get("_probate_preset"):
+            _dm_rel, _dm_reason = _probate_dm_relationship(notice)
             ranked_dms = [{
                 "name": notice.owner_name,
-                "relationship": "executor",
+                "relationship": _dm_rel,
                 "status": "verified_living",
                 "source": "probate_notice",
                 "rank": 1,
@@ -2696,14 +2770,14 @@ def enrich_obituary_data(
                 "heirs_verified_deceased": 0,
                 "heirs_unverified": 0,
                 "dm_confidence": "high",
-                "dm_confidence_reason": "executor named in probate notice with mailing address",
+                "dm_confidence_reason": _dm_reason,
             }
             # Mark decedent as deceased
             if notice.decedent_name:
                 notice.owner_deceased = "yes"
             logger.info(
-                "  [%d/%d] Probate preset DM: %s (executor) at %s",
-                j, len(matches), notice.owner_name, notice.owner_street,
+                "  [%d/%d] Probate preset DM: %s (%s) at %s",
+                j, len(matches), notice.owner_name, _dm_rel, notice.owner_street,
             )
 
         # Path 1: Full-page match with survivors → run heir verification

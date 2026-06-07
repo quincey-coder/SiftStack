@@ -38,6 +38,36 @@ def _clean_cad_owner_for_display(raw_upper: str) -> str:
     return _cleaner.title_case(stripped)
 
 
+def _cad_owner_to_first_last(raw_upper: str) -> str:
+    """Convert a raw CAD owner name (LAST FIRST MIDDLE, no comma) to a clean
+    'First [Middle] Last' display name.
+
+    CAD/tax records store names surname-first with no comma
+    ("CASH MARGOT SUZANNE"). owner_name is consumed downstream as
+    FIRST [MIDDLE] LAST — the DataSift "Owner First/Last" split and the
+    obituary candidate parser both assume first-name-first order — so the
+    conversion has to happen where CAD data enters the record. Reuses the
+    well-tested tax-name parser. Falls back to the plain title-cased name when
+    the parser can't produce a person name (e.g. business entities).
+    """
+    if not raw_upper:
+        return ""
+    try:
+        from obituary_enricher import parse_tax_owner_name
+        # County CADs disagree on format: TCAD is "LAST FIRST MIDDLE" (no comma)
+        # while WCAD/BCAD are "LAST, FIRST MIDDLE". parse_tax_owner_name expects
+        # surname-first whitespace tokens, so drop the comma first — that makes
+        # this work for all three counties and avoids a trailing-comma artifact
+        # on the surname.
+        normalized = raw_upper.replace(",", " ")
+        variants = parse_tax_owner_name(normalized)
+        if variants:
+            return variants[0]
+    except Exception:
+        pass
+    return _clean_cad_owner_for_display(raw_upper)
+
+
 # ── Property selection logic ──────────────────────────────────────────
 
 RESIDENTIAL_KEYWORDS = {
@@ -197,7 +227,11 @@ async def lookup_decedent_properties(notices: list) -> None:
                 cad_owner_raw = result.get("owner_raw") or (result.get("owner") or "").upper()
                 cad_owner_clean = _clean_cad_owner_for_display(cad_owner_raw)
                 if cad_owner_clean and not (notice.owner_name or "").strip():
-                    notice.owner_name = cad_owner_clean
+                    # CAD names are LAST FIRST MIDDLE; owner_name is consumed as
+                    # FIRST [MIDDLE] LAST downstream — normalize the order here so
+                    # the DataSift Owner First/Last split is correct. Keep
+                    # tax_owner_name in the raw LAST-FIRST form for name matching.
+                    notice.owner_name = _cad_owner_to_first_last(cad_owner_raw) or cad_owner_clean
                     if not (notice.tax_owner_name or "").strip():
                         notice.tax_owner_name = cad_owner_raw
                 found += 1

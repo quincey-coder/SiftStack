@@ -88,6 +88,13 @@ def _get_contacts_for_trace(
                         heir.get("zip", ""),
                         heir_name,
                     ))
+    elif notice.owner_deceased == "yes":
+        # Deceased owner with no DM identified → there is no valid LIVING contact
+        # to trace. owner_name here is the decedent (the CAD owner-of-record), so
+        # skip-tracing it would (a) spend credits on a dead person and (b) produce
+        # phones that can't attach to any contact (the deceased branch in
+        # _match_results never writes them). Leave the record for heir research.
+        return []
     else:
         # Living owner — single contact
         name = (notice.owner_name or "").strip()
