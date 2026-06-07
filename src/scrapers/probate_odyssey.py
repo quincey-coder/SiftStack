@@ -244,7 +244,13 @@ def _build_notice(record: dict, base_url: str, county: str) -> NoticeData | None
     case_title = record.get("case_title", "")
     decedent = _extract_decedent_name(case_title)
     if decedent:
-        notice.decedent_name = decedent
+        # Odyssey names are already FIRST LAST — don't flip; just split off any
+        # "a/k/a" alias so it doesn't pollute the name and can be searched.
+        from notice_parser import _split_aka
+        primary, alias = _split_aka(decedent)
+        notice.decedent_name = primary
+        if alias:
+            notice.decedent_aka = alias
     elif _GUARDIANSHIP_RE.search(case_title):
         # Skip guardianship cases — we only want estate/probate
         return None

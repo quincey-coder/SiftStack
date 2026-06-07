@@ -72,6 +72,37 @@ def _strip_trailing_suffixes(parts: list[str]) -> tuple[list[str], list[str]]:
     return parts, suffixes
 
 
+# "also known as" markers: AKA / A.K.A. / A/K/A / FKA / NKA / "also known as".
+# The marker may be trailing (no alias after it) — e.g. "JOHNSON SHELBY AKA" —
+# so the tail is "\s+ or end of string".
+_AKA_SPLIT_RE = re.compile(
+    r"\s+(?:A\.?/?K\.?/?A\.?|F\.?/?K\.?/?A\.?|N\.?/?K\.?/?A\.?|ALSO\s+KNOWN\s+AS)(?:\s+|$)",
+    re.IGNORECASE,
+)
+
+
+def _split_aka(name: str) -> tuple[str, str]:
+    """Split a court name on an 'also known as' marker into (primary, alias).
+
+    Returns the primary legal name and a captured alias. The alias is only kept
+    separate when it looks like a full alternate name (>= 2 tokens, with a
+    >= 2-token primary too) — e.g. "Mary Smith AKA Mary Jones". When the alias
+    is a bare fragment (e.g. just a surname: "Shelby Clayton AKA Johnson"), the
+    marker is dropped and all name tokens are merged into the primary so the
+    surname isn't lost; no alias is returned.
+    """
+    if not name:
+        return (name or "", "")
+    m = _AKA_SPLIT_RE.search(name)
+    if not m:
+        return (name.strip(), "")
+    before = name[:m.start()].strip()
+    after = name[m.end():].strip()
+    if len(after.split()) >= 2 and len(before.split()) >= 2:
+        return (before, after)
+    return (f"{before} {after}".strip(), "")
+
+
 def normalize_court_name(name: str) -> str:
     """Convert court-format `LAST FIRST [MIDDLE]` to modern `FIRST [MIDDLE] LAST`.
 
@@ -92,6 +123,10 @@ def normalize_court_name(name: str) -> str:
     """
     if not name or not name.strip():
         return name
+
+    # Defensive: drop any "a/k/a" alias clause so it can't pollute the flipped
+    # name. Scrapers that want the alias should call _split_aka themselves.
+    name, _alias = _split_aka(name)
 
     # Skip flipping if the name looks like a non-person entity — those don't
     # have a first/last to flip and "Travis County" → "County Travis" would
@@ -168,6 +203,7 @@ class NoticeData:
     lot_size: str = ""             # Lot size in sqft
     # Probate-specific fields
     decedent_name: str = ""        # Deceased person's name (probate only)
+    decedent_aka: str = ""         # Decedent's "also known as" alias, if any (probate)
     owner_street: str = ""         # PR/contact mailing street address
     owner_city: str = ""           # PR/contact mailing city
     owner_state: str = ""          # PR/contact mailing state

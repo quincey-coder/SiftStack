@@ -247,14 +247,36 @@ Obituary text:
 {obituary_text}"""
 
 
+_GEN_SUFFIXES = {"JR", "SR", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "ESQ"}
+
+# Alias / "also known as" noise tokens that should never count toward a
+# name match (a court "a/k/a" can leak into a decedent name).
+_NAME_ALIAS_NOISE = {"AKA", "FKA", "NKA", "DBA"}
+
+
+def _gen_suffix(name: str) -> str:
+    """Return the generational suffix token (JR/SR/II/III/...) found in a name,
+    upper-cased, or '' if none. Scans all tokens so a suffix in any position is
+    detected."""
+    if not name:
+        return ""
+    cleaned = _SUFFIX_RE.sub("", name.upper())
+    for tok in reversed(re.findall(r"[A-Z]+", cleaned)):
+        if tok in _GEN_SUFFIXES:
+            return tok
+    return ""
+
+
 def _person_tokens(name: str) -> set[str]:
-    """Significant (>1 char) alphabetic tokens of a name, upper-cased, with
-    legal suffixes removed. Single-letter middle initials are dropped so they
-    don't block a match between e.g. 'James D Slawson' and 'James Slawson'."""
+    """Core (>1 char) alphabetic tokens of a name, upper-cased. Drops legal
+    suffixes, generational suffixes (Jr/Sr/III), 'a/k/a' alias noise, and
+    single-letter middle initials so the *core* identity compares cleanly.
+    Generational suffixes are handled separately by _is_same_person."""
     if not name:
         return set()
     cleaned = _SUFFIX_RE.sub("", name.upper())
-    return {t for t in re.findall(r"[A-Z]+", cleaned) if len(t) > 1}
+    toks = {t for t in re.findall(r"[A-Z]+", cleaned) if len(t) > 1}
+    return toks - _GEN_SUFFIXES - _NAME_ALIAS_NOISE
 
 
 def _is_same_person(a: str, b: str) -> bool:
@@ -263,15 +285,23 @@ def _is_same_person(a: str, b: str) -> bool:
     Handles the CAD/probate case where the appraisal owner is the decedent
     themselves stored surname-first ('Cash Margot Suzanne') vs the court
     decedent name ('Margot Suzanne Cash'). Tolerant of a missing middle name:
-    matches when one name's token set is a subset of the other's.
+    matches when one name's core token set is a subset of the other's.
+
+    Generational suffixes then disambiguate same-core names: a 'Jr'/'II'/'III'
+    is a different (younger) person from a 'Sr'/unmarked elder — so
+    'Shelby Johnson Jr' (the child) is NOT the decedent 'Shelby Johnson'.
+    'Sr' and no-suffix share the same 'elder' bucket.
     """
     ta, tb = _person_tokens(a), _person_tokens(b)
     if not ta or not tb:
         return False
-    return ta <= tb or tb <= ta
+    if not (ta <= tb or tb <= ta):
+        return False
 
+    def _bucket(s: str) -> str:
+        return "" if s in ("", "SR") else s
 
-_GEN_SUFFIXES = {"JR", "SR", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "ESQ"}
+    return _bucket(_gen_suffix(a)) == _bucket(_gen_suffix(b))
 
 
 def _surname(name: str) -> str:
@@ -301,9 +331,30 @@ def _probate_dm_relationship(notice) -> tuple[str, str]:
     Returns (relationship, dm_confidence_reason).
     """
     raw = f" {(notice.tax_owner_name or '').upper()} "
-    is_joint = "&" in raw or " AND " in raw
+    has_etux = bool(re.search(r"\bET\s*(?:UX(?:OR)?|VIR)\b", raw))
+    is_joint = "&" in raw or " AND " in raw or has_etux
     dm_surname = _surname(notice.owner_name)
     same_surname = bool(dm_surname) and dm_surname == _surname(notice.decedent_name)
+
+    # Surviving child: the owner shares the decedent's surname but carries a
+    # younger generational suffix (Jr/II/III...) the decedent lacks — i.e. the
+    # son/daughter, not the spouse.
+    dm_suffix = _gen_suffix(notice.owner_name)
+    dec_suffix = _gen_suffix(notice.decedent_name)
+    _YOUNGER = {"JR", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X"}
+    if same_surname and dm_suffix in _YOUNGER and dm_suffix != dec_suffix:
+        return (
+            "surviving child",
+            f"surviving child — shares the decedent's surname with a {dm_suffix.title()} "
+            "suffix (likely son/daughter)",
+        )
+
+    # ET UX / ET VIR explicitly names a spouse — strongest spouse signal.
+    if has_etux and same_surname:
+        return (
+            "surviving spouse",
+            "surviving spouse — named via ET UX/ET VIR on the appraisal deed",
+        )
     if is_joint and same_surname:
         return (
             "surviving spouse",
@@ -361,6 +412,18 @@ def parse_tax_owner_name(raw: str) -> list[str]:
     if "%" in name:
         name = name.split("%")[0].strip()
 
+    # Capture an ET UX[OR] / ET VIR spouse named after the primary owner. The
+    # Latin marker (et uxor = "and wife", et vir = "and husband") introduces a
+    # given name that shares the primary's surname
+    # ("HAGLER JOHN B ETUX DIXIE" -> "Dixie Hagler"). Pull the clause out so the
+    # primary parses cleanly; the spouse is appended as a co-owner after the
+    # main parse below. (ETAL / ET AL is handled earlier by _SUFFIX_RE.)
+    etux_given = ""
+    _etux_m = re.search(r"\bET\s*(?:UX(?:OR)?|VIR)\b\s*(.*)$", name, flags=re.IGNORECASE)
+    if _etux_m:
+        etux_given = _etux_m.group(1).strip()
+        name = name[:_etux_m.start()].strip()
+
     # Handle joint owners with &
     parts = re.split(r"\s*&\s*", name)
 
@@ -375,16 +438,26 @@ def parse_tax_owner_name(raw: str) -> list[str]:
         tokens = part.split()
 
         if i == 0:
-            # First part: "LAST FIRST [MIDDLE]"
+            # First part: "LAST FIRST [MIDDLE] [SUFFIX]"
             if len(tokens) < 2:
                 continue
+            # Pull a trailing generational suffix (JR/SR/II/III...) off so it
+            # lands at the END of the display name instead of being mistaken for
+            # a middle initial — and so it survives for downstream Jr/Sr logic.
+            gen_suffix = ""
+            if tokens[-1].upper() in _GEN_SUFFIXES and len(tokens) > 2:
+                gen_suffix = tokens[-1].title()
+                tokens = tokens[:-1]
             last_name = tokens[0]
             first_name = tokens[1]
             middle = tokens[2] if len(tokens) >= 3 else ""
             if middle and len(middle) <= 2:
-                results.append(f"{first_name.title()} {middle.title()} {last_name.title()}")
+                built = f"{first_name.title()} {middle.title()} {last_name.title()}"
             else:
-                results.append(f"{first_name.title()} {last_name.title()}")
+                built = f"{first_name.title()} {last_name.title()}"
+            if gen_suffix:
+                built = f"{built} {gen_suffix}"
+            results.append(built)
         else:
             # A lone first name after "&" is a co-owner who inherits the primary
             # surname ("WANG JUNGANG & XIUQIN" -> "Xiuqin Wang"). Without this the
@@ -419,6 +492,13 @@ def parse_tax_owner_name(raw: str) -> list[str]:
                 # Same last name: "CHRISTINE C" (inherits WILLIAMS)
                 first_name = tokens[0]
                 results.append(f"{first_name.title()} {last_name.title()}")
+
+    # Append the ET UX[OR]/ET VIR spouse, sharing the primary surname.
+    if etux_given and last_name:
+        spouse_first = etux_given.split()[0]
+        spouse_full = f"{spouse_first.title()} {last_name.title()}"
+        if spouse_full not in results:
+            results.append(spouse_full)
 
     return results
 
@@ -2189,16 +2269,25 @@ def _process_one_candidate(
         search_names = parse_tax_owner_name(raw_name)
     else:
         search_names = _parse_notice_owner_name(raw_name)
-    if not search_names:
+    # Probate "a/k/a" alias: try the decedent's alias as a fallback search name
+    # so a decedent indexed only under their alias is still found.
+    alias_names = []
+    if notice.notice_type == "probate" and getattr(notice, "decedent_aka", ""):
+        alias_names = _parse_notice_owner_name(notice.decedent_aka)
+    if not search_names and not alias_names:
         result["status"] = "skipped"
         return result
+    # Primary names first (cap 2), then the alias (cap 1) as a fallback — the
+    # loop returns on the first match, so the alias is only used when the
+    # primary name finds nothing.
+    search_names = search_names[:2] + alias_names[:1]
 
     city = notice.city.strip() or "Austin"
     last_cache_key = ""
     last_results_empty = None
     last_any_fetch_succeeded = False
 
-    for search_name in search_names[:2]:
+    for search_name in search_names:
         cache_key = search_name.lower().strip()
         last_cache_key = cache_key
         result["search_name"] = search_name

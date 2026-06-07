@@ -28,7 +28,6 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://bell.tx.publicsearch.us"
 
 _DECD_SUFFIX_RE = re.compile(r"\s+(?:DECD|DECEASED)\.?$", re.IGNORECASE)
-_AKA_RE = re.compile(r"\s+AKA\s*$", re.IGNORECASE)
 
 
 def _clean_decedent_name(raw: str) -> str:
@@ -36,9 +35,11 @@ def _clean_decedent_name(raw: str) -> str:
 
     Input:  "ADAMS VERA N DECD"
     Output: "Adams Vera N"
+
+    Note: "a/k/a" alias handling is done by the shared notice_parser._split_aka
+    at the call site so the alias can be captured, not just stripped.
     """
     name = raw.strip()
-    name = _AKA_RE.sub("", name).strip()
     name = _DECD_SUFFIX_RE.sub("", name).strip()
     if name.isupper() or name.islower():
         name = name.title()
@@ -162,8 +163,9 @@ class BellProbateScraper:
                     if max_notices and len(all_notices) >= max_notices:
                         break
 
-                    from notice_parser import normalize_court_name
-                    decedent = normalize_court_name(_clean_decedent_name(row.get("grantor", "")))
+                    from notice_parser import normalize_court_name, _split_aka
+                    _primary, _alias = _split_aka(_clean_decedent_name(row.get("grantor", "")))
+                    decedent = normalize_court_name(_primary)
                     if not decedent:
                         continue
 
@@ -172,6 +174,7 @@ class BellProbateScraper:
                         county="Bell",
                         state="TX",
                         decedent_name=decedent,
+                        decedent_aka=normalize_court_name(_alias) if _alias else "",
                         source_url=f"{BASE_URL}/?instNum={row.get('instNum', '')}",
                     )
 
