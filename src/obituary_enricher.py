@@ -393,6 +393,15 @@ def parse_tax_owner_name(raw: str) -> list[str]:
                 if last_name:
                     results.append(f"{tokens[0].title()} {last_name.title()}")
                 continue
+            # Co-owner segment that restates the family surname in FIRST [MIDDLE]
+            # LAST order ("COBELLE COURTNEY & SUZANNE COBELLE" -> "Suzanne
+            # Cobelle"). Detect by the trailing token matching the primary
+            # surname; otherwise the LAST-FIRST branch below would flip it to
+            # "Cobelle Suzanne".
+            if last_name and tokens[-1].upper() == last_name.upper():
+                first_name = tokens[0]
+                results.append(f"{first_name.title()} {last_name.title()}")
+                continue
             # Subsequent parts: "FIRST [MIDDLE]" or "LAST FIRST [MIDDLE]"
             # If second token is a single char (middle initial), it's "FIRST MIDDLE"
             # inheriting previous last name. Otherwise check for new last name.
