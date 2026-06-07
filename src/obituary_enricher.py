@@ -373,11 +373,11 @@ def parse_tax_owner_name(raw: str) -> list[str]:
             continue
 
         tokens = part.split()
-        if len(tokens) < 2:
-            continue
 
         if i == 0:
             # First part: "LAST FIRST [MIDDLE]"
+            if len(tokens) < 2:
+                continue
             last_name = tokens[0]
             first_name = tokens[1]
             middle = tokens[2] if len(tokens) >= 3 else ""
@@ -386,6 +386,13 @@ def parse_tax_owner_name(raw: str) -> list[str]:
             else:
                 results.append(f"{first_name.title()} {last_name.title()}")
         else:
+            # A lone first name after "&" is a co-owner who inherits the primary
+            # surname ("WANG JUNGANG & XIUQIN" -> "Xiuqin Wang"). Without this the
+            # surviving joint owner is dropped entirely.
+            if len(tokens) == 1:
+                if last_name:
+                    results.append(f"{tokens[0].title()} {last_name.title()}")
+                continue
             # Subsequent parts: "FIRST [MIDDLE]" or "LAST FIRST [MIDDLE]"
             # If second token is a single char (middle initial), it's "FIRST MIDDLE"
             # inheriting previous last name. Otherwise check for new last name.

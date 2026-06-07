@@ -38,7 +38,7 @@ def _clean_cad_owner_for_display(raw_upper: str) -> str:
     return _cleaner.title_case(stripped)
 
 
-def _cad_owner_to_first_last(raw_upper: str) -> str:
+def _cad_owner_to_first_last(raw_upper: str, avoid_name: str = "") -> str:
     """Convert a raw CAD owner name (LAST FIRST MIDDLE, no comma) to a clean
     'First [Middle] Last' display name.
 
@@ -49,6 +49,11 @@ def _cad_owner_to_first_last(raw_upper: str) -> str:
     conversion has to happen where CAD data enters the record. Reuses the
     well-tested tax-name parser. Falls back to the plain title-cased name when
     the parser can't produce a person name (e.g. business entities).
+
+    When `avoid_name` is given (the probate decedent), a jointly-owned deed
+    prefers the co-owner who is NOT the decedent — i.e. the surviving joint
+    owner — instead of defaulting to the first-listed owner. Falls back to the
+    first owner when every owner matches `avoid_name`.
     """
     if not raw_upper:
         return ""
@@ -62,6 +67,11 @@ def _cad_owner_to_first_last(raw_upper: str) -> str:
         normalized = raw_upper.replace(",", " ")
         variants = parse_tax_owner_name(normalized)
         if variants:
+            if avoid_name:
+                from obituary_enricher import _is_same_person
+                for v in variants:
+                    if not _is_same_person(v, avoid_name):
+                        return v
             return variants[0]
     except Exception:
         pass
@@ -231,7 +241,11 @@ async def lookup_decedent_properties(notices: list) -> None:
                     # FIRST [MIDDLE] LAST downstream — normalize the order here so
                     # the DataSift Owner First/Last split is correct. Keep
                     # tax_owner_name in the raw LAST-FIRST form for name matching.
-                    notice.owner_name = _cad_owner_to_first_last(cad_owner_raw) or cad_owner_clean
+                    # For probate, prefer the surviving co-owner over the decedent
+                    # when the deed is jointly held (avoid_name = the decedent).
+                    notice.owner_name = _cad_owner_to_first_last(
+                        cad_owner_raw, avoid_name=notice.decedent_name or "",
+                    ) or cad_owner_clean
                     if not (notice.tax_owner_name or "").strip():
                         notice.tax_owner_name = cad_owner_raw
                 found += 1
