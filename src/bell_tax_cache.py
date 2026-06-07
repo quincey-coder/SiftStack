@@ -311,7 +311,15 @@ def _load_appraisal(
         prop_type_cd = str(row[col.get("prop_type_cd", -1)] or "").strip() if "prop_type_cd" in col else ""
         if prop_type_cd != "R":
             continue  # skip personal property, autos, mobile homes
-        owner = str(row[col["Ownr_Name"]] if "Ownr_Name" in col else "").strip()
+        # BellCAD's export header for the owner column has drifted between
+        # "Owner_name" (current) and "Ownr_Name" (older). Match either so a
+        # header rename can't silently zero out the whole appraisal index.
+        owner_col = next(
+            (c for c in ("Owner_name", "Ownr_Name", "owner_name", "Owner_Name", "OwnerName")
+             if c in col),
+            None,
+        )
+        owner = str(row[col[owner_col]] if owner_col else "").strip()
         if not owner:
             continue
         key = _normalize_last(owner)
