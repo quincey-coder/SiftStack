@@ -544,16 +544,26 @@ async def actor_main() -> None:
                         except Exception as e:
                             Actor.log.warning("Per-record Trestle scoring failed: %s", e)
 
-            # ── Deep Prospecting PDFs → KVS ──
+            # ── Deep Prospecting PDFs → Google Drive ──
+            # Uploaded to the same Drive folder as the DataSift CSVs so the Slack
+            # links are clickable webViewLinks (Apify KVS records are now Restricted
+            # by default and their raw API URLs fail with auth errors).
             pdf_urls: list[dict] = []
             dp_candidates = [
                 n for n in notices
                 if n.owner_deceased == "yes" or n.heir_map_json or n.decision_maker_name
             ]
-            if dp_candidates:
+            if dp_candidates and not (
+                config.GOOGLE_DRIVE_FOLDER_ID and config.GOOGLE_SERVICE_ACCOUNT_KEY
+            ):
+                Actor.log.warning(
+                    "Drive creds not set — skipping %d deep-prospecting PDF link(s)",
+                    len(dp_candidates),
+                )
+            elif dp_candidates:
                 try:
                     from report_generator import generate_record_pdf
-                    kvs_id = _kvs_info["id"]
+                    from drive_uploader import upload_file
                     report_dir = Path("output/reports")
                     for n in dp_candidates:
                         try:
@@ -563,13 +573,17 @@ async def actor_main() -> None:
                         except Exception:
                             Actor.log.exception("PDF generation failed for %s", n.address)
                             continue
-                        key = pdf_path.name
-                        with open(pdf_path, "rb") as f:
-                            await kvs.set_value(key, f.read(), content_type="application/pdf")
-                        url = f"https://api.apify.com/v2/key-value-stores/{kvs_id}/records/{key}"
-                        pdf_urls.append({"address": n.address, "url": url})
+                        link = upload_file(
+                            pdf_path,
+                            config.GOOGLE_DRIVE_FOLDER_ID,
+                            config.GOOGLE_SERVICE_ACCOUNT_KEY,
+                        )
+                        if link:
+                            pdf_urls.append({"address": n.address, "url": link})
+                        else:
+                            Actor.log.error("PDF Drive upload failed for %s", n.address)
                     Actor.log.info(
-                        "Generated %d deep-prospecting PDFs (%d records without DP data)",
+                        "Generated %d deep-prospecting PDFs → Drive (%d records without DP data)",
                         len(pdf_urls), total - len(dp_candidates),
                     )
                 except Exception as e:
