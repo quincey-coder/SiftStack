@@ -15,6 +15,92 @@ import config as cfg
 
 logger = logging.getLogger(__name__)
 
+# ── Token usage accumulator ───────────────────────────────────────────
+# Module-level meter. Lives for the process lifetime, so separate CLI
+# invocations start fresh automatically. Long-lived processes (dropbox-watch,
+# Apify Actor) must call reset_usage() at the start of each logical run —
+# see CLAUDE.md / the run entry points in main.py.
+
+_USAGE = {"calls": 0, "input_tokens": 0, "output_tokens": 0, "by_model": {}}
+
+
+def _record_usage(model: str, input_tokens: int, output_tokens: int) -> None:
+    """Add one LLM call's token usage to the accumulator."""
+    input_tokens = int(input_tokens or 0)
+    output_tokens = int(output_tokens or 0)
+    _USAGE["calls"] += 1
+    _USAGE["input_tokens"] += input_tokens
+    _USAGE["output_tokens"] += output_tokens
+    bm = _USAGE["by_model"].setdefault(
+        model, {"calls": 0, "input_tokens": 0, "output_tokens": 0}
+    )
+    bm["calls"] += 1
+    bm["input_tokens"] += input_tokens
+    bm["output_tokens"] += output_tokens
+    if getattr(cfg, "LLM_USAGE_LOG", True):
+        logger.debug(
+            "LLM usage: model=%s in=%d out=%d", model, input_tokens, output_tokens
+        )
+
+
+def _record_response_usage(model: str, response) -> None:
+    """Pull token counts off a backend response and record them.
+
+    Handles both shapes: Anthropic (input_tokens/output_tokens) and
+    OpenAI-compatible — Ollama/OpenRouter (prompt_tokens/completion_tokens).
+    Silently no-ops if the response carries no usage object.
+    """
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return
+    in_tok = getattr(usage, "input_tokens", None)
+    out_tok = getattr(usage, "output_tokens", None)
+    if in_tok is None and out_tok is None:
+        in_tok = getattr(usage, "prompt_tokens", 0)
+        out_tok = getattr(usage, "completion_tokens", 0)
+    _record_usage(model, in_tok, out_tok)
+
+
+def get_usage() -> dict:
+    """Return an immutable snapshot of the current token meter."""
+    import copy
+    return copy.deepcopy(_USAGE)
+
+
+def reset_usage() -> None:
+    """Zero the token meter. Call at the start of each logical run."""
+    _USAGE["calls"] = 0
+    _USAGE["input_tokens"] = 0
+    _USAGE["output_tokens"] = 0
+    _USAGE["by_model"] = {}
+
+
+def estimate_cost_usd(usage: dict | None = None) -> float:
+    """Convert token usage to USD using cfg.LLM_PRICING (per 1M tokens).
+
+    Unknown models fall back to cfg.LLM_PRICING_DEFAULT. Pass a snapshot
+    from get_usage(), or omit to price the current accumulator.
+    """
+    if usage is None:
+        usage = _USAGE
+    pricing = getattr(cfg, "LLM_PRICING", {})
+    default = getattr(cfg, "LLM_PRICING_DEFAULT", (1.0, 5.0))
+    total = 0.0
+    by_model = usage.get("by_model") or {}
+    if by_model:
+        for model, m in by_model.items():
+            in_rate, out_rate = pricing.get(model, default)
+            if model not in pricing:
+                logger.debug("No LLM_PRICING for model %s — using default rate", model)
+            total += (m["input_tokens"] / 1_000_000) * in_rate
+            total += (m["output_tokens"] / 1_000_000) * out_rate
+    else:
+        in_rate, out_rate = default
+        total += (usage.get("input_tokens", 0) / 1_000_000) * in_rate
+        total += (usage.get("output_tokens", 0) / 1_000_000) * out_rate
+    return total
+
+
 # ── Backend dispatch ──────────────────────────────────────────────────
 
 
@@ -77,6 +163,7 @@ def _chat_anthropic(
             system=system,
             messages=[{"role": "user", "content": prompt}],
         )
+        _record_response_usage(model, response)
         result_text = response.content[0].text.strip()
         return _parse_json(result_text)
     except Exception as e:
@@ -104,6 +191,7 @@ async def _chat_anthropic_async(
             system=system,
             messages=[{"role": "user", "content": prompt}],
         )
+        _record_response_usage(model, response)
         result_text = response.content[0].text.strip()
         return _parse_json(result_text)
     except Exception as e:
@@ -136,6 +224,7 @@ def _chat_ollama(
             max_tokens=max_tokens,
             temperature=0.1,
         )
+        _record_response_usage(model, response)
         result_text = response.choices[0].message.content.strip()
         parsed = _parse_json(result_text)
         if parsed is None:
@@ -151,6 +240,7 @@ def _chat_ollama(
                 max_tokens=max_tokens,
                 temperature=0.0,
             )
+            _record_response_usage(model, response)
             result_text = response.choices[0].message.content.strip()
             parsed = _parse_json(result_text)
         return parsed
@@ -181,6 +271,7 @@ async def _chat_ollama_async(
             max_tokens=max_tokens,
             temperature=0.1,
         )
+        _record_response_usage(model, response)
         result_text = response.choices[0].message.content.strip()
         parsed = _parse_json(result_text)
         if parsed is None:
@@ -195,6 +286,7 @@ async def _chat_ollama_async(
                 max_tokens=max_tokens,
                 temperature=0.0,
             )
+            _record_response_usage(model, response)
             result_text = response.choices[0].message.content.strip()
             parsed = _parse_json(result_text)
         return parsed
@@ -233,6 +325,7 @@ def _chat_openrouter(
             max_tokens=max_tokens,
             temperature=0.1,
         )
+        _record_response_usage(model, response)
         result_text = response.choices[0].message.content.strip()
         parsed = _parse_json(result_text)
         if parsed is None:
@@ -247,6 +340,7 @@ def _chat_openrouter(
                 max_tokens=max_tokens,
                 temperature=0.0,
             )
+            _record_response_usage(model, response)
             result_text = response.choices[0].message.content.strip()
             parsed = _parse_json(result_text)
         return parsed
@@ -282,6 +376,7 @@ async def _chat_openrouter_async(
             max_tokens=max_tokens,
             temperature=0.1,
         )
+        _record_response_usage(model, response)
         result_text = response.choices[0].message.content.strip()
         parsed = _parse_json(result_text)
         if parsed is None:
@@ -296,6 +391,7 @@ async def _chat_openrouter_async(
                 max_tokens=max_tokens,
                 temperature=0.0,
             )
+            _record_response_usage(model, response)
             result_text = response.choices[0].message.content.strip()
             parsed = _parse_json(result_text)
         return parsed

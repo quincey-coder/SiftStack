@@ -198,6 +198,10 @@ async def actor_main() -> None:
 
     async with Actor:
         pipeline_start = _time()
+        # Isolate this run's token meter (the Actor container is long-lived and
+        # may handle multiple runs) so the Slack "Run cost" reflects only this run.
+        import llm_client
+        llm_client.reset_usage()
         actor_input = await Actor.get_input() or {}
 
         # ── Credentials → config + env (downstream modules read either) ──
@@ -794,8 +798,19 @@ async def actor_main() -> None:
             # ── Slack notification ──
             elapsed_min = (_time() - pipeline_start) / 60
             cost_breakdown: dict[str, float] = {}
-            if config.ANTHROPIC_API_KEY:
-                cost_breakdown["Anthropic (Haiku)"] = round(total * 0.001, 3)
+            # Real LLM cost from measured token usage this run (not a flat
+            # per-record guess). Reset happens at pipeline start; see below.
+            import llm_client
+            _llm_usage = llm_client.get_usage()
+            if _llm_usage["calls"]:
+                cost_breakdown["Anthropic (Haiku)"] = round(
+                    llm_client.estimate_cost_usd(_llm_usage), 3
+                )
+                logging.info(
+                    "LLM usage this run: %d calls, %d in / %d out tokens (%s)",
+                    _llm_usage["calls"], _llm_usage["input_tokens"],
+                    _llm_usage["output_tokens"], _llm_usage["by_model"],
+                )
             if tracerfy_stats and tracerfy_stats.get("cost", 0) > 0:
                 cost_breakdown["Tracerfy"] = round(tracerfy_stats["cost"], 2)
             smarty_count = sum(1 for n in notices if n.dpv_match_code)
@@ -2049,6 +2064,26 @@ def cli_main() -> None:
             print(f"Report: {result['report_path']}")
             print(f"Processed {stats['total']} records at depth {args.depth}")
             print(f"Phones: {stats['phones_found']} | Deceased: {stats['deceased_confirmed']} | DMs: {stats['dms_identified']}")
+            print(
+                f"LLM tokens: {stats['llm_total_tokens']:,} total | "
+                f"{stats['avg_tokens_per_record']:,.0f}/record | "
+                f"{stats['llm_input_tokens']:,} in / {stats['llm_output_tokens']:,} out | "
+                f"${stats['llm_cost_usd']:.4f}"
+            )
+            # Slack post (on by default when a webhook is configured; --no-slack suppresses)
+            if config.SLACK_WEBHOOK_URL and not getattr(args, "no_slack", False):
+                try:
+                    from slack_notifier import _send_webhook
+                    avg = stats["avg_tokens_per_record"]
+                    _send_webhook(
+                        "*SiftStack — Deep Prospect*\n"
+                        f"{stats['total']} records · ${stats['llm_cost_usd']:.2f} total · "
+                        f"${stats['llm_cost_usd'] / max(1, stats['total']):.3f}/record · "
+                        f"{stats['avg_tokens_per_record']:,.0f} tokens/record · "
+                        f"{stats['phones_found']} phones · {stats['deceased_confirmed']} deceased"
+                    )
+                except Exception:
+                    logger.exception("Deep-prospect Slack post failed")
         return
 
     if args.mode == "lead-manage":
@@ -2432,6 +2467,20 @@ def _run_scrape_pipeline(args, targets) -> None:
         except Exception:
             logging.exception("Report generator import failed")
 
+    # Log this run's measured LLM token usage (CLI is a fresh process, so the
+    # meter already started at 0 — no reset needed here).
+    try:
+        import llm_client
+        _u = llm_client.get_usage()
+        if _u["calls"]:
+            logging.info(
+                "LLM usage this run: %d calls, %d in / %d out tokens, $%.4f (%s)",
+                _u["calls"], _u["input_tokens"], _u["output_tokens"],
+                llm_client.estimate_cost_usd(_u), _u["by_model"],
+            )
+    except Exception:
+        logging.exception("LLM usage summary failed")
+
     # DataSift-ready CSV generation + Drive upload (always run).
     # Playwright auto-upload to DataSift is opt-in via --upload-datasift.
     upload_result = None
@@ -2665,8 +2714,22 @@ def _run_scrape_pipeline(args, targets) -> None:
             build_rawpipe_block,
         )
 
-        # TIGHTFEED ①: slim daily report (suppressed when notices is empty)
-        send_slack_notification(notices)
+        # TIGHTFEED ①: slim daily report (suppressed when notices is empty).
+        # Real LLM cost from measured token usage this run.
+        cli_cost_breakdown: dict[str, float] = {}
+        try:
+            import llm_client
+            _u = llm_client.get_usage()
+            if _u["calls"]:
+                cli_cost_breakdown["Anthropic (Haiku)"] = round(
+                    llm_client.estimate_cost_usd(_u), 3
+                )
+        except Exception:
+            logging.exception("LLM cost computation failed")
+        send_slack_notification(
+            notices,
+            cost_breakdown=cli_cost_breakdown or None,
+        )
 
         # TIGHTFEED ②: RAWPIPE upload summary (CLI-side, fired when
         # --upload-datasift-api was used and produced api_results).

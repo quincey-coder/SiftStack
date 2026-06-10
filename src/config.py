@@ -62,6 +62,20 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")       # OpenRouter API 
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "qwen/qwen-2.5-72b-instruct")
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 
+# Per-call token-usage DEBUG logging (the accumulator always runs; this only
+# gates the noisy per-call log line). Set LLM_USAGE_LOG=0 to silence.
+LLM_USAGE_LOG = os.getenv("LLM_USAGE_LOG", "1") not in ("0", "false", "False", "")
+
+# USD pricing per 1M tokens: {model: (input_per_M, output_per_M)}.
+# Used to convert measured token usage into the Slack "Run cost" figure.
+# NOTE: verify these against current Anthropic/OpenRouter pricing — rates drift.
+LLM_PRICING = {
+    "claude-haiku-4-5-20251001": (1.0, 5.0),   # Haiku 4.5
+    "claude-haiku-4-5": (1.0, 5.0),
+}
+# Fallback rate (per 1M in, out) for any model not in LLM_PRICING.
+LLM_PRICING_DEFAULT = (1.0, 5.0)
+
 # ── Rate Limiting ──────────────────────────────────────────────────────
 REQUEST_DELAY_MIN = 2.0  # seconds between requests
 REQUEST_DELAY_MAX = 3.0

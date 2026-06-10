@@ -24,6 +24,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
 import config
+from llm_client import get_usage, reset_usage, estimate_cost_usd
 from notice_parser import NoticeData
 
 logger = logging.getLogger(__name__)
@@ -278,16 +279,36 @@ async def run_deep_prospecting(csv_path: str, depth: int = 3,
     logger.info("Processing %d records at depth %d (%s)",
                 len(records), depth, DEPTH_NAMES.get(depth, "Unknown"))
 
+    # Token meter: reset so this batch's run-total is isolated from any prior
+    # work in the same process (Apify Actor / dropbox-watch loops). Per-record
+    # numbers below use snapshot-diff so they're correct regardless.
+    reset_usage()
+    run_start = get_usage()
+
     results = []
     for i, row in enumerate(records):
         notice = _record_to_notice(row)
+        before = get_usage()
         result = await prospect_record(notice, depth)
+        after = get_usage()
+        di = after["input_tokens"] - before["input_tokens"]
+        do = after["output_tokens"] - before["output_tokens"]
+        if di or do:
+            logger.info("Tokens for %s: %d in + %d out = %d",
+                        notice.address, di, do, di + do)
         results.append(result)
         if (i + 1) % 10 == 0:
             logger.info("Processed %d/%d records", i + 1, len(records))
 
     # Generate report
     report_path = _generate_dp_report(results, depth, output_path)
+
+    # Token usage for this run = final meter minus the pre-loop snapshot.
+    run_end = get_usage()
+    in_tok = run_end["input_tokens"] - run_start["input_tokens"]
+    out_tok = run_end["output_tokens"] - run_start["output_tokens"]
+    n_calls = run_end["calls"] - run_start["calls"]
+    total_tok = in_tok + out_tok
 
     # Summary stats
     stats = {
@@ -298,11 +319,20 @@ async def run_deep_prospecting(csv_path: str, depth: int = 3,
         "dms_identified": sum(1 for r in results if r.decision_maker),
         "title_issues": sum(1 for r in results if r.title_issues),
         "attorney_referrals": sum(1 for r in results if r.attorney_referral_needed),
+        "llm_calls": n_calls,
+        "llm_input_tokens": in_tok,
+        "llm_output_tokens": out_tok,
+        "llm_total_tokens": total_tok,
+        "avg_tokens_per_record": total_tok / max(1, len(results)),
+        "llm_cost_usd": estimate_cost_usd(run_end),
     }
 
     logger.info("Deep prospecting complete: %d records, %d phones, %d deceased, %d DMs, %d title issues",
                 stats["total"], stats["phones_found"], stats["deceased_confirmed"],
                 stats["dms_identified"], stats["title_issues"])
+    logger.info("LLM usage: %d calls, %d tokens (%d in / %d out), $%.4f, %.0f tokens/record",
+                n_calls, total_tok, in_tok, out_tok, stats["llm_cost_usd"],
+                stats["avg_tokens_per_record"])
 
     return {
         "results": results,
