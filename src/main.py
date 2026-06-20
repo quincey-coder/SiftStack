@@ -190,6 +190,15 @@ async def actor_main() -> None:
     from apify import Actor
     from time import time as _time
     from scrapers import travis_texdel_state as _texdel_state
+    from scrapers import tax_delinquent_state as _gtexdel_state
+
+    # Bell + Williamson share the generic, county-parameterized texdel state
+    # module. (county, KVS key) pairs — slugs match county.lower() cache keys
+    # and the *_texdel_state naming Travis uses.
+    _GENERIC_TEXDEL = (
+        ("Bell", "bell_texdel_state"),
+        ("Williamson", "williamson_texdel_state"),
+    )
 
     logging.basicConfig(
         level=logging.INFO,
@@ -324,12 +333,20 @@ async def actor_main() -> None:
                 await Actor.fail(status_message="Missing apify_token input")
                 return
             _user_client = ApifyClientAsync(_user_token)
+            # Store name is configurable so test runs can target a throwaway
+            # KVS instead of perturbing production cross-run state. Default is
+            # unchanged, so normal runs behave exactly as before.
+            _state_kvs_name = (
+                actor_input.get("state_kvs_name")
+                or os.environ.get("SIFT_STATE_KVS_NAME")
+                or "sift-stack-state"
+            )
             _kvs_info = await _user_client.key_value_stores().get_or_create(
-                name="sift-stack-state",
+                name=_state_kvs_name,
             )
             _state_kvs = _user_client.key_value_store(_kvs_info["id"])
             Actor.log.info(
-                "Cross-run KVS 'sift-stack-state' opened (id=%s)", _kvs_info["id"],
+                "Cross-run KVS '%s' opened (id=%s)", _state_kvs_name, _kvs_info["id"],
             )
 
             # Thin async wrappers mirroring the Actor-SDK KVS API so downstream
@@ -380,6 +397,21 @@ async def actor_main() -> None:
                 stored_texdel.get("last_run_date", "(none)"),
                 len(stored_texdel.get("last_run_apns") or []),
             )
+
+            # ── Load Bell + Williamson tax-delinquent state ──
+            # MUST run before scrape_targets() below: the Bell/Williamson
+            # scrapers call load_state(county) during the scrape, which reads
+            # the in-memory cache we seed here. Without this inject, prev_apns
+            # is always empty → every run reports "first run — seeding".
+            for _cty, _key in _GENERIC_TEXDEL:
+                _stored = await kvs.get_value(_key) or _gtexdel_state._empty_state()
+                _gtexdel_state.inject_apify_state(_cty, _stored)
+                Actor.log.info(
+                    "Loaded %s texdel state: last_run_date=%s, last_run_apns=%d",
+                    _cty,
+                    _stored.get("last_run_date", "(none)"),
+                    len(_stored.get("last_run_apns") or []),
+                )
 
             # ── Scrape ────────────────────────────────────────────
             from scrapers import scrape_targets
@@ -486,6 +518,11 @@ async def actor_main() -> None:
                     "travis_texdel_state",
                     _texdel_state.snapshot_apify_state(),
                 )
+                # Parity with Travis above: persist Bell/Williamson texdel
+                # state on the empty-run path too, so a roll change that
+                # produced no surviving notices still updates the baseline.
+                for _cty, _key in _GENERIC_TEXDEL:
+                    await kvs.set_value(_key, _gtexdel_state.snapshot_apify_state(_cty))
                 if do_notify_slack and config.SLACK_WEBHOOK_URL:
                     try:
                         from slack_notifier import send_slack_notification
@@ -809,6 +846,26 @@ async def actor_main() -> None:
             except Exception as e:
                 Actor.log.warning("Failed to drain texdel buffers to KVS: %s", e)
 
+            # ── Drain Bell + Williamson texdel buffers to KVS (raw XLSX + reports) ──
+            try:
+                for _cty, _ in _GENERIC_TEXDEL:
+                    _slug = _cty.lower()
+                    for filename, raw_bytes in _gtexdel_state.drain_apify_raw(_cty)[-7:]:
+                        # Retention: keep only the most recent 7 raw XLSX files
+                        await kvs.set_value(
+                            f"{_slug}_tax_raw_{filename}",
+                            raw_bytes,
+                            content_type="application/octet-stream",
+                        )
+                    for filename, json_text in _gtexdel_state.drain_apify_reports(_cty):
+                        await kvs.set_value(
+                            f"{_slug}_texdel_{filename}",
+                            json_text,
+                            content_type="application/json",
+                        )
+            except Exception as e:
+                Actor.log.warning("Failed to drain Bell/Williamson texdel buffers to KVS: %s", e)
+
             # ── Slack notification ──
             elapsed_min = (_time() - pipeline_start) / 60
             cost_breakdown: dict[str, float] = {}
@@ -918,6 +975,15 @@ async def actor_main() -> None:
                 datetime.now().strftime("%Y-%m-%d"),
                 len(seen_ids),
                 len(_texdel_state.snapshot_apify_state().get("last_run_apns") or []),
+            )
+
+            # ── Persist Bell + Williamson texdel state for next run ──
+            for _cty, _key in _GENERIC_TEXDEL:
+                await kvs.set_value(_key, _gtexdel_state.snapshot_apify_state(_cty))
+            Actor.log.info(
+                "Saved Bell/Williamson texdel state: bell=%d, williamson=%d APNs",
+                len(_gtexdel_state.snapshot_apify_state("Bell").get("last_run_apns") or []),
+                len(_gtexdel_state.snapshot_apify_state("Williamson").get("last_run_apns") or []),
             )
 
             Actor.log.info("Done — %d notices exported (%.1f min)", total, elapsed_min)

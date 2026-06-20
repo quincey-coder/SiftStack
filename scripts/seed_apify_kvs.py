@@ -7,7 +7,13 @@ picks up where the local CLI left off — same `seen_notice_ids`, same
 What gets seeded (under the named KVS `sift-stack-state`):
   - `last_run_date`     ← last_run.json
   - `seen_notice_ids`   ← seen_ids.json (sorted list of dedup keys)
-  - `travis_texdel_state` ← data/travis_tax_state/tax_delinquent_travis_state.json
+  - `travis_texdel_state`     ← data/travis_tax_state/tax_delinquent_travis_state.json
+  - `bell_texdel_state`       ← data/bell_tax_state/tax_delinquent_bell_state.json (if present)
+  - `williamson_texdel_state` ← data/williamson_tax_state/tax_delinquent_williamson_state.json (if present)
+
+Bell/Williamson are optional — skipped if their local state file doesn't exist
+(the first cloud run will self-seed). Otherwise this hands the cloud a baseline
+from a known-good local run so the very first cloud diff is meaningful.
 
 Auth: reads APIFY_TOKEN from .env (via python-dotenv).
 
@@ -45,6 +51,13 @@ SEEN_IDS_PATH = PROJECT_ROOT / "seen_ids.json"
 LAST_RUN_PATH = PROJECT_ROOT / "last_run.json"
 TEXDEL_STATE_PATH = PROJECT_ROOT / "data" / "travis_tax_state" / "tax_delinquent_travis_state.json"
 
+# Bell + Williamson share the generic county-parameterized state module; their
+# local state lives under data/{county}_tax_state/. Optional — skipped if absent.
+GENERIC_TEXDEL = (
+    ("bell_texdel_state", PROJECT_ROOT / "data" / "bell_tax_state" / "tax_delinquent_bell_state.json"),
+    ("williamson_texdel_state", PROJECT_ROOT / "data" / "williamson_tax_state" / "tax_delinquent_williamson_state.json"),
+)
+
 
 def _load_json_or_exit(path: Path) -> object:
     if not path.exists():
@@ -55,6 +68,21 @@ def _load_json_or_exit(path: Path) -> object:
     except json.JSONDecodeError as e:
         print(f"ERROR: {path} is not valid JSON: {e}", file=sys.stderr)
         sys.exit(1)
+
+
+def _load_json_optional(path: Path) -> dict | None:
+    """Load a state dict if it exists; return None (skip) if it doesn't."""
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError as e:
+        print(f"WARN: {path} is not valid JSON ({e}) — skipping.", file=sys.stderr)
+        return None
+    if not isinstance(data, dict):
+        print(f"WARN: {path} is not a dict — skipping.", file=sys.stderr)
+        return None
+    return data
 
 
 def main() -> int:
@@ -79,6 +107,11 @@ def main() -> int:
     last_run = _load_json_or_exit(LAST_RUN_PATH)
     seen_ids = _load_json_or_exit(SEEN_IDS_PATH)
     texdel_state = _load_json_or_exit(TEXDEL_STATE_PATH)
+    generic_states = [
+        (key, state)
+        for key, path in GENERIC_TEXDEL
+        if (state := _load_json_optional(path)) is not None
+    ]
 
     last_run_date = last_run.get("last_run_date") if isinstance(last_run, dict) else None
     if not last_run_date:
@@ -104,6 +137,13 @@ def main() -> int:
     print(f"  last_run_date       : {last_run_date}")
     print(f"  seen_notice_ids     : {seen_count:,} keys")
     print(f"  travis_texdel_state : last_run_apns={texdel_apn_count:,}, master_apns={texdel_master_count:,}")
+    for key, state in generic_states:
+        apn_count = len(state.get("last_run_apns") or [])
+        master_count = len(state.get("master_apns") or [])
+        print(f"  {key:<19} : last_run_apns={apn_count:,}, master_apns={master_count:,}")
+    skipped = [key for key, _ in GENERIC_TEXDEL if key not in {k for k, _ in generic_states}]
+    for key in skipped:
+        print(f"  {key:<19} : (no local state file — will self-seed on first cloud run)")
 
     if args.dry_run:
         print("\n[DRY RUN] No writes performed.")
@@ -135,6 +175,10 @@ def main() -> int:
 
     kvs.set_record("travis_texdel_state", texdel_state)
     print(f"  ✓ travis_texdel_state (last_run_apns={texdel_apn_count:,})")
+
+    for key, state in generic_states:
+        kvs.set_record(key, state)
+        print(f"  ✓ {key} (last_run_apns={len(state.get('last_run_apns') or []):,})")
 
     print("\nDone. The next Apify Actor run will pick up from this state.")
     print(f"Verify in Apify Console: Storage → Key-value stores → {args.kvs_name}")

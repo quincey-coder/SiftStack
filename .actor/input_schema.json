@@ -242,6 +242,13 @@
             "default": true,
             "editor": "checkbox"
         },
+        "state_kvs_name": {
+            "title": "Cross-run State KVS Name",
+            "type": "string",
+            "description": "Named key-value store for cross-run state (last_run_date, seen_notice_ids, *_texdel_state). Leave empty for the production default 'sift-stack-state'. Set to a throwaway name (e.g. 'sift-stack-state-test') to verify state round-trips without perturbing production.",
+            "editor": "textfield",
+            "default": ""
+        },
 
         "upload_datasift_api": {
             "title": "Auto-upload to DataSift (RAWPIPE)",
