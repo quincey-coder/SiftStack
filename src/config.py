@@ -55,7 +55,11 @@ DROPBOX_REFRESH_TOKEN = os.getenv("DROPBOX_REFRESH_TOKEN", "")
 
 # ── LLM Backend ──────────────────────────────────────────────────────
 LLM_BACKEND = os.getenv("LLM_BACKEND", "anthropic")           # "anthropic", "ollama", or "openrouter"
-LLM_MODEL = os.getenv("LLM_MODEL", "claude-haiku-4-5-20251001")  # Anthropic model name
+LLM_MODEL = os.getenv("LLM_MODEL", "claude-haiku-4-5-20251001")  # Anthropic model name (default for all LLM calls)
+# High-stakes obituary identity + heir/survivor extraction uses a stronger model.
+# Getting the heir/decision-maker chain right is critical: a wrong heir map sends
+# the whole deal down the wrong path, so this defaults to Sonnet rather than Haiku.
+OBITUARY_LLM_MODEL = os.getenv("OBITUARY_LLM_MODEL", "claude-sonnet-4-6")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")        # Local Ollama model
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1/")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")       # OpenRouter API key
@@ -72,6 +76,9 @@ LLM_USAGE_LOG = os.getenv("LLM_USAGE_LOG", "1") not in ("0", "false", "False", "
 LLM_PRICING = {
     "claude-haiku-4-5-20251001": (1.0, 5.0),   # Haiku 4.5
     "claude-haiku-4-5": (1.0, 5.0),
+    # Heir/survivor extraction runs on Sonnet (OBITUARY_LLM_MODEL); price it
+    # correctly so the run-cost report doesn't undercount it at the Haiku rate.
+    "claude-sonnet-4-6": (3.0, 15.0),          # Sonnet 4.6
 }
 # Fallback rate (per 1M in, out) for any model not in LLM_PRICING.
 LLM_PRICING_DEFAULT = (1.0, 5.0)
