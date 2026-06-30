@@ -23,6 +23,9 @@ from openpyxl.utils import get_column_letter
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT_DIR = ROOT / "output"
 
+sys.path.insert(0, str(ROOT / "src"))
+import buyer_composition as bc  # noqa: E402
+
 FRED_DOM_BASELINE = 73
 
 HEADER_FONT = Font(bold=True, color="FFFFFF", size=11)
@@ -1005,6 +1008,148 @@ def build_data_sources(wb, source_path, county):
     ws.column_dimensions["D"].width = 50
 
 
+def build_buyer_composition(wb, data, county):
+    """Sheet decomposing the 'investor transactions' headline by actual buyer type,
+    so builders / iBuyers / lenders don't get mistaken for the local cash-buyer pool."""
+    ws = wb.create_sheet("Buyer Composition")
+    try:
+        a = bc.analyze_county(county)
+    except Exception as e:  # dataset missing — degrade gracefully, keep report valid
+        ws["A1"] = f"Buyer composition unavailable: {e}"
+        ws["A1"].font = SECTION_FONT
+        return
+    if not a["rows"]:
+        ws["A1"] = f"No buyer-entity data for {county} County in nationwide_buyers.csv"
+        ws["A1"].font = SECTION_FONT
+        return
+
+    ws["A1"] = f"{county.upper()} COUNTY — BUYER COMPOSITION (who is actually buying)"
+    ws["A1"].font = TITLE_FONT
+    ws.merge_cells("A1:F1")
+    ws["A2"] = ("The 'investor transactions' headline lumps builders, iBuyers/SFR funds, and "
+                "lenders in with local investors. Only the last group is your wholesale buyer pool.")
+    ws["A2"].font = SUBTITLE_FONT
+    ws.merge_cells("A2:F2")
+    ws["A3"] = ("Source: nationwide_buyers.csv (county deed records, trailing 6-mo investor "
+                "purchases by buyer entity). Classification by entity name — best-effort.")
+    ws["A3"].font = SUBTITLE_FONT
+    ws.merge_cells("A3:F3")
+
+    # ── A. Volume by category ──────────────────────────────────────────
+    r = 5
+    ws.cell(row=r, column=1, value="A. Volume by Buyer Category (trailing 6-mo purchases)").font = SECTION_FONT
+    ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=6)
+    r += 1
+    for i, h in enumerate(["Category", "Entities", "6-Mo Purchases", "% of Volume",
+                           "In your buyer pool?", ""]):
+        ws.cell(row=r, column=i + 1, value=h)
+    style_header_row(ws, r, 5)
+    r += 1
+    start = r
+    order = [bc.CAT_INSTITUTIONAL, bc.CAT_BUILDER, bc.CAT_LENDER, bc.CAT_GOV, bc.CAT_LOCAL]
+    for cat in order:
+        v = a["by_category"].get(cat)
+        if not v:
+            continue
+        is_local = cat == bc.CAT_LOCAL
+        ws.cell(row=r, column=1, value=cat)
+        ws.cell(row=r, column=2, value=v["entities"])
+        ws.cell(row=r, column=3, value=v["purchases"])
+        ws.cell(row=r, column=4, value=v["pct"] / 100).number_format = "0.0%"
+        ws.cell(row=r, column=5, value="YES — local pool" if is_local else "No — excluded skew")
+        fill = TIER1_FILL if is_local else NEG_FILL
+        for c in range(1, 6):
+            ws.cell(row=r, column=c).fill = fill
+        r += 1
+    ws.cell(row=r, column=1, value="TOTAL (headline 'investor' volume)").font = HEADER_FONT
+    ws.cell(row=r, column=1).fill = HEADER_FILL
+    tcell = ws.cell(row=r, column=2, value=a["total_entities"]); tcell.font = HEADER_FONT; tcell.fill = HEADER_FILL
+    tcell = ws.cell(row=r, column=3, value=a["total_purchases"]); tcell.font = HEADER_FONT; tcell.fill = HEADER_FILL
+    tcell = ws.cell(row=r, column=4, value=1.0); tcell.number_format = "0.0%"; tcell.font = HEADER_FONT; tcell.fill = HEADER_FILL
+    ws.cell(row=r, column=5).fill = HEADER_FILL
+    apply_borders(ws, start - 1, r, 1, 5)
+
+    # ── B. Headline correction ─────────────────────────────────────────
+    zips = data["zip_data"]
+    mf_monthly = sum((z["total_inv_trans_6mo"] or 0) for z in zips) / 6
+    corrected = mf_monthly * a["local_pct"] / 100
+    r += 2
+    ws.cell(row=r, column=1, value="B. Headline Correction").font = SECTION_FONT
+    ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=6)
+    r += 1
+    for line in [
+        f"Market Finder headline: ~{mf_monthly:,.0f} investor transactions/mo across {len(zips)} ZIPs.",
+        f"Builder + iBuyer + lender + gov share (deed records): {a['excluded_skew_pct']:.0f}% of volume — NOT your buyers.",
+        f"Genuine local investor share: {a['local_pct']:.0f}% ({len(a['local_rows'])} distinct local entities).",
+        f"==> Effective LOCAL cash-buyer flow ~{corrected:,.0f}/mo. Treat the headline count as inflated for buyer-pool depth.",
+    ]:
+        c = ws.cell(row=r, column=1, value=line)
+        if line.startswith("==>"):
+            c.font = Font(bold=True, color="C00000")
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=6)
+        r += 1
+
+    # ── C. Top genuine local buyers ────────────────────────────────────
+    r += 1
+    ws.cell(row=r, column=1, value="C. Top Genuine Local Buyers (your real cash-buyer pool)").font = SECTION_FONT
+    ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=6)
+    r += 1
+    for i, h in enumerate(["Rank", "Buyer Entity", "Entity Type", "6-Mo Buys", "City", "State"]):
+        ws.cell(row=r, column=i + 1, value=h)
+    style_header_row(ws, r, 6)
+    r += 1
+    for i, b in enumerate(a["top_local"][:15], 1):
+        ws.cell(row=r, column=1, value=i)
+        ws.cell(row=r, column=2, value=b["entity"])
+        ws.cell(row=r, column=3, value=b["entity_type"])
+        ws.cell(row=r, column=4, value=b["purchases"])
+        ws.cell(row=r, column=5, value=b["city"])
+        ws.cell(row=r, column=6, value=b["state"])
+        for c in range(1, 7):
+            ws.cell(row=r, column=c).fill = TIER1_FILL
+        r += 1
+    apply_borders(ws, r - 15, r - 1, 1, 6)
+
+    # ── D. Top excluded buyers (transparency) ──────────────────────────
+    r += 1
+    ws.cell(row=r, column=1, value="D. Largest Excluded Buyers (builders / iBuyers / lenders skewing the headline)").font = SECTION_FONT
+    ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=6)
+    r += 1
+    for i, h in enumerate(["Buyer Entity", "Category", "6-Mo Buys", "City", "State", ""]):
+        ws.cell(row=r, column=i + 1, value=h)
+    style_header_row(ws, r, 5)
+    r += 1
+    n_exc = len(a["top_excluded"])
+    for b in a["top_excluded"]:
+        ws.cell(row=r, column=1, value=b["entity"])
+        ws.cell(row=r, column=2, value=b["category"])
+        ws.cell(row=r, column=3, value=b["purchases"])
+        ws.cell(row=r, column=4, value=b["city"])
+        ws.cell(row=r, column=5, value=b["state"])
+        for c in range(1, 6):
+            ws.cell(row=r, column=c).fill = NEG_FILL
+        r += 1
+    apply_borders(ws, r - n_exc, r - 1, 1, 5)
+
+    # ── Methodology ────────────────────────────────────────────────────
+    r += 2
+    ws.cell(row=r, column=1, value="Method & caveats").font = SECTION_FONT
+    ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=6)
+    for line in [
+        "Categories assigned by buyer-entity name keywords (see src/buyer_composition.py) — a heuristic, not exact.",
+        "Some opaque shells (e.g. generic 'XYZ LLC') can't be classified and remain in the local pool, so local % is an UPPER bound.",
+        "Buyer dataset is county-level (no ZIP); it doesn't reconcile 1:1 with Market Finder counts (different source/window).",
+        "Use this to discount headline buyer-pool depth and to seed a clean cash-buyer list — not as exact transaction counts.",
+    ]:
+        r += 1
+        ws.cell(row=r, column=1, value=f"• {line}")
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=6)
+
+    widths = [40, 24, 16, 12, 18, 10]
+    for i, w in enumerate(widths):
+        ws.column_dimensions[get_column_letter(i + 1)].width = w
+
+
 def main():
     county = sys.argv[1] if len(sys.argv) > 1 else "Travis"
     if county not in COUNTY_CONFIG:
@@ -1019,6 +1164,7 @@ def main():
     build_economic(wb, county, cfg)
     build_crime(wb, county, cfg)
     build_recommendations(wb, data, county, cfg)
+    build_buyer_composition(wb, data, county)
     build_data_sources(wb, src, county)
 
     out = OUTPUT_DIR / f"{county}_County_TX_Market_Research.xlsx"
