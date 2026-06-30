@@ -243,6 +243,66 @@ class DataSiftAPIClient:
         """Return subscription info: {name, price, interval, valid_until, addons}."""
         return self._request_json("GET", "/api/internal/account/subscription/")
 
+    # ─── Records search + status reads ───────────────────────────
+    #
+    # The Records page (and SiftMap selection, skip-trace, etc.) all run
+    # through one search endpoint. It's a POST that the SPA tunnels as a
+    # GET via the `X-HTTP-Method-Override: GET` header — so the body is a
+    # GET-style filter, not a mutation. Body shape (verified live 2026-06):
+    #
+    #   {"offset": 0, "limit": N, "query": {"must": { <filters> }}}
+    #
+    # Response: {"count": <total matching>, "data": [...], "results": [...]}.
+    # An empty `must` returns 400 "Filter can't be empty" — always pass at
+    # least one filter key. Useful filter keys (property/seller side):
+    #   any_property_status: [<status uuid>, ...]   — scope to lead stages
+    #   tasks_incomplete:    [min, max]             — open-task count range
+    #   tasks_complete / tasks_total: [min, max]
+    #   property_type: "clean"
+    # `tasks_incomplete: [0, 0]` == "has no open task" (the quality check).
+
+    def get_statuses(self, mode: str = "property") -> list[dict]:
+        """List the account's status stages. mode: 'property' or 'contact'.
+
+        Returns dicts with at least {uuid, title}. The property side holds
+        the seller-lead stages (new_lead, Hot/Warm/Cold Lead, …); the
+        contact side holds buyer/vendor stages.
+        """
+        namespace = "properties" if mode == "property" else "contacts"
+        data = self._request_json(
+            "GET", f"/api/internal/{namespace}/status/?offset=0&limit=999"
+        )
+        return data.get("results", []) if isinstance(data, dict) else data
+
+    def search_records(
+        self,
+        must: dict,
+        *,
+        mode: str = "property",
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict:
+        """Run a read-only records search. Returns the raw {count, results}.
+
+        `must` is the Elasticsearch-style filter object (see class notes).
+        mode 'property' hits /property/, 'owner' hits /owner/. Read-only:
+        the GET method-override means this never mutates anything.
+        """
+        endpoint = "/api/internal/property/" if mode == "property" else "/api/internal/owner/"
+        resp = self._request(
+            "POST",
+            endpoint,
+            json={"offset": offset, "limit": limit, "query": {"must": must}},
+            headers={"X-HTTP-Method-Override": "GET"},
+        )
+        if resp.status_code >= 400:
+            raise DataSiftAPIError(resp.status_code, resp.text, endpoint)
+        return resp.json()
+
+    def count_records(self, must: dict, *, mode: str = "property") -> int:
+        """Return just the total count for a filter (limit=1 to stay light)."""
+        return int(self.search_records(must, mode=mode, limit=1).get("count", 0))
+
     # ─── Skip-trace ──────────────────────────────────────────────
     #
     # Endpoint discovered from the SPA's bundled main.min.js (DataSift
