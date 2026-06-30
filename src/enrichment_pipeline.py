@@ -449,6 +449,42 @@ def run_enrichment_pipeline(
         except Exception as e:
             logger.warning("  Probate property lookup failed: %s", e)
 
+    # ── Step 3c-lien: Lien Property Lookup ───────────────────────────
+    # County-clerk liens are NAME-indexed with no property address. Search the
+    # county CAD/tax roll by the debtor name to find the property they own
+    # in-county. Records with no match keep their blank address and drop out
+    # downstream (ZIP filter / row validation) — which also discards the mostly
+    # business-owned State Tax Liens automatically (the safety property).
+    lien_no_addr = [
+        n for n in notices
+        if n.notice_type == "lien"
+        and not n.address.strip()
+        and (n.tax_owner_name.strip() or n.owner_name.strip())
+        and n.county.lower() in ("travis", "bell", "williamson")
+    ]
+    if lien_no_addr:
+        logger.info("── Step 3c-lien: Lien Property Lookup (%d candidates) ──", len(lien_no_addr))
+        try:
+            from cad_lookup import lookup_property_by_name
+            found = 0
+            for n in lien_no_addr:
+                search_name = n.tax_owner_name.strip() or n.owner_name.strip()
+                try:
+                    result = lookup_property_by_name(search_name, n.county)
+                except Exception as e:
+                    logger.debug("  Lien CAD lookup error for %r: %s", search_name, e)
+                    continue
+                if result and result.get("address"):
+                    n.address = result["address"]
+                    n.city = result.get("city", "") or n.city
+                    n.zip = result.get("zip", "") or n.zip
+                    if result.get("parcel_id"):
+                        n.parcel_id = result["parcel_id"]
+                    found += 1
+            logger.info("  Lien property address found: %d/%d", found, len(lien_no_addr))
+        except Exception as e:
+            logger.warning("  Lien property lookup failed: %s", e)
+
     # ── Step 4: Parcel Address Lookup ────────────────────────────────
     if not opts.skip_parcel_lookup and not opts.skip_tax:
         candidates = [
@@ -489,6 +525,29 @@ def run_enrichment_pipeline(
             logger.warning("  Tax enrichment failed: %s", e)
     elif opts.has_tax:
         logger.info("── Step 5: Tax Delinquency (preserved — data already present) ──")
+        # has_tax is True whenever ANY record carries a parcel ID — including
+        # code-enforcement cases, which have a parcel but NO owner. Those still
+        # need a CAD owner to be skip-traceable, so resolve just the owner-less
+        # records (without re-running CAD on records that already have an owner).
+        if not opts.skip_tax:
+            ownerless = [
+                n for n in notices
+                if n.address.strip()
+                and not (n.owner_name or "").strip()
+                and not (n.tax_owner_name or "").strip()
+                and (n.county or "").lower() in ("travis", "bell", "williamson")
+            ]
+            if ownerless:
+                logger.info("  CAD owner resolution for %d owner-less record(s)", len(ownerless))
+                try:
+                    from tax_enricher import enrich_tax_delinquency
+                    enrich_tax_delinquency(ownerless)
+                    resolved = sum(1 for n in ownerless if n.tax_owner_name.strip())
+                    logger.info("  Owner resolved: %d/%d", resolved, len(ownerless))
+                except ImportError:
+                    logger.warning("  tax_enricher not available — skipping")
+                except Exception as e:
+                    logger.warning("  CAD owner resolution failed: %s", e)
     elif opts.skip_tax:
         logger.info("── Step 5: Tax Delinquency (skipped) ──")
 

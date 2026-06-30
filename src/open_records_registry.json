@@ -1,0 +1,303 @@
+{
+  "description": "Open-records (Texas Public Information Act) contact registry for code-enforcement records in Bell + Williamson counties. Drives the request/retrieve pipeline. Travis is NOT here — it has a live API (scrapers/code_enforcement_travis.py).",
+  "generated": "2026-06-27",
+  "legend": {
+    "submission_method": "Ordered preference: how to file a PIA request with this jurisdiction.",
+    "tier": "1 = covers an investor target ZIP (priority); 2 = incorporated city w/ code function, outside buy box; 3 = no real code-enforcement records (tiny town or county nuisance-only).",
+    "email_verified": "true only when a dedicated/named PIA inbox was confirmed on an official page. false = address is general/unverified/obfuscated — DO NOT auto-send without human confirmation.",
+    "accepts_email_pia": "yes | portal-only | form-required | unknown"
+  },
+  "jurisdictions": [
+    {
+      "city": "Killeen", "county": "Bell", "tier": 1, "has_code_enforcement": true,
+      "target_zips": ["76541", "76542", "76543", "76549"],
+      "submission_method": ["portal"],
+      "pia_email": "Citysec@killeentexas.gov", "email_verified": false,
+      "portal_url": "https://killeentx.justfoia.com/publicportal/home/newrequest", "portal_software": "JustFOIA",
+      "code_dept_phone": "254-501-7608", "code_dept_email": "code-enforcement@killeentexas.gov",
+      "accepts_email_pia": "portal-only",
+      "notes": "All PIA via JustFOIA portal (since Jan 2025). Email is a general City-Secretary inbox, not a designated PIA address. Mail alt: City Attorney's Office, PO Box 1329, Killeen 76540."
+    },
+    {
+      "city": "Temple", "county": "Bell", "tier": 1, "has_code_enforcement": true,
+      "target_zips": ["76502", "76504"],
+      "submission_method": ["portal", "email"],
+      "pia_email": "customercare@templetx.gov", "email_verified": false,
+      "portal_url": "https://cityoftempletx.nextrequest.com/", "portal_software": "NextRequest",
+      "code_dept_phone": "254-298-5670", "code_dept_email": "codecompliance@templetx.gov",
+      "accepts_email_pia": "yes",
+      "notes": "City Attorney's Office accepts email; NextRequest preferred. customercare@ is general intake, not a dedicated PIA inbox. PIR line 254-298-5674."
+    },
+    {
+      "city": "Belton", "county": "Bell", "tier": 1, "has_code_enforcement": true,
+      "target_zips": ["76513"],
+      "submission_method": ["email", "portal"],
+      "pia_email": "openrecords@beltontexas.gov", "email_verified": true,
+      "portal_url": "https://beltontexas.justfoia.com/publicportal/home/newrequest", "portal_software": "JustFOIA",
+      "code_dept_phone": "254-933-5840", "code_dept_email": null,
+      "accepts_email_pia": "yes",
+      "notes": "Verified dedicated PIA inbox. Code Compliance under PD (no direct email). Custodian Amy Casey acasey@beltontexas.gov. Domain is beltontexas.gov (NOT belton.org = Belton MO)."
+    },
+    {
+      "city": "Salado", "county": "Bell", "tier": 1, "has_code_enforcement": true,
+      "target_zips": ["76571"],
+      "submission_method": ["webform", "email"],
+      "pia_email": "vos@saladotx.gov", "email_verified": false,
+      "portal_url": "https://www.saladotx.gov/administration/webform/open-records-request-form", "portal_software": "native webform",
+      "code_dept_phone": "254-947-5060", "code_dept_email": "vos@saladotx.gov",
+      "accepts_email_pia": "unknown",
+      "notes": "Village. Online webform is the stated method; email acceptance unconfirmed. vos@ is general inbox. Labor fee $15/hr only if 51+ pages."
+    },
+    {
+      "city": "Harker Heights", "county": "Bell", "tier": 2, "has_code_enforcement": true,
+      "target_zips": ["76548"],
+      "submission_method": ["portal"],
+      "pia_email": null, "email_verified": false,
+      "portal_url": "https://harkerheights.civicweb.net/Portal/", "portal_software": "CivicWeb",
+      "code_dept_phone": "254-953-5600", "code_dept_email": null,
+      "accepts_email_pia": "yes",
+      "notes": "PIA email JS-cloaked; only ContactUs@HarkerHeights.Gov (general) decodable. Use CivicWeb portal. Do NOT trust the unconfirmed hhadmin@ address."
+    },
+    {
+      "city": "Copperas Cove", "county": "Bell", "tier": 2, "has_code_enforcement": true,
+      "target_zips": ["76522"],
+      "submission_method": ["portal"],
+      "pia_email": null, "email_verified": false,
+      "portal_url": "https://copperascovetx.mycusthelp.com/", "portal_software": "GovQA",
+      "code_dept_phone": "254-542-8966", "code_dept_email": "codecompliance@copperascovetx.gov",
+      "accepts_email_pia": "unknown",
+      "notes": "Primarily Coryell County. GovQA portal; no published PIA email. PDRecords@ is police-only. PIA form PDF exists."
+    },
+    {
+      "city": "Nolanville", "county": "Bell", "tier": 2, "has_code_enforcement": true,
+      "target_zips": ["76559"],
+      "submission_method": ["email", "form"],
+      "pia_email": "publicinformationrequests@nolanvilletx.gov", "email_verified": true,
+      "portal_url": null, "portal_software": "none",
+      "code_dept_phone": "254-698-6335", "code_dept_email": "jnavarro@nolanvilletx.gov",
+      "accepts_email_pia": "yes",
+      "notes": "Verified dedicated PIA inbox. Code handled by Planning Coordinator Jessica Navarro (no standalone officer)."
+    },
+    {
+      "city": "Troy", "county": "Bell", "tier": 3, "has_code_enforcement": true,
+      "target_zips": ["76579"],
+      "submission_method": ["fax", "mail"],
+      "pia_email": null, "email_verified": false,
+      "portal_url": null, "portal_software": "none",
+      "code_dept_phone": "254-938-2505", "code_dept_email": null,
+      "accepts_email_pia": "form-required",
+      "notes": "Fax 254.938.0440 / mail / in-person only; no PIA email or portal. Separate PD-records path."
+    },
+    {
+      "city": "Morgan's Point Resort", "county": "Bell", "tier": 3, "has_code_enforcement": true,
+      "target_zips": ["76513"],
+      "submission_method": ["email", "form"],
+      "pia_email": "kelli.merolillo@mprtx.gov", "email_verified": true,
+      "portal_url": null, "portal_software": "none",
+      "code_dept_phone": "254-780-1334", "code_dept_email": "BuildingAndSafety@mprtx.us",
+      "accepts_email_pia": "yes",
+      "notes": "City Secretary is designated PIO. Domain mprtx.gov. NOT Morgan's Point in Harris County."
+    },
+    {
+      "city": "Rogers", "county": "Bell", "tier": 3, "has_code_enforcement": true,
+      "target_zips": ["76569"],
+      "submission_method": ["email", "mail"],
+      "pia_email": "citysecretary@rogerstx.org", "email_verified": false,
+      "portal_url": null, "portal_software": "none",
+      "code_dept_phone": "254-642-3312", "code_dept_email": null,
+      "accepts_email_pia": "yes",
+      "notes": "Two city sites (cityofrogerstx.gov new, rogerstx.org old). Email lives only on old site; confirm it's still monitored."
+    },
+    {
+      "city": "Holland", "county": "Bell", "tier": 3, "has_code_enforcement": false,
+      "target_zips": ["76534"],
+      "submission_method": ["email", "form"],
+      "pia_email": "sdickey@hollandtx.gov", "email_verified": false,
+      "portal_url": null, "portal_software": "none",
+      "code_dept_phone": "254-657-2460", "code_dept_email": null,
+      "accepts_email_pia": "yes",
+      "notes": "Accepts email PIA. Code Compliance pages empty ('adding soon'). Domain mismatch: site cityofholland.org vs email hollandtx.gov — verify."
+    },
+    {
+      "city": "Little River-Academy", "county": "Bell", "tier": 3, "has_code_enforcement": false,
+      "target_zips": ["76554"],
+      "submission_method": ["form", "email"],
+      "pia_email": "CitySecretary@LittleRiverAcademy.us", "email_verified": false,
+      "portal_url": "https://littleriveracademy.us/city-request-forms/", "portal_software": "PDF forms",
+      "code_dept_phone": "254-982-4248", "code_dept_email": null,
+      "accepts_email_pia": "unknown",
+      "notes": "PDF forms; email acceptance not stated. No code enforcement dept."
+    },
+    {
+      "city": "Bartlett", "county": "Bell", "tier": 3, "has_code_enforcement": true,
+      "target_zips": ["76511"],
+      "submission_method": ["form", "email"],
+      "pia_email": "joseph.resendez@bartlett-tx.us", "email_verified": true,
+      "portal_url": null, "portal_software": "none",
+      "code_dept_phone": "254-527-3219", "code_dept_email": null,
+      "accepts_email_pia": "form-required",
+      "notes": "ONE city hall serves Bell + Williamson portions. Page still lists STALE clerk Brenda Kelley — current is Joseph Resendez. Code under PD. Labor $15/hr waived <50 pages."
+    },
+    {
+      "city": "Unincorporated Bell County", "county": "Bell", "tier": 3, "has_code_enforcement": false,
+      "target_zips": [],
+      "submission_method": ["email", "mail"],
+      "pia_email": "Shelley.Coston@Bellcounty.texas.gov", "email_verified": true,
+      "portal_url": null, "portal_software": "none",
+      "code_dept_phone": "254-831-2241", "code_dept_email": "FireRecords@bellcounty.texas.gov",
+      "accepts_email_pia": "yes",
+      "notes": "County does NO building/zoning code enforcement — only Ch.343 nuisance abatement via FIRE MARSHAL (FireRecords@). PIA coordinator = County Clerk Shelley Coston. The only NextRequest portal is Sheriff-only. Low yield."
+    },
+
+    {
+      "city": "Round Rock", "county": "Williamson", "tier": 1, "has_code_enforcement": true,
+      "target_zips": ["78664", "78665", "78681"],
+      "submission_method": ["email", "portal"],
+      "pia_email": "openrecords@roundrocktexas.gov", "email_verified": true,
+      "portal_url": "https://roundrocktx.mycusthelp.com/webapp/_rs/supporthome.aspx", "portal_software": "QScend/QAlert",
+      "code_dept_phone": "512-341-3329", "code_dept_email": null,
+      "accepts_email_pia": "yes",
+      "notes": "Verified dedicated PIA inbox + tracking portal that emails on completion. Code Enforcement Mgr Margie Lopez 512-218-7027."
+    },
+    {
+      "city": "Georgetown", "county": "Williamson", "tier": 1, "has_code_enforcement": true,
+      "target_zips": ["78628", "78633"],
+      "submission_method": ["email", "portal"],
+      "pia_email": "records@georgetowntexas.gov", "email_verified": true,
+      "portal_url": "https://records.georgetowntexas.gov/", "portal_software": "QScend/QAlert + Laserfiche",
+      "code_dept_phone": "512-930-3606", "code_dept_email": "codecompliance@georgetowntexas.gov",
+      "accepts_email_pia": "yes",
+      "notes": "Verified dedicated PIA inbox; also code dept email. Open Records Team 512-930-8473."
+    },
+    {
+      "city": "Cedar Park", "county": "Williamson", "tier": 1, "has_code_enforcement": true,
+      "target_zips": ["78613"],
+      "submission_method": ["email"],
+      "pia_email": null, "email_verified": false,
+      "portal_url": null, "portal_software": "none (Report-It is complaints, not PIR)",
+      "code_dept_phone": "512-401-5100", "code_dept_email": null,
+      "accepts_email_pia": "yes",
+      "notes": "Accepts email PIA but address is Cloudflare-obscured. Likely lquinn@cedarparktexas.gov (City Secretary LeAnn Quinn) — UNVERIFIED. Confirm via 'Email LeAnn M. Quinn' link or call 512-401-5002 before sending."
+    },
+    {
+      "city": "Leander", "county": "Williamson", "tier": 1, "has_code_enforcement": true,
+      "target_zips": ["78641"],
+      "submission_method": ["email", "form"],
+      "pia_email": "orr@leandertx.gov", "email_verified": true,
+      "portal_url": "https://www.leandertx.gov/FormCenter/City-Secretary-6/Open-Records-Request-49", "portal_software": "CivicPlus FormCenter",
+      "code_dept_phone": "512-528-2884", "code_dept_email": null,
+      "accepts_email_pia": "yes",
+      "notes": "Verified dedicated ORR inbox. Code Enforcement Mgr Alma Trevino."
+    },
+    {
+      "city": "Hutto", "county": "Williamson", "tier": 1, "has_code_enforcement": true,
+      "target_zips": ["78634"],
+      "submission_method": ["portal"],
+      "pia_email": null, "email_verified": false,
+      "portal_url": "https://huttotx.mycusthelp.com/WEBAPP/_rs/supporthome.aspx", "portal_software": "GovQA",
+      "code_dept_phone": "512-759-5994", "code_dept_email": null,
+      "accepts_email_pia": "form-required",
+      "notes": "City disclaims any request not sent to the (obfuscated) designated inbox — GovQA portal is the reliable channel. Code under PD."
+    },
+    {
+      "city": "Liberty Hill", "county": "Williamson", "tier": 1, "has_code_enforcement": true,
+      "target_zips": ["78642"],
+      "submission_method": ["email", "portal"],
+      "pia_email": "openrecords@libertyhilltx.gov", "email_verified": true,
+      "portal_url": "https://libertyhilltx.govqa.us/WEBAPP/_rs/supporthome.aspx", "portal_software": "GovQA",
+      "code_dept_phone": "512-998-3774", "code_dept_email": "ggonzales@libertyhilltx.gov",
+      "accepts_email_pia": "yes",
+      "notes": "Verified dedicated PIA inbox + GovQA. PIO Rebecca Harness."
+    },
+    {
+      "city": "Jarrell", "county": "Williamson", "tier": 1, "has_code_enforcement": false,
+      "target_zips": ["76537"],
+      "submission_method": ["email", "form"],
+      "pia_email": "municlerk@cityofjarrell.com", "email_verified": true,
+      "portal_url": null, "portal_software": "none",
+      "code_dept_phone": "512-746-4593", "code_dept_email": null,
+      "accepts_email_pia": "yes",
+      "notes": "Verified clerk inbox. NO dedicated code officer — low yield. Domain mix: clerk @cityofjarrell.com, staff @cityofjarrell.gov."
+    },
+    {
+      "city": "Taylor", "county": "Williamson", "tier": 2, "has_code_enforcement": true,
+      "target_zips": ["76574"],
+      "submission_method": ["email", "form"],
+      "pia_email": "lucy.aldrich@taylortx.gov", "email_verified": true,
+      "portal_url": "https://taylortx.gov/33/Open-Records", "portal_software": "CivicPlus FormCenter",
+      "code_dept_phone": "512-352-6891", "code_dept_email": "mitchell.alvarez@taylortx.gov",
+      "accepts_email_pia": "yes",
+      "notes": "City Clerk Lucy Aldrich. Deposit may be required if cost >$50 (small body). Has a real Code Enforcement unit."
+    },
+    {
+      "city": "Pflugerville", "county": "Williamson", "tier": 2, "has_code_enforcement": true,
+      "target_zips": ["78660"],
+      "submission_method": ["email", "form"],
+      "pia_email": "citysecretary@pflugervilletx.gov", "email_verified": true,
+      "portal_url": "https://www.pflugervilletx.gov/268/Open-Records-Request", "portal_software": "CivicPlus form",
+      "code_dept_phone": "512-670-5720", "code_dept_email": null,
+      "accepts_email_pia": "yes",
+      "notes": "One city govt serves Travis + Williamson portions (78660 is a Travis target ZIP). Real Code Compliance dept. Routed via Central Records (PD)."
+    },
+    {
+      "city": "Granger", "county": "Williamson", "tier": 3, "has_code_enforcement": false,
+      "target_zips": ["76530"],
+      "submission_method": ["email", "mail"],
+      "pia_email": null, "email_verified": false,
+      "portal_url": null, "portal_software": "none",
+      "code_dept_phone": "512-859-2755", "code_dept_email": null,
+      "accepts_email_pia": "yes",
+      "notes": "Email PIA accepted but address Cloudflare-obscured — call City Hall. No code dept."
+    },
+    {
+      "city": "Florence", "county": "Williamson", "tier": 3, "has_code_enforcement": false,
+      "target_zips": ["76527"],
+      "submission_method": ["email", "form"],
+      "pia_email": "openrecords@florencetex.com", "email_verified": true,
+      "portal_url": null, "portal_software": "none",
+      "code_dept_phone": "254-793-2490", "code_dept_email": "mdixon@florencetex.com",
+      "accepts_email_pia": "yes",
+      "notes": "Verified dedicated inbox. Code not a standalone dept — complaints via City Secretary."
+    },
+    {
+      "city": "Thrall", "county": "Williamson", "tier": 3, "has_code_enforcement": false,
+      "target_zips": ["76578"],
+      "submission_method": ["form", "mail"],
+      "pia_email": "cityclerk@cityofthrall.com", "email_verified": true,
+      "portal_url": null, "portal_software": "none",
+      "code_dept_phone": "512-898-5306", "code_dept_email": "cityclerk@cityofthrall.com",
+      "accepts_email_pia": "form-required",
+      "notes": "Directs to AG PIR form; email acceptance not explicit. No code dept. Limited hours."
+    },
+    {
+      "city": "Coupland", "county": "Williamson", "tier": 3, "has_code_enforcement": false,
+      "target_zips": ["78615"],
+      "submission_method": ["email", "mail"],
+      "pia_email": "rachel@couplandtx.com", "email_verified": false,
+      "portal_url": null, "portal_software": "none",
+      "code_dept_phone": "737-215-2649", "code_dept_email": "rachel@couplandtx.com",
+      "accepts_email_pia": "unknown",
+      "notes": "Tiny village, no code enforcement. Only paid official is City Secretary. Office hours Tue/Thu AM only."
+    },
+    {
+      "city": "Weir", "county": "Williamson", "tier": 3, "has_code_enforcement": false,
+      "target_zips": ["78674"],
+      "submission_method": ["mail", "phone"],
+      "pia_email": null, "email_verified": false,
+      "portal_url": null, "portal_software": "none",
+      "code_dept_phone": "512-863-7984", "code_dept_email": null,
+      "accepts_email_pia": "unknown",
+      "notes": "Site 403s automated access; no current email published. No code dept. Call City Hall."
+    },
+    {
+      "city": "Unincorporated Williamson County", "county": "Williamson", "tier": 3, "has_code_enforcement": false,
+      "target_zips": [],
+      "submission_method": ["email", "mail"],
+      "pia_email": "piarequest@wilco.org", "email_verified": true,
+      "portal_url": "https://www.wilcotx.gov/419/Open-Records-Request", "portal_software": "none (form only)",
+      "code_dept_phone": "512-943-1158", "code_dept_email": null,
+      "accepts_email_pia": "yes",
+      "notes": "County has NO zoning, NO building code, NO traditional code enforcement. Only Ch.343 nuisance (dumping/junk vehicles) via Constables + commercial fire review. PIA via County Attorney. Very low yield."
+    }
+  ]
+}

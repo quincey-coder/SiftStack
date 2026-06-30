@@ -23,11 +23,13 @@ import json
 import logging
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
 import config
+
+from notice_parser import NoticeData
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +91,12 @@ def _empty_state() -> dict:
         "last_run_date": "",
         "last_run_apns": [],
         "master_apns": [],
+        # APN → compact record snapshot of what we actually uploaded last run
+        # ({address, city, state, zip, owner_name}). Used to rehydrate a parcel
+        # that drops off the roll into a full "Sold"-tagged record. Only the
+        # uploaded (post-filter) set is stored so a dropped parcel that was
+        # never in DataSift can't spawn a junk record.
+        "last_run_records": {},
         "runs": [],
     }
 
@@ -158,6 +166,10 @@ class DiffResult:
     is_first_run: bool
     guardrail_tripped: bool
     guardrail_reason: str
+    # Rehydrated detail for the subset of dropped APNs that were in our prior
+    # upload (and therefore exist in DataSift). Each entry:
+    # {apn, address, city, state, zip, owner_name}. These become "Sold" rows.
+    dropped_records: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -170,6 +182,7 @@ class DiffResult:
             "is_first_run": self.is_first_run,
             "guardrail_tripped": self.guardrail_tripped,
             "guardrail_reason": self.guardrail_reason,
+            "dropped_records": self.dropped_records,
         }
 
 
@@ -211,7 +224,17 @@ def check_guardrails(
 def compute_diff(
     current_apns: set[str],
     prev_apns: set[str],
+    prev_records: dict | None = None,
 ) -> DiffResult:
+    """Diff this run's parcels against the prior run.
+
+    - new     = current - prev (fresh delinquencies)
+    - repeat  = current & prev (still delinquent)
+    - dropped = prev - current (off the roll — paid off / sold)
+    - dropped_records = the subset of `dropped` that exists in `prev_records`
+      (i.e. parcels we actually uploaded last run, so they're in DataSift).
+      Rehydrated with address/owner so they can be tagged "Sold".
+    """
     ok, reason = check_guardrails(current_apns, prev_apns)
     is_first = not prev_apns
     if not ok:
@@ -221,10 +244,17 @@ def compute_diff(
             is_first_run=is_first,
             guardrail_tripped=True,
             guardrail_reason=reason,
+            dropped_records=[],
         )
     new = sorted(current_apns - prev_apns)
     repeat = sorted(current_apns & prev_apns)
     dropped = sorted(prev_apns - current_apns) if prev_apns else []
+    prev_records = prev_records or {}
+    dropped_records = [
+        {"apn": apn, **prev_records[apn]}
+        for apn in dropped
+        if apn in prev_records
+    ]
     return DiffResult(
         new=new, repeat=repeat, dropped=dropped,
         new_count=len(new),
@@ -233,7 +263,53 @@ def compute_diff(
         is_first_run=is_first,
         guardrail_tripped=False,
         guardrail_reason="",
+        dropped_records=dropped_records,
     )
+
+
+# ── Record snapshot + sold-record builder ─────────────────────────────
+def snapshot_records(notices: list) -> dict:
+    """Build the APN → compact-record map persisted as `last_run_records`.
+
+    Only fields needed to (a) match the property in DataSift by address and
+    (b) render a readable report. Keyed by parcel_id; notices without one are
+    skipped (they couldn't be diffed anyway).
+    """
+    out: dict[str, dict] = {}
+    for n in notices:
+        apn = (n.parcel_id or "").strip()
+        if not apn:
+            continue
+        out[apn] = {
+            "address": n.address,
+            "city": n.city,
+            "state": n.state or "TX",
+            "zip": n.zip,
+            "owner_name": n.owner_name,
+        }
+    return out
+
+
+def build_sold_notice(rec: dict, county: str, today: str) -> NoticeData:
+    """Rehydrate a dropped-off-roll parcel into a 'Sold'-tagged NoticeData.
+
+    Carries only the property address + owner + parcel ID (enough for DataSift
+    to match the existing record) and sets record_status='sold' so the
+    formatter emits Tags='Sold' with a blank Lists column.
+    """
+    n = NoticeData(
+        notice_type="tax_delinquent",
+        county=county,
+        state=rec.get("state") or "TX",
+        date_added=today,
+        address=rec.get("address", ""),
+        city=rec.get("city", ""),
+        zip=rec.get("zip", ""),
+        owner_name=rec.get("owner_name", ""),
+        parcel_id=rec.get("apn", ""),
+    )
+    n.record_status = "sold"
+    return n
 
 
 # ── Commit state update ──────────────────────────────────────────────
@@ -244,6 +320,7 @@ def commit_run(
     raw_path: Path,
     raw_sha: str,
     diff: DiffResult,
+    current_records: dict | None = None,
 ) -> dict:
     today = datetime.now().strftime("%Y-%m-%d")
     state.setdefault("runs", []).append({
@@ -256,12 +333,18 @@ def commit_run(
         "new_count": diff.new_count,
         "repeat_count": diff.repeat_count,
         "dropped_count": diff.dropped_count,
+        "sold_tagged_count": len(diff.dropped_records),
     })
     if not diff.guardrail_tripped:
         state["last_run_date"] = today
         state["last_run_apns"] = sorted(current_apns)
         master = set(state.get("master_apns") or []) | current_apns
         state["master_apns"] = sorted(master)
+        # Refresh the uploaded-record snapshot so the NEXT run can rehydrate
+        # whatever drops off into Sold rows. Guardrail-tripped runs keep the
+        # prior snapshot untouched (consistent with last_run_apns).
+        if current_records is not None:
+            state["last_run_records"] = current_records
     save_state(county, state)
     return state
 
@@ -374,21 +457,30 @@ def format_slack_summary(
 
     if diff.is_first_run:
         lines.append(f"First run — seeding state with *{diff.new_count:,}* APNs.")
-    else:
-        # TIGHTFEED: NEW + DROPPED only; REPEAT, financial summary, and
-        # filter breakdown removed as low-signal noise.
-        lines.append(
-            f":new: NEW: *{diff.new_count:,}*  |  "
-            f":white_check_mark: DROPPED (sold/paid off): *{diff.dropped_count:,}*"
-        )
+        return "\n".join(lines)
 
-    if diff.dropped_count and not diff.is_first_run:
-        if diff.dropped_count <= max_inline_dropped:
-            lines.append("Dropped APNs: " + ", ".join(diff.dropped))
-        else:
-            preview = ", ".join(diff.dropped[:10])
+    # TIGHTFEED: NEW + DROPPED only; REPEAT, financial summary, and filter
+    # breakdown removed as low-signal noise.
+    sold_n = len(diff.dropped_records)
+    lines.append(
+        f":new: NEW: *{diff.new_count:,}*  |  "
+        f":white_check_mark: DROPPED off roll: *{diff.dropped_count:,}*  |  "
+        f":label: tagged Sold in CRM: *{sold_n:,}*"
+    )
+
+    # The Sold rows (owner — address) are the actionable headline: these get
+    # the "Sold" tag applied to the matching DataSift record on next upload.
+    if sold_n:
+        shown = diff.dropped_records[:max_inline_dropped]
+        for rec in shown:
+            owner = rec.get("owner_name") or "(unknown owner)"
+            addr = ", ".join(
+                p for p in [rec.get("address", ""), rec.get("city", ""), rec.get("zip", "")] if p
+            ) or rec.get("apn", "")
+            lines.append(f"• {owner} — {addr}")
+        if sold_n > max_inline_dropped:
             lines.append(
-                f"Dropped APNs (first 10 of {diff.dropped_count}): {preview} … see report JSON for the full list."
+                f"…and {sold_n - max_inline_dropped} more — see report JSON for the full list."
             )
 
     return "\n".join(lines)

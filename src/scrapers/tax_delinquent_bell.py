@@ -44,6 +44,10 @@ LAST_RUN_STATS: dict | None = None
 LAST_RUN_REMOVED: dict | None = None
 LAST_RUN_REPORT_PATH: Path | None = None
 LAST_RUN_RAW_PATH: Path | None = None
+# Sold (dropped-off-roll) NoticeData rehydrated from the prior run's snapshot.
+# Collected by main.py after enrichment and appended to the upload CSV tagged
+# "Sold" so DataSift applies the tag to the matching record by address.
+LAST_RUN_SOLD: list | None = None
 
 
 # ── Filter thresholds (CLI-overridable) ───────────────────────────────
@@ -278,12 +282,13 @@ class BellTaxDelinquentScraper:
         max_notices: int | None = None,
     ) -> list[NoticeData]:
         global LAST_RUN_DIFF, LAST_RUN_STATS, LAST_RUN_REMOVED
-        global LAST_RUN_REPORT_PATH, LAST_RUN_RAW_PATH
+        global LAST_RUN_REPORT_PATH, LAST_RUN_RAW_PATH, LAST_RUN_SOLD
         LAST_RUN_DIFF = None
         LAST_RUN_STATS = None
         LAST_RUN_REMOVED = None
         LAST_RUN_REPORT_PATH = None
         LAST_RUN_RAW_PATH = None
+        LAST_RUN_SOLD = None
 
         logger.info(
             "Bell tax delinquent: filters %d+ years, $%.0f+ owed, target-zip=%s",
@@ -495,7 +500,9 @@ class BellTaxDelinquentScraper:
         try:
             state = state_mod.load_state(self.COUNTY)
             prev_apns = set(state.get("last_run_apns") or [])
-            diff = state_mod.compute_diff(source_apns, prev_apns)
+            prev_records = state.get("last_run_records") or {}
+            current_records = state_mod.snapshot_records(notices)
+            diff = state_mod.compute_diff(source_apns, prev_apns, prev_records)
             stats = state_mod.build_stats(notices)
 
             if raw_archive_path is not None:
@@ -505,11 +512,17 @@ class BellTaxDelinquentScraper:
                     raw_path=raw_archive_path,
                     raw_sha=raw_sha,
                     diff=diff,
+                    current_records=current_records,
                 )
             report_path = state_mod.write_report_json(
                 self.COUNTY, diff, stats, removed,
                 raw_path=raw_archive_path or "",
             )
+            # Rehydrate dropped-off-roll parcels into Sold-tagged records.
+            LAST_RUN_SOLD = [
+                state_mod.build_sold_notice(rec, self.COUNTY, today)
+                for rec in diff.dropped_records
+            ]
             LAST_RUN_DIFF = diff.to_dict()
             LAST_RUN_STATS = stats
             LAST_RUN_REMOVED = removed
@@ -527,8 +540,9 @@ class BellTaxDelinquentScraper:
             else:
                 logger.info(
                     "Bell tax-delinquent cross-run diff: NEW=%d REPEAT=%d DROPPED=%d "
-                    "(dropped = paid/sold — see %s)",
-                    diff.new_count, diff.repeat_count, diff.dropped_count, report_path,
+                    "(%d in our upload → tagged Sold — see %s)",
+                    diff.new_count, diff.repeat_count, diff.dropped_count,
+                    len(diff.dropped_records), report_path,
                 )
         except Exception:
             logger.exception("Bell tax-delinquent diff/state failed — continuing")

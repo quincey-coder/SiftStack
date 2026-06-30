@@ -16,7 +16,7 @@ import json
 import logging
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -84,6 +84,10 @@ def _empty_state() -> dict:
         "last_run_date": "",
         "last_run_apns": [],
         "master_apns": [],
+        # APN → compact record snapshot of what we uploaded last run. Lets the
+        # next run rehydrate any parcel that dropped off the roll into a full
+        # "Sold"-tagged record. See scrapers.tax_delinquent_state for details.
+        "last_run_records": {},
         "runs": [],
     }
 
@@ -166,6 +170,9 @@ class DiffResult:
     is_first_run: bool
     guardrail_tripped: bool
     guardrail_reason: str
+    # Rehydrated detail for dropped APNs that were in our prior upload (and so
+    # exist in DataSift). Each: {apn, address, city, state, zip, owner_name}.
+    dropped_records: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -178,6 +185,7 @@ class DiffResult:
             "is_first_run": self.is_first_run,
             "guardrail_tripped": self.guardrail_tripped,
             "guardrail_reason": self.guardrail_reason,
+            "dropped_records": self.dropped_records,
         }
 
 
@@ -230,12 +238,16 @@ def check_guardrails(
 def compute_diff(
     current_apns: set[str],
     prev_apns: set[str],
+    prev_records: dict | None = None,
 ) -> DiffResult:
     """Compare current-run APNs against the prior run.
 
     - new     = current - prev (fresh delinquencies)
     - repeat  = current & prev (still delinquent)
     - dropped = prev - current (paid off / sold — the signal we want)
+    - dropped_records = the subset of `dropped` that exists in `prev_records`
+      (parcels we uploaded last run, so they're in DataSift), rehydrated with
+      address/owner so they can be tagged "Sold".
     """
     ok, reason = check_guardrails(current_apns, prev_apns)
     is_first = not prev_apns
@@ -247,10 +259,17 @@ def compute_diff(
             is_first_run=is_first,
             guardrail_tripped=True,
             guardrail_reason=reason,
+            dropped_records=[],
         )
     new = sorted(current_apns - prev_apns)
     repeat = sorted(current_apns & prev_apns)
     dropped = sorted(prev_apns - current_apns) if prev_apns else []
+    prev_records = prev_records or {}
+    dropped_records = [
+        {"apn": apn, **prev_records[apn]}
+        for apn in dropped
+        if apn in prev_records
+    ]
     return DiffResult(
         new=new, repeat=repeat, dropped=dropped,
         new_count=len(new),
@@ -259,6 +278,7 @@ def compute_diff(
         is_first_run=is_first,
         guardrail_tripped=False,
         guardrail_reason="",
+        dropped_records=dropped_records,
     )
 
 
@@ -269,6 +289,7 @@ def commit_run(
     raw_csv_path: Path,
     raw_csv_sha: str,
     diff: DiffResult,
+    current_records: dict | None = None,
 ) -> dict:
     """Append a run entry and refresh last_run / master sets. No-op when guardrail tripped.
 
@@ -288,6 +309,7 @@ def commit_run(
         "new_count": diff.new_count,
         "repeat_count": diff.repeat_count,
         "dropped_count": diff.dropped_count,
+        "sold_tagged_count": len(diff.dropped_records),
     }
     state.setdefault("runs", []).append(run_entry)
 
@@ -296,6 +318,9 @@ def commit_run(
         state["last_run_apns"] = sorted(current_apns)
         master = set(state.get("master_apns") or []) | current_apns
         state["master_apns"] = sorted(master)
+        # Refresh the uploaded-record snapshot for next run's Sold rehydration.
+        if current_records is not None:
+            state["last_run_records"] = current_records
 
     save_state(state)
     return state

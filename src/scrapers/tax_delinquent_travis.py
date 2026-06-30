@@ -34,6 +34,8 @@ from scrapers import register
 from scrapers import travis_texdel_cleaner as cleaner
 from scrapers import travis_texdel_report as report_mod
 from scrapers import travis_texdel_state as state_mod
+# Sold-record helpers are shared with Bell/Williamson (single source of truth).
+from scrapers.tax_delinquent_state import build_sold_notice, snapshot_records
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +50,10 @@ LAST_RUN_STATS: dict | None = None
 LAST_RUN_REMOVED: dict | None = None
 LAST_RUN_REPORT_PATH: Path | None = None
 LAST_RUN_RAW_CSV_PATH: Path | None = None
+# Sold (dropped-off-roll) NoticeData rehydrated from the prior run's snapshot.
+# Collected by main.py after enrichment and appended to the upload CSV tagged
+# "Sold" so DataSift applies the tag to the matching record by address.
+LAST_RUN_SOLD: list | None = None
 
 
 def _parse_address(street_num: str, street_name: str) -> str:
@@ -150,12 +156,13 @@ class TravisTaxDelinquentScraper:
         max_notices: int | None = None,
     ) -> list[NoticeData]:
         global LAST_RUN_DIFF, LAST_RUN_STATS, LAST_RUN_REMOVED
-        global LAST_RUN_REPORT_PATH, LAST_RUN_RAW_CSV_PATH
+        global LAST_RUN_REPORT_PATH, LAST_RUN_RAW_CSV_PATH, LAST_RUN_SOLD
         LAST_RUN_DIFF = None
         LAST_RUN_STATS = None
         LAST_RUN_REMOVED = None
         LAST_RUN_REPORT_PATH = None
         LAST_RUN_RAW_CSV_PATH = None
+        LAST_RUN_SOLD = None
 
         logger.info(
             "Travis tax delinquent: filters %d+ years, $%.0f+ owed, "
@@ -419,7 +426,9 @@ class TravisTaxDelinquentScraper:
         try:
             state = state_mod.load_state()
             prev_apns = set(state.get("last_run_apns") or [])
-            diff = state_mod.compute_diff(source_apns, prev_apns)
+            prev_records = state.get("last_run_records") or {}
+            current_records = snapshot_records(notices)
+            diff = state_mod.compute_diff(source_apns, prev_apns, prev_records)
             stats = report_mod.build_stats(notices)
 
             if raw_csv_path is not None:
@@ -429,12 +438,18 @@ class TravisTaxDelinquentScraper:
                     raw_csv_path=raw_csv_path,
                     raw_csv_sha=raw_csv_sha,
                     diff=diff,
+                    current_records=current_records,
                 )
 
             report_path = report_mod.write_report_json(
                 diff, stats, removed, raw_csv_path=raw_csv_path or "",
             )
 
+            # Rehydrate dropped-off-roll parcels into Sold-tagged records.
+            LAST_RUN_SOLD = [
+                build_sold_notice(rec, "Travis", today)
+                for rec in diff.dropped_records
+            ]
             LAST_RUN_DIFF = diff.to_dict()
             LAST_RUN_STATS = stats
             LAST_RUN_REMOVED = removed
@@ -454,9 +469,9 @@ class TravisTaxDelinquentScraper:
             else:
                 logger.info(
                     "Travis tax-delinquent cross-run diff: NEW=%d REPEAT=%d DROPPED=%d "
-                    "(dropped = likely sold/paid off — see %s for APN list)",
+                    "(%d in our upload → tagged Sold — see %s)",
                     diff.new_count, diff.repeat_count, diff.dropped_count,
-                    report_path,
+                    len(diff.dropped_records), report_path,
                 )
         except Exception:
             logger.exception("Cross-run diff/state update failed — continuing with notices")

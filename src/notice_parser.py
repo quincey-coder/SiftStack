@@ -212,6 +212,10 @@ class NoticeData:
     parcel_id: str = ""                # County assessor parcel ID
     tax_delinquent_amount: str = ""    # Total delinquent tax owed ($)
     tax_delinquent_years: str = ""     # Number of years delinquent
+    # Code enforcement / violation fields (Austin Code dataset + photo LLM parse)
+    violation_description: str = ""    # e.g. "Structure Condition Violation(s)"
+    compliance_deadline: str = ""      # Date owner must comply by (YYYY-MM-DD), if stated
+    case_status: str = ""              # e.g. "Active"/"Open"/"Closed"/"In Compliance" — drives closed-case filter
     # Travis tax-delinquent cleaner outputs (empty for all other scrapers)
     business_name: str = ""            # Entity name when owner_name is business (skill overflow merge result)
     mailing_address: str = ""          # Cleaned mailing address, distinct from property address
@@ -278,6 +282,17 @@ class NoticeData:
     email_5: str = ""
     # Pipeline metadata (set by enrichment_pipeline)
     run_id: str = ""                   # Unique pipeline run identifier for data lineage
+    # Record lifecycle status. "sold" marks a parcel that dropped off the
+    # tax-delinquent roll since the last run (paid off / sold) — rehydrated
+    # from the prior run's snapshot and tagged "Sold" so DataSift applies the
+    # tag to the matching existing record by address. "" = normal record.
+    record_status: str = ""
+    # Lien fields (notice_type == "lien"). County-clerk OPR liens are indexed
+    # against a debtor by NAME, usually with no property address — the address
+    # is backfilled via CAD name search (enrichment Step 3c). The lead is the
+    # debtor (grantee/[E]), NOT the creditor who filed the lien.
+    lien_type: str = ""                # e.g. "Abstract Of Judgment", "Federal Tax Lien"
+    lien_creditor: str = ""            # Filing party (bank/IRS/State) — context, not the lead
 
 
 # ── Known TX cities in Travis, Bell & Williamson counties ─────────────

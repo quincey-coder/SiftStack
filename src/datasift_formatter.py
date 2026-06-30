@@ -349,6 +349,7 @@ NOTICE_TYPE_TO_LIST = {
     "eviction": "Eviction",
     "code_violation": "Code Violation",
     "divorce": "Divorce",
+    "lien": "Lien",
 }
 
 
@@ -364,11 +365,31 @@ def _build_tags(notice: NoticeData) -> str:
     - DM confidence level (for deceased records)
     - has_auction if auction date is upcoming
     """
+    # Sold (dropped-off-roll) record: minimal tag set so DataSift's "Sold
+    # Property Cleanup" sequence fires (trigger = Property Tags Added "Sold").
+    # Capital-S "Sold" matches the sequence condition exactly. No other tags —
+    # this is a tag-update row matched to an existing record by address.
+    if notice.record_status == "sold":
+        sold_tags = ["Sold"]
+        if notice.county:
+            sold_tags.append(notice.county.lower())
+        if notice.date_added:
+            try:
+                dt = datetime.strptime(notice.date_added, "%Y-%m-%d")
+                sold_tags.append(f"sold_{dt.strftime('%Y-%m')}")
+            except ValueError:
+                pass
+        return ",".join(sold_tags)
+
     tags = ["Courthouse Data"]
 
     # Notice type
     if notice.notice_type:
         tags.append(notice.notice_type)
+
+    # Specific lien type (e.g. "abstract_of_judgment") for finer filter presets
+    if notice.lien_type:
+        tags.append(notice.lien_type.lower().replace("'", "").replace(" ", "_"))
 
     # County
     if notice.county:
@@ -731,6 +752,19 @@ def _build_property_section(notice: NoticeData) -> str:
     if notice.notice_type:
         parts.append(notice.notice_type.replace("_", " ").title())
 
+    # Lien context: the specific lien type + the creditor who filed it. The
+    # debtor (our lead) is already the owner; this surfaces WHY they're distressed.
+    if notice.lien_type:
+        parts.append(f"Lien: {notice.lien_type}")
+    if notice.lien_creditor:
+        parts.append(f"Creditor: {notice.lien_creditor}")
+
+    if notice.violation_description:
+        parts.append(f"Violation: {notice.violation_description}")
+
+    if notice.compliance_deadline:
+        parts.append(f"Comply By: {_format_date(notice.compliance_deadline)}")
+
     if notice.auction_date:
         parts.append(f"Auction: {_format_date(notice.auction_date)}")
 
@@ -931,8 +965,19 @@ def _build_row(notice: NoticeData, notes_override: str | None = None) -> dict:
     """
     contact = _get_contact_info(notice)
     tags = _build_tags(notice)
-    list_name = NOTICE_TYPE_TO_LIST.get(notice.notice_type, "")
-    notes = notes_override if notes_override is not None else _build_notes(notice)
+    if notice.record_status == "sold":
+        # Don't re-add a sold parcel to the Tax Delinquent list — the cleanup
+        # sequence removes it from lists. Tax/value fields stay blank so the
+        # upload doesn't overwrite the record's delinquency history. The sold
+        # note always wins over any notes_override (these are tag-update rows).
+        list_name = ""
+        notes = (
+            f"Dropped off {notice.county} tax-delinquent roll on "
+            f"{_format_date(notice.date_added)} — likely paid off or sold."
+        )
+    else:
+        list_name = NOTICE_TYPE_TO_LIST.get(notice.notice_type, "")
+        notes = notes_override if notes_override is not None else _build_notes(notice)
 
     # Conditionally map auction_date to the right built-in field
     tax_auction = ""

@@ -117,12 +117,49 @@ Configured in `config.py`:
 | Travis | Tax Delinquent | Travis Tax Office CSV (13K+ records) |
 | Travis | Tax Sale | Travis Tax Office upcoming sales |
 | Travis | Probate | Odyssey portal |
+| Travis | Lien | tccsearch.org OPR (doc-type checkboxes) |
 | Bell | Foreclosure | bellcountytx.com county clerk |
 | Bell | Tax Sale | MVBA Law Firm PDFs |
 | Bell | Probate | Odyssey portal |
+| Bell | Lien | bell.tx.publicsearch.us (GovOS, **headed**) |
 | Williamson | Foreclosure | wilco.org trustee sales |
 | Williamson | Tax Sale | MVBA Law Firm PDFs |
 | Williamson | Probate | Odyssey portal |
+| Williamson | Lien | williamson.tx.publicsearch.us (GovOS, **headed**) |
+
+## Liens (County-Clerk OPR) — `notice_type = "lien"`
+
+Recorded liens (Abstract of Judgment, Federal/State Tax Lien, Mechanic's Lien, …)
+are pulled from the same County-Clerk Official Public Records as foreclosures.
+Scrapers: `scrapers/lien_travis.py` (Travis) + `scrapers/lien_publicsearch.py`
+(Bell + Williamson). Wired into `config.NOTICE_TYPES`, the `(county,"lien")`
+registry, `datasift_formatter` (`Lien` list + `lien`/lien-type tags + Notes), and
+enrichment **Step 3c-lien**.
+
+- **Travis — `tccsearch.org` (same site as foreclosure).** Doc-type checkbox
+  indices captured live (130 types): AJ=1, Assessment=14, Estate Tax=49,
+  Federal Tax=51, Hospital=56, Judgement=60, Mechanics=65, State Judgement=106,
+  State Tax=107 (`DEFAULT_LIEN_DOC_TYPES`). Releases/transfers excluded. Runs
+  headless like the other Travis scrapers.
+- **Bell + Williamson — `{county}.tx.publicsearch.us` (Kofile/GovOS County
+  Fusion). MUST RUN HEADED.** The anti-bot blocks *old headless* chromium
+  (results stick on "Loading…" forever, no API fires); a real headed browser
+  (`headless=False`) + automation-signal spoofing renders results. In
+  Docker/Apify (Linux, no display) run under Xvfb (`xvfb-run -a …`). Override
+  with `LIEN_PUBLICSEARCH_HEADLESS=1` (will likely return 0). Flow = Advanced
+  Search: add lien doc types to `#docTypes-input` (react-select: type + Enter)
+  **before** filling `#recordedDateRange-start/-end` (date picker overlays the
+  doc-type field otherwise) → click the **exact** "Search" button (NOT
+  "Search Criteria", a section toggle) → parse the tab-separated results table.
+- **Lead = the GRANTEE (debtor), NOT the grantor (creditor).** On a tax lien the
+  grantor is the IRS/State and the grantee is the taxpayer we want; on an AJ the
+  grantor is the bank/abstract co. and the grantee is the judgment debtor.
+  (Opposite of foreclosure, where `[R]`/grantor is the borrower.)
+- **Name-indexed, no address.** Liens carry a debtor name but no property
+  address. Step 3c-lien backfills it via `cad_lookup.lookup_property_by_name`
+  (debtor name → in-county property). No match → blank address → dropped
+  downstream, which also discards the mostly-business State Tax Liens (the same
+  safety property as the sold flow).
 
 ## Key Domain Rules
 
@@ -132,6 +169,16 @@ Configured in `config.py`:
 - **Rate limiting:** 2-3 second random delays between requests, 3 retries per page. Travis CSV download needs no rate limiting.
 - **Texas is a disclosure state** — actual sale prices are available in public records (unlike non-disclosure states).
 - **Texas has no state transfer tax** — closing cost calculations should not include transfer tax.
+
+## Tax-Delinquent Cross-Run Diff + Sold Tagging
+
+All three tax-delinquent scrapers (Travis CSV, Bell/Williamson XLSX) diff each pull against the prior run's parcel-ID set and persist state across runs (`data/{county}_tax_state/` locally; Apify KVS keys `travis_texdel_state` / `bell_texdel_state` / `williamson_texdel_state`). State modules: `travis_texdel_state.py` (Travis) and the county-parameterized `tax_delinquent_state.py` (Bell + Williamson). Per-run diff JSON + raw-file archive are written for forensics; the diff is surfaced to Slack via `--notify-slack`.
+
+- **Diff terms:** `NEW` = current − previous, `REPEAT` = current ∩ previous, `DROPPED` = previous − current (off the roll = paid off / sold).
+- **Guardrails** (`check_guardrails`) suppress false "sold" claims: empty file, APN-format drift (<85–90% match), or >50% volume shrinkage trips the guardrail — the prior baseline + snapshot are preserved and no drop/sold claims are reported.
+- **`last_run_records` snapshot:** each successful run stores `parcel_id → {address, city, state, zip, owner_name}` for the records it actually **uploaded** (post-filter). This lets the next run rehydrate any dropped parcel into a full record (not just an APN).
+- **Sold flow (the round-trip you upload):** dropped parcels that were in our prior upload become `NoticeData(record_status="sold")` — exposed as each scraper's module-level `LAST_RUN_SOLD`, collected by `main._collect_sold_records()` after enrichment, and appended to the same tax-delinquent upload CSV. The formatter (`datasift_formatter._build_tags` / `_build_row`) tags them exactly **`Sold`** with a **blank Lists** column and blank tax/value fields. On upload, DataSift matches by property address → adds the `Sold` tag to the existing record → the **"Sold Property Cleanup"** sequence fires (status→Sold, remove from lists, clear tasks/assignee). New parcels in the same file upload as normal.
+- **Safety property:** only previously-**uploaded** dropped parcels become Sold rows — a parcel that left the roll but was filtered out (never in DataSift) is intersected away, so no junk records are created. Sold rows bypass enrichment/skip-trace and are never added to the daily `seen` set.
 
 ## Output
 

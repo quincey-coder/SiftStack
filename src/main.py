@@ -171,6 +171,35 @@ def _preflight_check(mode: str) -> list[str]:
     return failures
 
 
+def _collect_sold_records() -> list:
+    """Gather Sold (dropped-off-roll) NoticeData from tax-delinquent scrapers.
+
+    Each tax-delinquent scraper sets module-level LAST_RUN_SOLD during its
+    scrape() — parcels that were on the roll last run but are gone now (paid
+    off / sold), rehydrated from the prior run's snapshot. These bypass
+    enrichment and ride into the upload CSV tagged "Sold" so DataSift applies
+    the tag to the matching existing record by property-address match. The
+    "Sold Property Cleanup" sequence then fires (status→Sold, remove lists,
+    clear tasks/assignee).
+    """
+    from importlib import import_module
+
+    sold: list = []
+    for mod_name in (
+        "tax_delinquent_travis",
+        "tax_delinquent_bell",
+        "tax_delinquent_wilco",
+    ):
+        try:
+            mod = import_module(f"scrapers.{mod_name}")
+        except Exception:
+            continue
+        recs = getattr(mod, "LAST_RUN_SOLD", None)
+        if recs:
+            sold.extend(recs)
+    return sold
+
+
 # ── Apify Actor mode ─────────────────────────────────────────────────
 
 
@@ -508,7 +537,18 @@ async def actor_main() -> None:
             )
             notices = run_enrichment_pipeline(notices, opts)
 
-            if not notices:
+            # Sold (dropped-off-roll) records — rehydrated by the tax-delinquent
+            # scrapers from the prior run's snapshot. They bypass enrichment and
+            # are appended just before CSV export (below) so they ride into the
+            # same upload tagged "Sold".
+            sold_notices = _collect_sold_records()
+            if sold_notices:
+                Actor.log.info(
+                    "Collected %d Sold (dropped-off-roll) records to tag in DataSift",
+                    len(sold_notices),
+                )
+
+            if not notices and not sold_notices:
                 Actor.log.warning("No notices found after enrichment")
                 # Still persist state so next run's window narrows
                 await kvs.set_value("seen_notice_ids", sorted(seen_ids))
@@ -628,6 +668,12 @@ async def actor_main() -> None:
                     )
                 except Exception as e:
                     Actor.log.warning("PDF generator import failed: %s", e)
+
+            # Append Sold rows now (after enrichment/Tracerfy/PDFs, before any
+            # CSV/dataset output) so they upload alongside new records and get
+            # the "Sold" tag applied to their existing DataSift record.
+            if sold_notices:
+                notices.extend(sold_notices)
 
             # ── Legacy flat CSV + push records to Dataset ──
             csv_path = write_csv(notices)
@@ -2442,7 +2488,17 @@ def _run_scrape_pipeline(args, targets) -> None:
     )
     notices = run_enrichment_pipeline(notices, opts)
 
-    if not notices:
+    # Sold (dropped-off-roll) records — rehydrated by the tax-delinquent
+    # scrapers from the prior run's snapshot. Bypass enrichment; appended just
+    # before CSV export (below) so they ride into the same upload tagged "Sold".
+    sold_notices = _collect_sold_records()
+    if sold_notices:
+        logging.info(
+            "Collected %d Sold (dropped-off-roll) records to tag in DataSift",
+            len(sold_notices),
+        )
+
+    if not notices and not sold_notices:
         logging.warning("No notices found")
         # Still advance last_run.json so tomorrow's scrape window narrows —
         # otherwise a stretch of empty days keeps re-scraping the same window.
@@ -2508,6 +2564,12 @@ def _run_scrape_pipeline(args, targets) -> None:
                     except Exception as e:
                         logging.warning("Per-record Trestle scoring failed: %s", e)
 
+    # Append Sold rows now (after enrichment/Tracerfy, before any output) so
+    # they ride into the same CSVs and get the "Sold" tag applied to their
+    # existing DataSift record by address match.
+    if sold_notices:
+        notices.extend(sold_notices)
+
     # Write output
     if args.split:
         paths = write_csv_by_type(notices)
@@ -2521,6 +2583,10 @@ def _run_scrape_pipeline(args, targets) -> None:
     # Uses the same composite dedup key as the filter step — monotonic growth.
     if args.mode == "daily":
         for n in notices:
+            # Sold rows are tag-update rows, not new leads — never add them to
+            # the seen set (they're off the roll and won't recur as new).
+            if getattr(n, "record_status", "") == "sold":
+                continue
             # Use the pre-pipeline snapshot key set earlier (Smarty may have
             # mutated notice.address since then). Fall back to recomputing
             # if the snapshot somehow wasn't attached (defensive).

@@ -24,7 +24,7 @@
         "types": {
             "title": "Notice Types",
             "type": "array",
-            "description": "Notice types. Leave empty for all (foreclosure, probate, tax_sale, tax_delinquent).",
+            "description": "Notice types. Leave empty for all (foreclosure, probate, tax_sale, tax_delinquent, code_violation). code_violation is Travis-only (Austin Code Socrata API).",
             "items": { "type": "string" },
             "default": [],
             "editor": "stringList"

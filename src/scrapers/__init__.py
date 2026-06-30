@@ -160,3 +160,21 @@ try:
     from scrapers import tax_delinquent_wilco  # noqa: F401
 except ImportError as e:
     logger.debug("Could not import tax_delinquent_wilco: %s", e)
+
+# Code enforcement — Travis (City of Austin) via Socrata SODA API
+try:
+    from scrapers import code_enforcement_travis  # noqa: F401
+except ImportError as e:
+    logger.debug("Could not import code_enforcement_travis: %s", e)
+
+# Liens (county-clerk OPR) — Travis via tccsearch.org doc-type checkboxes
+try:
+    from scrapers import lien_travis  # noqa: F401
+except ImportError as e:
+    logger.debug("Could not import lien_travis: %s", e)
+
+# Liens — Bell + Williamson via publicsearch.us (must run headed; see module docstring)
+try:
+    from scrapers import lien_publicsearch  # noqa: F401
+except ImportError as e:
+    logger.debug("Could not import lien_publicsearch: %s", e)

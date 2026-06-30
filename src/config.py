@@ -53,6 +53,18 @@ DROPBOX_APP_KEY = os.getenv("DROPBOX_APP_KEY", "")            # Dropbox OAuth2 a
 DROPBOX_APP_SECRET = os.getenv("DROPBOX_APP_SECRET", "")
 DROPBOX_REFRESH_TOKEN = os.getenv("DROPBOX_REFRESH_TOKEN", "")
 
+# Open-records (Bell/Williamson code enforcement PIA requests) — requester identity
+# placed on every Texas Public Information Act request. Required before any send.
+OPEN_RECORDS_REQUESTER_NAME = os.getenv("OPEN_RECORDS_REQUESTER_NAME", "")
+OPEN_RECORDS_REQUESTER_EMAIL = os.getenv("OPEN_RECORDS_REQUESTER_EMAIL", "")
+OPEN_RECORDS_REQUESTER_PHONE = os.getenv("OPEN_RECORDS_REQUESTER_PHONE", "")
+OPEN_RECORDS_FEE_CAP = os.getenv("OPEN_RECORDS_FEE_CAP", "25")  # $ threshold to pause for estimate
+
+# Code-enforcement relevance filter: drop closed cases + keep only neglect/distress
+# violation types (LLM-classified). Set false to ingest raw, unfiltered cases.
+CODE_VIOLATION_NEGLECT_FILTER = os.getenv(
+    "CODE_VIOLATION_NEGLECT_FILTER", "true").lower() in ("1", "true", "yes")
+
 # ── LLM Backend ──────────────────────────────────────────────────────
 LLM_BACKEND = os.getenv("LLM_BACKEND", "anthropic")           # "anthropic", "ollama", or "openrouter"
 LLM_MODEL = os.getenv("LLM_MODEL", "claude-haiku-4-5-20251001")  # Anthropic model name (default for all LLM calls)
@@ -102,7 +114,9 @@ TESSERACT_PSM_PDF = 3    # fully automatic — best for PDF tax sale tables
 TESSERACT_PSM_PHOTO = 4  # assume single column of variable-size text — best for terminal screen photos
 
 # ── Notice Types ───────────────────────────────────────────────────────
-NOTICE_TYPES = ["foreclosure", "tax_sale", "tax_delinquent", "probate"]
+# code_violation is scraped for Travis (Austin Code Socrata API); Bell/Williamson
+# have no live source (open-records only) and warn harmlessly as unregistered.
+NOTICE_TYPES = ["foreclosure", "tax_sale", "tax_delinquent", "probate", "code_violation", "lien"]
 
 # ── Texas Counties ────────────────────────────────────────────────────
 # Target counties for scraping. Each maps to its data sources.

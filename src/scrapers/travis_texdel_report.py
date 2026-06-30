@@ -136,23 +136,30 @@ def format_slack_summary(
 
     if diff.is_first_run:
         lines.append(f"First run — seeding state with *{diff.new_count:,}* APNs.")
-    else:
-        # TIGHTFEED: drop the REPEAT counter (boring stable middle) and
-        # the financial + filter blocks below. NEW + DROPPED + the
-        # actual dropped-APN list is the operational signal.
-        lines.append(
-            f":new: NEW: *{diff.new_count:,}*  |  "
-            f":white_check_mark: DROPPED (sold/paid off): *{diff.dropped_count:,}*"
-        )
+        return "\n".join(lines)
 
-    # Dropped APNs — the headline
-    if diff.dropped_count and not diff.is_first_run:
-        if diff.dropped_count <= max_inline_dropped:
-            lines.append("Dropped APNs: " + ", ".join(diff.dropped))
-        else:
-            preview = ", ".join(diff.dropped[:10])
+    # TIGHTFEED: drop the REPEAT counter (boring stable middle) and the
+    # financial + filter blocks. NEW + DROPPED + the Sold-tagged rows are
+    # the operational signal.
+    sold_n = len(diff.dropped_records)
+    lines.append(
+        f":new: NEW: *{diff.new_count:,}*  |  "
+        f":white_check_mark: DROPPED off roll: *{diff.dropped_count:,}*  |  "
+        f":label: tagged Sold in CRM: *{sold_n:,}*"
+    )
+
+    # The Sold rows (owner — address) are the headline: these get the "Sold"
+    # tag applied to the matching DataSift record on the next upload.
+    if sold_n:
+        for rec in diff.dropped_records[:max_inline_dropped]:
+            owner = rec.get("owner_name") or "(unknown owner)"
+            addr = ", ".join(
+                p for p in [rec.get("address", ""), rec.get("city", ""), rec.get("zip", "")] if p
+            ) or rec.get("apn", "")
+            lines.append(f"• {owner} — {addr}")
+        if sold_n > max_inline_dropped:
             lines.append(
-                f"Dropped APNs (first 10 of {diff.dropped_count}): {preview} … see report JSON for the full list."
+                f"…and {sold_n - max_inline_dropped} more — see report JSON for the full list."
             )
 
     return "\n".join(lines)
