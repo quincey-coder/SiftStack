@@ -280,6 +280,7 @@ async def actor_main() -> None:
         # ── Operational toggles ──
         do_notify_slack = bool(actor_input.get("notify_slack", True))
         rebuild_dedup_only = bool(actor_input.get("rebuild_dedup_only", False))
+        no_reports = bool(actor_input.get("no_reports", False))
         use_proxy = bool(actor_input.get("use_residential_proxy", False))  # Default OFF on Free plan
 
         # ── DataSift auto-upload (RAWPIPE) toggles ──
@@ -586,10 +587,12 @@ async def actor_main() -> None:
             # links are clickable webViewLinks (Apify KVS records are now Restricted
             # by default and their raw API URLs fail with auth errors).
             pdf_urls: list[dict] = []
-            dp_candidates = [
+            dp_candidates = [] if no_reports else [
                 n for n in notices
                 if n.owner_deceased == "yes" or n.heir_map_json or n.decision_maker_name
             ]
+            if no_reports:
+                Actor.log.info("Deep-prospecting reports disabled (no_reports=True)")
             if dp_candidates and not (
                 config.GOOGLE_DRIVE_FOLDER_ID and config.GOOGLE_SERVICE_ACCOUNT_KEY
             ):
@@ -1811,6 +1814,12 @@ def cli_main() -> None:
         help="Suppress the Google Drive upload of DataSift CSVs",
     )
     parser.add_argument(
+        "--no-reports",
+        action="store_true",
+        help="Skip deep-prospecting PDF report generation entirely (even for "
+             "records that carry a decision-maker / heir / deceased flag)",
+    )
+    parser.add_argument(
         "--audit-records",
         action="store_true",
         help="Audit DataSift for incomplete records (future: daily check via Playwright)",
@@ -2522,10 +2531,12 @@ def _run_scrape_pipeline(args, targets) -> None:
     # Generate deep-prospecting PDFs for deceased/DM/heir records.
     # Matches the Apify branch behavior so CLI runs get the same reports —
     # includes the Case Summary section added for deceased-owner records.
-    dp_candidates = [
+    dp_candidates = [] if getattr(args, "no_reports", False) else [
         n for n in notices
         if n.owner_deceased == "yes" or n.heir_map_json or n.decision_maker_name
     ]
+    if getattr(args, "no_reports", False):
+        logging.info("Deep-prospecting reports disabled (--no-reports)")
     if dp_candidates:
         try:
             from report_generator import generate_record_pdf

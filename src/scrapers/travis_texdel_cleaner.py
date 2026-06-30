@@ -18,13 +18,15 @@ from collections import Counter
 
 
 # ── Configuration ─────────────────────────────────────────────────────
-# Travis-specific target ZIPs (from the skill, matches target_zips.json
-# for Travis rows). Other counties have their own filter list in
-# src/zip_filter.py — we scope this module to Travis tax-delinquent only.
+# Travis-specific target ZIPs. Kept in sync with the "Travis" array in
+# src/target_zips.json (manual override 2026-06-29) so Travis tax-delinquent
+# filters identically to every other Travis source. Other counties have
+# their own filter list in src/target_zips.json.
 TARGET_ZIPS: set[str] = {
-    "78660", "78702", "78703", "78704", "78721", "78723", "78728",
-    "78735", "78741", "78745", "78746", "78747", "78752", "78753",
-    "78757", "78758",
+    "78745", "78660", "78723", "78746", "78704", "78757", "78759", "78731",
+    "78749", "78727", "78748", "78738", "78753", "78702", "78664", "78739",
+    "78758", "78728", "78641", "78733", "78732", "78645", "78705", "78747",
+    "78754", "78734", "78724", "78751",
 }
 
 # Condo property-type code filtered out per skill spec

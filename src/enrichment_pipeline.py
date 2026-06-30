@@ -609,6 +609,40 @@ def run_enrichment_pipeline(
     else:
         logger.info("── Step 8b: MLS Status Filter (skipped) ──")
 
+    # ── Step 8c: Investor Zip Code Re-filter (post-geocode) ──────────
+    # Step 2a runs before addresses are resolved and deliberately lets
+    # records with no zip pass through (so they aren't dropped pre-geocode).
+    # Probate/lien records — and any record whose zip is filled in later by
+    # Steps 3c / 3c-lien / 4 / 6 / 7 / 8 — therefore bypass the early zip
+    # gate. Re-run the SAME filter now that every resolvable zip is populated
+    # so those late-geocoded records are held to the same target-zip list.
+    # filter_by_target_zips keeps records that still have no zip, so nothing
+    # geocodable is lost — only records with a confirmed out-of-target zip
+    # are dropped.
+    if not opts.skip_zip_filter:
+        logger.info("── Step 8c: Investor Zip Code Re-filter (post-geocode) ──")
+        try:
+            from zip_filter import load_target_zips, filter_by_target_zips
+            target_zips = load_target_zips()
+            if target_zips:
+                before = len(notices)
+                notices = filter_by_target_zips(notices, target_zips)
+                dropped = before - len(notices)
+                logger.info(
+                    "  %d records after re-filter%s",
+                    len(notices),
+                    f" (dropped {dropped} now-geocoded out-of-target)" if dropped else "",
+                )
+            else:
+                logger.info("  No target zips configured — skipping")
+        except ImportError:
+            logger.warning("  zip_filter module not found — skipping")
+    else:
+        logger.info("── Step 8c: Investor Zip Code Re-filter (skipped) ──")
+    if not notices:
+        logger.warning("No records remaining after zip re-filter")
+        return notices
+
     # ── Step 9: Obituary Enrichment ──────────────────────────────────
     if not opts.skip_obituary and not opts.has_obituary:
         if config.ANTHROPIC_API_KEY:
