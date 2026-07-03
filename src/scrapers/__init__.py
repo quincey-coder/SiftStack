@@ -173,8 +173,17 @@ try:
 except ImportError as e:
     logger.debug("Could not import lien_travis: %s", e)
 
-# Liens — Bell + Williamson via publicsearch.us (must run headed; see module docstring)
+# Liens — Bell via publicsearch.us (must run headed; see module docstring).
+# Williamson's registration was REMOVED from this module (it replatformed to
+# Tyler Self-Service) — see lien_tyler below.
 try:
     from scrapers import lien_publicsearch  # noqa: F401
 except ImportError as e:
     logger.debug("Could not import lien_publicsearch: %s", e)
+
+# Liens — Williamson via Tyler "Self-Service" recorder portal (must run headed).
+# Imported AFTER lien_publicsearch so Williamson/lien resolves here.
+try:
+    from scrapers import lien_tyler  # noqa: F401
+except ImportError as e:
+    logger.debug("Could not import lien_tyler: %s", e)

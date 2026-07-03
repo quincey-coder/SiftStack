@@ -149,33 +149,28 @@ async def _dismiss_all_popups(page) -> None:
 # ── Navigation ────────────────────────────────────────────────────────
 
 async def _navigate_to_market_finder(page) -> bool:
-    """Navigate to Market Finder page."""
-    await page.goto(DATASIFT_MARKET_FINDER_URL, wait_until="domcontentloaded")
-    await wait_for_spa(page, 5000)
-    await _dismiss_all_popups(page)
+    """Navigate to Market Finder via the sidebar (client-side SPA route).
 
-    # Check if we landed on Market Finder
-    mf_check = await page.evaluate("""() => {
-        return document.body.innerText.includes('Market Finder') ||
-               document.body.innerText.includes('Investor Transactions') ||
-               document.querySelector('[class*="MarketFinder"]') !== null;
-    }""")
-
-    if mf_check:
-        logger.info("Navigated to Market Finder via direct URL")
-        return True
-
-    # Fallback: click sidebar link
-    logger.info("Direct URL didn't land on Market Finder, trying sidebar")
-    sidebar_link = page.get_by_text("Market Finder", exact=False)
+    A hard goto() to /market-finder returns the server's 404 and wipes the
+    SPA shell, so we always route by clicking the sidebar link instead.
+    """
+    sidebar_link = page.get_by_text("Market Finder", exact=True)
     if await sidebar_link.count() > 0:
         await sidebar_link.first.click()
         await wait_for_spa(page, 5000)
         await _dismiss_all_popups(page)
-        logger.info("Navigated to Market Finder via sidebar link")
-        return True
+        mf_check = await page.evaluate("""() => {
+            const t = document.body.innerText || '';
+            return t.includes('Investor Transactions') ||
+                   document.querySelector('[class*="MarketFinder"]') !== null;
+        }""")
+        if mf_check:
+            logger.info("Navigated to Market Finder via sidebar link")
+            return True
+        logger.error("Clicked Market Finder but page did not load")
+        return False
 
-    logger.error("Could not navigate to Market Finder")
+    logger.error("Could not find Market Finder sidebar link")
     return False
 
 

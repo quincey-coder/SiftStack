@@ -147,7 +147,9 @@ async def login(page, email: str = None, password: str = None) -> bool:
         await page.goto(DATASIFT_RECORDS_URL, wait_until="domcontentloaded")
         await page.wait_for_timeout(5000)
         current_url = page.url
-        if "/login" not in current_url and ("/dashboard" in current_url or "/records" in current_url):
+        # Authenticated if we stayed on an app route (not bounced to /login or
+        # the root with a ?next= redirect param).
+        if "/login" not in current_url and "next=" not in current_url:
             logger.info("DataSift session restored from cookies")
             return True
         logger.info("DataSift cookies expired (url=%s), doing fresh login", current_url)
@@ -171,16 +173,31 @@ async def login(page, email: str = None, password: str = None) -> bool:
     # Click Sign In
     await page.get_by_role("button", name="Sign In").click()
 
-    # Wait for navigation away from login page
-    try:
-        await page.wait_for_url("**/dashboard/general**", timeout=15000)
-    except PwTimeout:
-        if "/login" in page.url:
-            logger.error("DataSift login failed — still on login page")
-            return False
+    # Detect success by the authenticated app shell (sidebar nav) rendering —
+    # NOT by URL. The SPA can linger on /login in the address bar for many
+    # seconds after auth, and the post-login landing route may 404, so a
+    # URL check races. The sidebar (Market Finder + Skip Tracing links, no
+    # password field) is an unambiguous authenticated signal.
+    authed = False
+    for _ in range(25):  # up to ~25s
+        await page.wait_for_timeout(1000)
+        try:
+            authed = await page.evaluate("""() => {
+                const t = document.body.innerText || '';
+                const hasNav = t.includes('Market Finder') && t.includes('Skip Tracing');
+                const hasPwd = !!document.querySelector('input[type="password"]');
+                return hasNav && !hasPwd;
+            }""")
+        except Exception:
+            authed = False
+        if authed:
+            break
+    if not authed:
+        logger.error("DataSift login failed — authenticated shell not detected")
+        return False
 
     await save_cookies(page)
-    logger.info("DataSift login successful")
+    logger.info("DataSift login successful (landing=%s)", page.url)
     return True
 
 

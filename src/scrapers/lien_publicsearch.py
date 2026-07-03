@@ -365,10 +365,44 @@ class _PublicSearchLienScraper:
                         )
                         await page.wait_for_timeout(3000)
                 if not form_ok:
-                    logger.warning(
-                        "%s lien: advanced-search form never rendered (anti-bot / "
-                        "slow SPA). Returning 0.", self.COUNTY,
-                    )
+                    # Distinguish a genuine anti-bot / slow-SPA miss from a
+                    # source-side change. As of 2026-06-30 the Williamson portal
+                    # migrated vendors ("Powered By neumo") and now offers only a
+                    # single "Commissioners Court" department — the Official Public
+                    # Records (deeds/liens) collection, and its
+                    # #recordedDateRange-start / #docTypes-input fields, are gone.
+                    # Report WHY so future runs aren't chased as a scraper bug.
+                    opr_gone = False
+                    try:
+                        diag = await page.evaluate(
+                            "() => ({"
+                            "  hasOprForm: !!document.querySelector("
+                            "    '#recordedDateRange-start,#docTypes-input'),"
+                            "  body: (document.body.innerText || '').toLowerCase()"
+                            "    .slice(0, 600)"
+                            "})"
+                        )
+                        body = diag.get("body") or ""
+                        opr_gone = (not diag.get("hasOprForm")) and (
+                            "commissioners court" in body or "neumo" in body
+                        )
+                    except Exception:
+                        pass
+                    if opr_gone:
+                        logger.error(
+                            "%s lien: Official Public Records search UNAVAILABLE at "
+                            "%s.tx.publicsearch.us — portal appears migrated (only a "
+                            "'Commissioners Court' collection is offered; the "
+                            "recorded-document / lien search form is absent). This is "
+                            "a SOURCE change, not a scraper bug: retry later or locate "
+                            "the county's new OPR search. Returning 0.",
+                            self.COUNTY, self.SUBDOMAIN,
+                        )
+                    else:
+                        logger.warning(
+                            "%s lien: advanced-search form never rendered (anti-bot / "
+                            "slow SPA). Returning 0.", self.COUNTY,
+                        )
                     await browser.close()
                     return []
 
@@ -463,7 +497,10 @@ class BellLienScraper(_PublicSearchLienScraper):
     SUBDOMAIN = "bell"
 
 
-@register("Williamson", "lien")
+# NOTE: Williamson is NO LONGER served here. It replatformed its Official Public
+# Records off GovOS/publicsearch to Tyler "Self-Service" (2026-07-01) — the
+# Williamson/lien scraper now lives in `lien_tyler.py`. This class is kept
+# UNREGISTERED for reference / in case the county ever reverts to publicsearch.
 class WilliamsonLienScraper(_PublicSearchLienScraper):
     COUNTY = "Williamson"
     SUBDOMAIN = "williamson"
