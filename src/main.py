@@ -172,32 +172,113 @@ def _preflight_check(mode: str) -> list[str]:
 
 
 def _collect_sold_records() -> list:
-    """Gather Sold (dropped-off-roll) NoticeData from tax-delinquent scrapers.
+    """Gather CRM-cleanup NoticeData (drop-off round-trips) from the scrapers.
 
-    Each tax-delinquent scraper sets module-level LAST_RUN_SOLD during its
-    scrape() — parcels that were on the roll last run but are gone now (paid
-    off / sold), rehydrated from the prior run's snapshot. These bypass
-    enrichment and ride into the upload CSV tagged "Sold" so DataSift applies
-    the tag to the matching existing record by property-address match. The
-    "Sold Property Cleanup" sequence then fires (status→Sold, remove lists,
-    clear tasks/assignee).
+    Two flavors, both rehydrated from a prior run's snapshot, both bypassing
+    enrichment and riding into the upload CSV as tag-update rows matched to the
+    existing DataSift record by property address:
+
+    - LAST_RUN_SOLD (tax-delinquent scrapers): parcels that fell off the roll
+      (paid off / sold) → tagged "Sold" → "Sold Property Cleanup" sequence
+      (status→Sold, remove all lists, clear tasks/assignee).
+    - LAST_RUN_RESOLVED (code-enforcement scraper): cases that closed/complied
+      → tagged "Code Violation Resolved" → scoped "Code Violation Cleanup"
+      sequence (removes ONLY the Code Violation list — other signals survive).
     """
     from importlib import import_module
 
-    sold: list = []
-    for mod_name in (
-        "tax_delinquent_travis",
-        "tax_delinquent_bell",
-        "tax_delinquent_wilco",
+    cleanup: list = []
+    for mod_name, attr in (
+        ("tax_delinquent_travis", "LAST_RUN_SOLD"),
+        ("tax_delinquent_bell", "LAST_RUN_SOLD"),
+        ("tax_delinquent_wilco", "LAST_RUN_SOLD"),
+        ("code_enforcement_travis", "LAST_RUN_RESOLVED"),
     ):
         try:
             mod = import_module(f"scrapers.{mod_name}")
         except Exception:
             continue
-        recs = getattr(mod, "LAST_RUN_SOLD", None)
+        recs = getattr(mod, attr, None)
         if recs:
-            sold.extend(recs)
-    return sold
+            cleanup.extend(recs)
+    return cleanup
+
+
+def _upload_cleanup_csv_to_drive(cleanup_info: dict, no_drive: bool = False) -> str | None:
+    """Route the drop-off cleanup CSV to the Kessair 03_Sold-Cleanup Drive folder.
+
+    Prefers GOOGLE_DRIVE_CLEANUP_FOLDER_ID (the actual 03_Sold-Cleanup folder,
+    which is a sibling of 00_Inbox and can't be reached from the daily folder by
+    subfolder alone). Falls back to the main lead folder under a
+    '03_Sold-Cleanup/{YYYY}/{MM-Month}' subpath so the file is still clearly
+    separated from the daily lead feed. Returns the webViewLink or None.
+    """
+    import config
+    if no_drive or not config.GOOGLE_SERVICE_ACCOUNT_KEY:
+        return None
+    now = datetime.now()
+    dated = [now.strftime("%Y"), now.strftime("%m-%B")]
+    if config.GOOGLE_DRIVE_CLEANUP_FOLDER_ID:
+        folder = config.GOOGLE_DRIVE_CLEANUP_FOLDER_ID
+        sub = dated if config.GOOGLE_DRIVE_AUTO_FOLDER else None
+    elif config.GOOGLE_DRIVE_FOLDER_ID:
+        folder = config.GOOGLE_DRIVE_FOLDER_ID
+        sub = ["03_Sold-Cleanup", *dated]
+    else:
+        return None
+    from drive_uploader import upload_file
+    return upload_file(
+        Path(cleanup_info["path"]), folder,
+        config.GOOGLE_SERVICE_ACCOUNT_KEY, subfolder_parts=sub,
+    )
+
+
+def _upload_forensics_reports_to_drive(no_drive: bool = False) -> int:
+    """Route cross-run diff JSON reports to the Kessair 04_Forensics-&-Audit folder.
+
+    Best-effort: gathers each scraper's LAST_RUN_REPORT_PATH (tax-delinquent +
+    code-enforcement) and uploads any that exist on local disk. Under Apify the
+    reports are virtual (apify-kvs://) and already drained to KVS, so those are
+    skipped here. Returns the number of reports uploaded.
+    """
+    import config
+    from importlib import import_module
+    if no_drive or not config.GOOGLE_SERVICE_ACCOUNT_KEY:
+        return 0
+    if config.GOOGLE_DRIVE_FORENSICS_FOLDER_ID:
+        folder = config.GOOGLE_DRIVE_FORENSICS_FOLDER_ID
+        base_sub: list = []
+    elif config.GOOGLE_DRIVE_FOLDER_ID:
+        folder = config.GOOGLE_DRIVE_FOLDER_ID
+        base_sub = ["04_Forensics-&-Audit"]
+    else:
+        return 0
+
+    now = datetime.now()
+    dated = [now.strftime("%Y"), now.strftime("%m-%B")]
+    from drive_uploader import upload_file
+    uploaded = 0
+    for mod_name in (
+        "tax_delinquent_travis", "tax_delinquent_bell", "tax_delinquent_wilco",
+        "code_enforcement_travis",
+    ):
+        try:
+            mod = import_module(f"scrapers.{mod_name}")
+        except Exception:
+            continue
+        rp = getattr(mod, "LAST_RUN_REPORT_PATH", None)
+        if not rp:
+            continue
+        p = Path(str(rp))
+        if not p.exists():  # virtual apify-kvs:// path or nothing written
+            continue
+        link = upload_file(
+            p, folder, config.GOOGLE_SERVICE_ACCOUNT_KEY,
+            subfolder_parts=[*base_sub, *dated],
+        )
+        if link:
+            uploaded += 1
+    return uploaded
 
 
 # ── Apify Actor mode ─────────────────────────────────────────────────
@@ -220,6 +301,7 @@ async def actor_main() -> None:
     from time import time as _time
     from scrapers import travis_texdel_state as _texdel_state
     from scrapers import tax_delinquent_state as _gtexdel_state
+    from scrapers import code_enforcement_state as _ce_state
 
     # Bell + Williamson share the generic, county-parameterized texdel state
     # module. (county, KVS key) pairs — slugs match county.lower() cache keys
@@ -267,11 +349,18 @@ async def actor_main() -> None:
         types = actor_input.get("types") or None
         since_date_override = (actor_input.get("since_date") or "").strip()
         drive_folder_id = actor_input.get("google_drive_folder_id", "")
+        drive_reports_folder_id = actor_input.get("google_drive_reports_folder_id", "")
         drive_key_b64 = actor_input.get("google_service_account_key", "")
         if drive_folder_id:
             config.GOOGLE_DRIVE_FOLDER_ID = drive_folder_id
+        if drive_reports_folder_id:
+            config.GOOGLE_DRIVE_REPORTS_FOLDER_ID = drive_reports_folder_id
         if drive_key_b64:
             config.GOOGLE_SERVICE_ACCOUNT_KEY = drive_key_b64
+        if bool(actor_input.get("google_drive_auto_folder", False)):
+            config.GOOGLE_DRIVE_AUTO_FOLDER = True
+        if bool(actor_input.get("datasift_split_by_county", False)):
+            config.DATASIFT_SPLIT_BY_COUNTY = True
 
         # ── Scraper kwargs (tax-delinquent thresholds + skill cleaner knobs) ──
         min_years = int(actor_input.get("min_delinquent_years", 2) or 2)
@@ -443,6 +532,17 @@ async def actor_main() -> None:
                     len(_stored.get("last_run_apns") or []),
                 )
 
+            # ── Load Travis code-enforcement state ──
+            # Same rationale as the texdel loads above: the code-enforcement
+            # scraper calls load_state("Travis") mid-scrape and reads this cache.
+            _stored_ce = await kvs.get_value("travis_codeenf_state") or _ce_state._empty_state()
+            _ce_state.inject_apify_state("Travis", _stored_ce)
+            Actor.log.info(
+                "Loaded Travis code-enforcement state: last_run_date=%s, open_cases=%d",
+                _stored_ce.get("last_run_date", "(none)"),
+                len(_stored_ce.get("last_run_case_ids") or []),
+            )
+
             # ── Scrape ────────────────────────────────────────────
             from scrapers import scrape_targets
             notices = await scrape_targets(
@@ -496,6 +596,10 @@ async def actor_main() -> None:
                     "travis_texdel_state",
                     _texdel_state.snapshot_apify_state(),
                 )
+                await kvs.set_value(
+                    "travis_codeenf_state",
+                    _ce_state.snapshot_apify_state("Travis"),
+                )
                 Actor.log.info("Rebuild complete — exiting without running pipeline")
                 return
 
@@ -544,7 +648,7 @@ async def actor_main() -> None:
             sold_notices = _collect_sold_records()
             if sold_notices:
                 Actor.log.info(
-                    "Collected %d Sold (dropped-off-roll) records to tag in DataSift",
+                    "Collected %d CRM-cleanup (Sold/Resolved) records to tag in DataSift",
                     len(sold_notices),
                 )
 
@@ -564,6 +668,10 @@ async def actor_main() -> None:
                 # produced no surviving notices still updates the baseline.
                 for _cty, _key in _GENERIC_TEXDEL:
                     await kvs.set_value(_key, _gtexdel_state.snapshot_apify_state(_cty))
+                await kvs.set_value(
+                    "travis_codeenf_state",
+                    _ce_state.snapshot_apify_state("Travis"),
+                )
                 if do_notify_slack and config.SLACK_WEBHOOK_URL:
                     try:
                         from slack_notifier import send_slack_notification
@@ -633,8 +741,12 @@ async def actor_main() -> None:
             ]
             if no_reports:
                 Actor.log.info("Deep-prospecting reports disabled (no_reports=True)")
+            # Deep-prospecting PDFs go to the dedicated reports folder
+            # (05_Deep-Prospecting-Reports); falls back to the main lead
+            # folder if a separate reports folder isn't configured.
+            reports_folder = config.GOOGLE_DRIVE_REPORTS_FOLDER_ID or config.GOOGLE_DRIVE_FOLDER_ID
             if dp_candidates and not (
-                config.GOOGLE_DRIVE_FOLDER_ID and config.GOOGLE_SERVICE_ACCOUNT_KEY
+                reports_folder and config.GOOGLE_SERVICE_ACCOUNT_KEY
             ):
                 Actor.log.warning(
                     "Drive creds not set — skipping %d deep-prospecting PDF link(s)",
@@ -644,7 +756,11 @@ async def actor_main() -> None:
                 try:
                     from report_generator import generate_record_pdf
                     from drive_uploader import upload_file
+                    from datetime import datetime as _dt
                     report_dir = Path("output/reports")
+                    _rpt_now = _dt.now()
+                    _rpt_year = _rpt_now.strftime("%Y")
+                    _rpt_month = _rpt_now.strftime("%m-%B")
                     for n in dp_candidates:
                         try:
                             pdf_path = generate_record_pdf(
@@ -653,10 +769,15 @@ async def actor_main() -> None:
                         except Exception:
                             Actor.log.exception("PDF generation failed for %s", n.address)
                             continue
+                        rsub = (
+                            [_rpt_year, _rpt_month, n.county or "Unknown", n.notice_type or "unknown"]
+                            if config.GOOGLE_DRIVE_AUTO_FOLDER else None
+                        )
                         link = upload_file(
                             pdf_path,
-                            config.GOOGLE_DRIVE_FOLDER_ID,
+                            reports_folder,
                             config.GOOGLE_SERVICE_ACCOUNT_KEY,
+                            subfolder_parts=rsub,
                         )
                         if link:
                             pdf_urls.append({"address": n.address, "url": link})
@@ -669,11 +790,10 @@ async def actor_main() -> None:
                 except Exception as e:
                     Actor.log.warning("PDF generator import failed: %s", e)
 
-            # Append Sold rows now (after enrichment/Tracerfy/PDFs, before any
-            # CSV/dataset output) so they upload alongside new records and get
-            # the "Sold" tag applied to their existing DataSift record.
-            if sold_notices:
-                notices.extend(sold_notices)
+            # NOTE: drop-off cleanup records (Sold + Code Violation Resolved) are
+            # NOT merged into `notices`. They go to their own cleanup CSV below
+            # (KVS + 03_Sold-Cleanup Drive folder) for manual upload — kept out
+            # of the lead CSVs, the Dataset, and any auto-upload.
 
             # ── Legacy flat CSV + push records to Dataset ──
             csv_path = write_csv(notices)
@@ -734,6 +854,7 @@ async def actor_main() -> None:
                 from datasift_formatter import write_datasift_by_notice_type
                 csv_infos = write_datasift_by_notice_type(
                     notices, keep_government=keep_government,
+                    split_by_county=config.DATASIFT_SPLIT_BY_COUNTY,
                 )
 
                 kvs_id = kvs._id if hasattr(kvs, "_id") else ""
@@ -753,11 +874,20 @@ async def actor_main() -> None:
                 if config.GOOGLE_DRIVE_FOLDER_ID and config.GOOGLE_SERVICE_ACCOUNT_KEY:
                     try:
                         from drive_uploader import upload_file
+                        from datetime import datetime as _dt
+                        _csv_now = _dt.now()
                         for info in csv_infos:
+                            csub = None
+                            if config.GOOGLE_DRIVE_AUTO_FOLDER:
+                                csub = [_csv_now.strftime("%Y"), _csv_now.strftime("%m-%B")]
+                                if info.get("county"):
+                                    csub.append(info["county"])
+                                csub.append(str(info["label"]).lower().replace(" ", "_"))
                             link = upload_file(
                                 Path(info["path"]),
                                 config.GOOGLE_DRIVE_FOLDER_ID,
                                 config.GOOGLE_SERVICE_ACCOUNT_KEY,
+                                subfolder_parts=csub,
                             )
                             if link:
                                 Actor.log.info("  %s → Drive: %s", info["label"], link)
@@ -770,6 +900,28 @@ async def actor_main() -> None:
                     Actor.log.info("Drive creds not set — skipping Drive upload")
             except Exception as e:
                 Actor.log.error("DataSift CSV generation failed: %s", e)
+
+            # ── Drop-off cleanup CSV (Sold + Code Violation Resolved) ──
+            # Manual-upload artifact: pushed to KVS + the 03_Sold-Cleanup Drive
+            # folder, deliberately kept out of the lead CSVs and any auto-upload.
+            try:
+                from datasift_formatter import write_cleanup_csv
+                cleanup_info = write_cleanup_csv(sold_notices)
+                if cleanup_info:
+                    with open(cleanup_info["path"], "rb") as f:
+                        await kvs.set_value(
+                            "datasift_cleanup.csv", f.read(), content_type="text/csv",
+                        )
+                    Actor.log.info(
+                        "Cleanup CSV: %d records (%d Sold, %d Resolved) → KVS "
+                        "datasift_cleanup.csv [manual upload]",
+                        cleanup_info["count"], cleanup_info["sold"], cleanup_info["resolved"],
+                    )
+                    clink = _upload_cleanup_csv_to_drive(cleanup_info)
+                    if clink:
+                        Actor.log.info("  Cleanup CSV → Drive (03_Sold-Cleanup): %s", clink)
+            except Exception as e:
+                Actor.log.warning("Cleanup CSV generation failed: %s", e)
 
             # ── RAWPIPE: direct API upload to apiv2.reisift.io ──
             # Runs only when the user explicitly enables it. Each CSV
@@ -915,6 +1067,15 @@ async def actor_main() -> None:
             except Exception as e:
                 Actor.log.warning("Failed to drain Bell/Williamson texdel buffers to KVS: %s", e)
 
+            # ── Drain Travis code-enforcement diff reports to KVS ──
+            try:
+                for filename, json_text in _ce_state.drain_apify_reports("Travis"):
+                    await kvs.set_value(
+                        f"travis_codeenf_{filename}", json_text, content_type="application/json",
+                    )
+            except Exception as e:
+                Actor.log.warning("Failed to drain code-enforcement buffers to KVS: %s", e)
+
             # ── Slack notification ──
             elapsed_min = (_time() - pipeline_start) / 60
             cost_breakdown: dict[str, float] = {}
@@ -1004,6 +1165,19 @@ async def actor_main() -> None:
                         except Exception:
                             Actor.log.exception("%s tax-delinquent Slack summary failed", _county_name)
 
+                    # Travis code-enforcement resolution diff (NEW/RESOLVED)
+                    try:
+                        from scrapers import code_enforcement_travis as _ce
+                        if _ce.LAST_RUN_DIFF is not None:
+                            from scrapers.code_enforcement_state import (
+                                DiffResult as _CEDiff,
+                                format_slack_summary as _fmt_ce,
+                            )
+                            msg = _fmt_ce("Travis", _CEDiff(**_ce.LAST_RUN_DIFF))
+                            _send_webhook(msg)
+                    except Exception:
+                        Actor.log.exception("Travis code-enforcement Slack summary failed")
+
                     Actor.log.info("Slack notification sent")
                 except Exception as e:
                     Actor.log.warning("Slack notification failed: %s", e)
@@ -1033,6 +1207,15 @@ async def actor_main() -> None:
                 "Saved Bell/Williamson texdel state: bell=%d, williamson=%d APNs",
                 len(_gtexdel_state.snapshot_apify_state("Bell").get("last_run_apns") or []),
                 len(_gtexdel_state.snapshot_apify_state("Williamson").get("last_run_apns") or []),
+            )
+
+            # ── Persist Travis code-enforcement state for next run ──
+            await kvs.set_value(
+                "travis_codeenf_state", _ce_state.snapshot_apify_state("Travis"),
+            )
+            Actor.log.info(
+                "Saved Travis code-enforcement state: open_cases=%d",
+                len(_ce_state.snapshot_apify_state("Travis").get("last_run_case_ids") or []),
             )
 
             Actor.log.info("Done — %d notices exported (%.1f min)", total, elapsed_min)
@@ -2494,7 +2677,7 @@ def _run_scrape_pipeline(args, targets) -> None:
     sold_notices = _collect_sold_records()
     if sold_notices:
         logging.info(
-            "Collected %d Sold (dropped-off-roll) records to tag in DataSift",
+            "Collected %d CRM-cleanup (Sold/Resolved) records to tag in DataSift",
             len(sold_notices),
         )
 
@@ -2564,11 +2747,10 @@ def _run_scrape_pipeline(args, targets) -> None:
                     except Exception as e:
                         logging.warning("Per-record Trestle scoring failed: %s", e)
 
-    # Append Sold rows now (after enrichment/Tracerfy, before any output) so
-    # they ride into the same CSVs and get the "Sold" tag applied to their
-    # existing DataSift record by address match.
-    if sold_notices:
-        notices.extend(sold_notices)
+    # NOTE: drop-off cleanup records (Sold + Code Violation Resolved) are NOT
+    # merged into `notices`. They are written to their own cleanup CSV below and
+    # uploaded to DataSift manually by the operator — deliberately kept out of
+    # the lead CSVs and any auto-upload.
 
     # Write output
     if args.split:
@@ -2607,7 +2789,22 @@ def _run_scrape_pipeline(args, targets) -> None:
         try:
             from report_generator import generate_record_pdf
             report_dir = Path("output/reports")
+            # PDFs upload to the dedicated reports folder
+            # (05_Deep-Prospecting-Reports); falls back to the main lead folder.
+            reports_folder = config.GOOGLE_DRIVE_REPORTS_FOLDER_ID or config.GOOGLE_DRIVE_FOLDER_ID
+            upload_pdfs_to_drive = (
+                not getattr(args, "no_drive", False)
+                and reports_folder
+                and config.GOOGLE_SERVICE_ACCOUNT_KEY
+            )
+            if upload_pdfs_to_drive:
+                from drive_uploader import upload_file
+            from datetime import datetime as _dt
+            _rpt_now = _dt.now()
+            _rpt_year = _rpt_now.strftime("%Y")
+            _rpt_month = _rpt_now.strftime("%m-%B")
             generated = 0
+            uploaded = 0
             for n in dp_candidates:
                 try:
                     pdf_path = generate_record_pdf(
@@ -2617,9 +2814,26 @@ def _run_scrape_pipeline(args, targets) -> None:
                     generated += 1
                 except Exception:
                     logging.exception("PDF generation failed for %s", n.address)
+                    continue
+                if upload_pdfs_to_drive:
+                    rsub = (
+                        [_rpt_year, _rpt_month, n.county or "Unknown", n.notice_type or "unknown"]
+                        if config.GOOGLE_DRIVE_AUTO_FOLDER else None
+                    )
+                    link = upload_file(
+                        pdf_path,
+                        reports_folder,
+                        config.GOOGLE_SERVICE_ACCOUNT_KEY,
+                        subfolder_parts=rsub,
+                    )
+                    if link:
+                        uploaded += 1
+                        logging.info("  %s → Drive: %s", n.address, link)
+                    else:
+                        logging.error("PDF Drive upload failed for %s", n.address)
             logging.info(
-                "Generated %d/%d deep-prospecting PDFs in %s",
-                generated, len(dp_candidates), report_dir,
+                "Generated %d/%d deep-prospecting PDFs in %s (%d uploaded to Drive)",
+                generated, len(dp_candidates), report_dir, uploaded,
             )
         except Exception:
             logging.exception("Report generator import failed")
@@ -2646,6 +2860,7 @@ def _run_scrape_pipeline(args, targets) -> None:
     csv_infos = write_datasift_by_notice_type(
         notices,
         keep_government=getattr(args, "keep_government_records", False),
+        split_by_county=config.DATASIFT_SPLIT_BY_COUNTY,
     )
     for info in csv_infos:
         logging.info("DataSift CSV (%s): %s", info["label"], info["path"])
@@ -2655,12 +2870,21 @@ def _run_scrape_pipeline(args, targets) -> None:
     drive_links: list[dict] = []
     if not getattr(args, "no_drive", False) and config.GOOGLE_DRIVE_FOLDER_ID and config.GOOGLE_SERVICE_ACCOUNT_KEY:
         from drive_uploader import upload_file
+        from datetime import datetime as _dt
+        _csv_now = _dt.now()
         logging.info("Uploading DataSift CSVs to Google Drive...")
         for info in csv_infos:
+            csub = None
+            if config.GOOGLE_DRIVE_AUTO_FOLDER:
+                csub = [_csv_now.strftime("%Y"), _csv_now.strftime("%m-%B")]
+                if info.get("county"):
+                    csub.append(info["county"])
+                csub.append(str(info["label"]).lower().replace(" ", "_"))
             link = upload_file(
                 Path(info["path"]),
                 config.GOOGLE_DRIVE_FOLDER_ID,
                 config.GOOGLE_SERVICE_ACCOUNT_KEY,
+                subfolder_parts=csub,
             )
             if link:
                 logging.info("  %s → Drive: %s", info["label"], link)
@@ -2674,6 +2898,25 @@ def _run_scrape_pipeline(args, targets) -> None:
             "Drive creds not set — skipping Drive upload "
             "(set GOOGLE_DRIVE_FOLDER_ID + GOOGLE_SERVICE_ACCOUNT_KEY to enable)"
         )
+
+    # Drop-off cleanup CSV (Sold + Code Violation Resolved) — a review /
+    # manual-upload artifact kept OUT of the lead CSVs and any auto-upload.
+    # Routed to the Kessair 03_Sold-Cleanup Drive folder; diff JSON reports go
+    # to 04_Forensics-&-Audit.
+    from datasift_formatter import write_cleanup_csv
+    cleanup_info = write_cleanup_csv(sold_notices)
+    if cleanup_info:
+        logging.info(
+            "Cleanup CSV: %d records (%d Sold, %d Resolved) → %s [manual upload]",
+            cleanup_info["count"], cleanup_info["sold"], cleanup_info["resolved"],
+            cleanup_info["path"],
+        )
+        clink = _upload_cleanup_csv_to_drive(cleanup_info, no_drive=getattr(args, "no_drive", False))
+        if clink:
+            logging.info("  Cleanup CSV → Drive (03_Sold-Cleanup): %s", clink)
+    _forensics_n = _upload_forensics_reports_to_drive(no_drive=getattr(args, "no_drive", False))
+    if _forensics_n:
+        logging.info("  %d diff report(s) → Drive (04_Forensics-&-Audit)", _forensics_n)
 
     upload_result = {
         "success": True,
@@ -2935,6 +3178,20 @@ def _run_scrape_pipeline(args, targets) -> None:
                     _send_webhook(msg)
             except Exception:
                 logging.exception("%s tax-delinquent Slack summary failed", _county_name)
+
+        # Travis code-enforcement resolution diff (NEW open / RESOLVED). Surfaces
+        # which addresses got their code-enforcement case solved this cycle.
+        try:
+            from scrapers import code_enforcement_travis as _ce
+            if _ce.LAST_RUN_DIFF is not None:
+                from scrapers.code_enforcement_state import (
+                    DiffResult as _CEDiff,
+                    format_slack_summary as _fmt_ce,
+                )
+                msg = _fmt_ce("Travis", _CEDiff(**_ce.LAST_RUN_DIFF))
+                _send_webhook(msg)
+        except Exception:
+            logging.exception("Travis code-enforcement Slack summary failed")
 
     # Audit DataSift for incomplete records (future daily check)
     if getattr(args, "audit_records", False):

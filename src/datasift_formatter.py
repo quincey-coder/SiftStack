@@ -381,6 +381,22 @@ def _build_tags(notice: NoticeData) -> str:
                 pass
         return ",".join(sold_tags)
 
+    # Resolved code-enforcement case: a scoped tag-update row. "Code Violation
+    # Resolved" is the trigger for the "Code Violation Cleanup" sequence, which
+    # removes ONLY the Code Violation list — this is NOT a Sold, so other
+    # distress signals on the same property (probate/tax/lien) survive.
+    if notice.record_status == "resolved":
+        res_tags = ["Code Violation Resolved"]
+        if notice.county:
+            res_tags.append(notice.county.lower())
+        if notice.date_added:
+            try:
+                dt = datetime.strptime(notice.date_added, "%Y-%m-%d")
+                res_tags.append(f"resolved_{dt.strftime('%Y-%m')}")
+            except ValueError:
+                pass
+        return ",".join(res_tags)
+
     tags = ["Courthouse Data"]
 
     # Notice type
@@ -975,6 +991,18 @@ def _build_row(notice: NoticeData, notes_override: str | None = None) -> dict:
             f"Dropped off {notice.county} tax-delinquent roll on "
             f"{_format_date(notice.date_added)} — likely paid off or sold."
         )
+    elif notice.record_status == "resolved":
+        # Scoped cleanup: blank Lists so we don't re-add to the Code Violation
+        # list — the "Code Violation Cleanup" sequence removes only that list.
+        # Value/tax fields stay blank so this tag-update row doesn't overwrite
+        # the record. The resolution note always wins over notes_override.
+        list_name = ""
+        detail = notice.resolution_note or "resolved"
+        case_ref = f" {notice.case_id}" if notice.case_id else ""
+        notes = (
+            f"Code-enforcement case{case_ref} resolved ({detail}) — "
+            "removed from Code Violation marketing."
+        )
     else:
         list_name = NOTICE_TYPE_TO_LIST.get(notice.notice_type, "")
         notes = notes_override if notes_override is not None else _build_notes(notice)
@@ -1280,6 +1308,7 @@ def write_datasift_by_notice_type(
     notices: list[NoticeData],
     date_str: str | None = None,
     keep_government: bool = False,
+    split_by_county: bool = False,
 ) -> list[dict]:
     """One CSV per distress type (notice_type), plus a combined Heirs CSV.
 
@@ -1330,19 +1359,28 @@ def write_datasift_by_notice_type(
     if govt_dropped:
         logger.info("Dropped %d government-entity records (Travis County, City Of, etc.)", govt_dropped)
 
-    # Group by notice_type. Preserve the canonical order from NOTICE_TYPE_TO_LIST
-    # so the uploader processes them in a predictable sequence; any unknown
-    # notice_type values get appended after in insertion order.
-    groups: dict[str, list[NoticeData]] = {}
+    # Group by notice_type (and county when split_by_county). Preserve the
+    # canonical order from NOTICE_TYPE_TO_LIST so the uploader processes them in
+    # a predictable sequence; unknown notice_type values sort last. When
+    # splitting by county, the list name stays the notice type (so DataSift CRM
+    # lists remain per-type and all counties merge into one list), but each
+    # county gets its own CSV + a "county" field for per-county tracking.
+    groups: dict[tuple[str, str], list[NoticeData]] = {}
     for n in filtered:
         ntype = (n.notice_type or "").strip().lower()
-        groups.setdefault(ntype, []).append(n)
+        county = (n.county or "").strip() if split_by_county else ""
+        groups.setdefault((county, ntype), []).append(n)
 
-    ordered_types = [t for t in NOTICE_TYPE_TO_LIST if t in groups]
-    ordered_types += [t for t in groups if t not in NOTICE_TYPE_TO_LIST]
+    def _order_key(key: tuple[str, str]) -> tuple[int, str]:
+        county, ntype = key
+        try:
+            type_rank = list(NOTICE_TYPE_TO_LIST).index(ntype)
+        except ValueError:
+            type_rank = len(NOTICE_TYPE_TO_LIST)
+        return (type_rank, county)
 
-    for ntype in ordered_types:
-        group = groups[ntype]
+    for county, ntype in sorted(groups, key=_order_key):
+        group = groups[(county, ntype)]
         if not group:
             continue
 
@@ -1352,9 +1390,12 @@ def write_datasift_by_notice_type(
             logger.warning("Unknown notice_type '%s' — deriving list name", ntype)
             list_name = ntype.replace("_", " ").title() if ntype else "Unknown"
 
-        # Filename-safe slug: lowercase with underscores.
+        # Filename-safe slugs: lowercase with underscores. County prefix is
+        # added to the filename only when splitting by county.
         slug = re.sub(r"[^a-z0-9]+", "_", ntype or "unknown").strip("_") or "unknown"
-        csv_path = OUTPUT_DIR / f"datasift_{slug}_{timestamp}.csv"
+        county_slug = re.sub(r"[^a-z0-9]+", "_", county.lower()).strip("_")
+        prefix = f"{county_slug}_" if county_slug else ""
+        csv_path = OUTPUT_DIR / f"datasift_{prefix}{slug}_{timestamp}.csv"
 
         written = 0
         incomplete = 0
@@ -1373,7 +1414,8 @@ def write_datasift_by_notice_type(
                 writer.writerow(row)
                 written += 1
 
-        logger.info("%s CSV: %d records → %s", list_name, written, csv_path)
+        label_disp = f"{county} {list_name}".strip() if county else list_name
+        logger.info("%s CSV: %d records → %s", label_disp, written, csv_path)
         if incomplete:
             logger.warning(
                 "  completeness: %d/%d clean, %d incomplete (%s)",
@@ -1386,6 +1428,7 @@ def write_datasift_by_notice_type(
             "label": list_name,
             "list_name": list_name,
             "count": written,
+            "county": county,
         })
 
     # Final Heirs CSV — deceased-with-heirs across all notice_types, uploaded
@@ -1413,8 +1456,55 @@ def write_datasift_by_notice_type(
             "label": "Heirs",
             "list_name": "Heirs",
             "count": heir_written,
+            "county": "",
         })
     else:
         logger.info("No deceased records with heir data — skipping Heirs CSV")
 
     return results
+
+
+def write_cleanup_csv(cleanup_notices: list[NoticeData]) -> dict | None:
+    """Write all drop-off cleanup rows to ONE CSV (record_status in sold/resolved).
+
+    These are tag-update rows matched to an existing DataSift record by property
+    address — "Sold" (a parcel that fell off the tax-delinquent roll) and
+    "Code Violation Resolved" (a code-enforcement case that closed/complied).
+    They are kept OUT of the per-type lead CSVs so they aren't auto-uploaded as
+    new leads; this file is a review / manual-upload artifact that lands in the
+    Kessair 03_Sold-Cleanup Drive folder.
+
+    Returns {"path", "label", "count", "sold", "resolved"} or None if there are
+    no cleanup records.
+    """
+    cleanup = [
+        n for n in cleanup_notices
+        if getattr(n, "record_status", "") in ("sold", "resolved")
+    ]
+    if not cleanup:
+        return None
+
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    csv_path = OUTPUT_DIR / f"datasift_cleanup_{timestamp}.csv"
+    sold = resolved = 0
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=DATASIFT_COLUMNS)
+        writer.writeheader()
+        for notice in cleanup:
+            writer.writerow(_build_row(notice))
+            if notice.record_status == "sold":
+                sold += 1
+            else:
+                resolved += 1
+
+    logger.info(
+        "Cleanup CSV: %d records (%d Sold, %d Resolved) → %s",
+        len(cleanup), sold, resolved, csv_path,
+    )
+    return {
+        "path": csv_path,
+        "label": "Cleanup",
+        "count": len(cleanup),
+        "sold": sold,
+        "resolved": resolved,
+    }

@@ -273,12 +273,33 @@
             "editor": "checkbox"
         },
         "google_drive_folder_id": {
-            "title": "Google Drive Folder ID",
+            "title": "Google Drive Folder ID (raw records → 00_Inbox/daily)",
             "type": "string",
-            "description": "Drive folder ID for CSV upload. Leave empty to skip.",
+            "description": "Drive folder ID for the raw scraped record CSVs — point this at 00_Inbox/daily (these are records, not leads). Leave empty to skip Drive upload.",
             "editor": "textfield",
             "default": "",
             "sectionCaption": "Google Drive"
+        },
+        "google_drive_reports_folder_id": {
+            "title": "Google Drive Reports Folder ID (PDFs → 05_Deep-Prospecting-Reports)",
+            "type": "string",
+            "description": "Drive folder ID for deep-prospecting PDF reports. Leave empty to send PDFs to the same folder as the CSVs.",
+            "editor": "textfield",
+            "default": ""
+        },
+        "google_drive_auto_folder": {
+            "title": "Auto-organize Drive uploads into dated subfolders",
+            "type": "boolean",
+            "description": "Sort uploads into Year / MM-Month / County / Type folders instead of dropping them flat (e.g. 2026/07-July/Travis/probate/).",
+            "editor": "checkbox",
+            "default": false
+        },
+        "datasift_split_by_county": {
+            "title": "Split lead CSVs per county",
+            "type": "boolean",
+            "description": "Write one lead CSV per county+type (e.g. Travis_probate, Bell_probate) for per-county tracking, instead of one combined CSV per type. DataSift list names stay per-type.",
+            "editor": "checkbox",
+            "default": false
         },
         "google_service_account_key": {
             "title": "Google Service Account Key (base64)",
