@@ -216,6 +216,7 @@ class NoticeData:
     violation_description: str = ""    # e.g. "Structure Condition Violation(s)"
     compliance_deadline: str = ""      # Date owner must comply by (YYYY-MM-DD), if stated
     case_status: str = ""              # e.g. "Active"/"Open"/"Closed"/"In Compliance" — drives closed-case filter
+    case_id: str = ""                  # Source case number (Austin Code case_id) — cross-run key for resolution tracking
     # Travis tax-delinquent cleaner outputs (empty for all other scrapers)
     business_name: str = ""            # Entity name when owner_name is business (skill overflow merge result)
     mailing_address: str = ""          # Cleaned mailing address, distinct from property address
@@ -285,8 +286,14 @@ class NoticeData:
     # Record lifecycle status. "sold" marks a parcel that dropped off the
     # tax-delinquent roll since the last run (paid off / sold) — rehydrated
     # from the prior run's snapshot and tagged "Sold" so DataSift applies the
-    # tag to the matching existing record by address. "" = normal record.
+    # tag to the matching existing record by address. "resolved" marks a
+    # code-enforcement case that closed/complied since the last run — rehydrated
+    # the same way and tagged "Code Violation Resolved" for a scoped list-only
+    # cleanup (NOT a Sold). "" = normal record.
     record_status: str = ""
+    # Human-readable resolution detail for a "resolved" code-violation record,
+    # e.g. "Closed on 2026-06-14" — rendered into the DataSift Notes column.
+    resolution_note: str = ""
     # Lien fields (notice_type == "lien"). County-clerk OPR liens are indexed
     # against a debtor by NAME, usually with no property address — the address
     # is backfilled via CAD name search (enrichment Step 3c). The lead is the
