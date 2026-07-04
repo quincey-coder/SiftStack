@@ -16,6 +16,7 @@ Account protection is #1 priority:
 import asyncio
 import json
 import logging
+import os
 import random
 import re
 from datetime import date
@@ -33,6 +34,12 @@ SIGNIN_URL = "https://www.ancestry.com/account/signin"
 # Daily page load counter
 PAGE_LOAD_FILE = Path(__file__).resolve().parent.parent / ".ancestry_page_loads.json"
 DAILY_LIMIT = 100
+
+# Max seconds to wait for the sign-in round-trip to resolve. Ancestry runs a
+# silent background bot/identity check before redirecting off /account/signin
+# (typically 10-30s), so a single short wait is not enough. Override with
+# ANCESTRY_LOGIN_TIMEOUT if needed.
+LOGIN_TIMEOUT_S = int(os.getenv("ANCESTRY_LOGIN_TIMEOUT", "40"))
 
 # ── Page load tracking ──────────────────────────────────────────────
 
@@ -109,6 +116,85 @@ def reset_circuit_breaker():
 
 
 # ── Login ───────────────────────────────────────────────────────────
+
+
+async def _is_authenticated(page) -> bool:
+    """True if the current page shows an authenticated session (account menu
+    present, or we've been redirected off the signin page)."""
+    try:
+        return await page.evaluate("""() => {
+            const url = location.href.toLowerCase();
+            const hasAccount = !!document.querySelector(
+                'a[href*="account/profile"], a[href*="account/settings"], [class*="userName"], [data-tracking-name*="account" i]');
+            const onSignin = url.includes('signin') || url.includes('account/signin');
+            return hasAccount || !onSignin;
+        }""")
+    except Exception:
+        return False
+
+
+async def _login_challenge_visible(page) -> bool:
+    """True if a verification challenge is on screen that automated login can't
+    clear (one-time code / 2-step / CAPTCHA / Arkose)."""
+    try:
+        body = (await page.evaluate("() => (document.body.innerText||'').toLowerCase()")) or ""
+    except Exception:
+        return False
+    phrases = [
+        "one-time code", "enter the code", "code we sent", "verify it's you",
+        "verify its you", "two-step", "2-step", "confirm your identity",
+        "unusual activity", "verify you're human", "verify you are human",
+        "not a robot", "security check",
+    ]
+    if any(p in body for p in phrases):
+        return True
+    try:
+        has_arkose = await page.evaluate(
+            """() => !!document.querySelector('iframe[src*="arkose" i], iframe[src*="funcaptcha" i], iframe[src*="recaptcha" i], iframe[src*="hcaptcha" i], #arkose, [id*="funcaptcha" i]')"""
+        )
+    except Exception:
+        has_arkose = False
+    return bool(has_arkose)
+
+
+async def _login_error_visible(page) -> bool:
+    """True if the signin form is showing a credential-rejected error."""
+    try:
+        alerts = await page.evaluate(
+            """() => [...document.querySelectorAll('[role=alert], [class*=error i], [class*=alert i], [aria-live]')].map(e => (e.innerText||'').toLowerCase()).join(' ')"""
+        )
+    except Exception:
+        return False
+    return any(p in (alerts or "") for p in [
+        "incorrect", "doesn't match", "does not match", "couldn't find",
+        "could not find", "wrong password", "invalid", "try again",
+    ])
+
+
+async def _await_login_result(page, timeout_s: int = 40) -> str:
+    """Poll after submitting the signin form until the outcome is known.
+
+    Returns one of: 'authenticated', 'challenge', 'bad_credentials', 'timeout'.
+    Ancestry's silent background bot-check means the redirect can lag 10-30s, so
+    we keep checking rather than reading the URL a single time.
+    """
+    deadline = timeout_s
+    waited = 0.0
+    while waited < deadline:
+        if await _is_authenticated(page):
+            return "authenticated"
+        if await _check_blocked(page) or await _login_challenge_visible(page):
+            return "challenge"
+        if await _login_error_visible(page):
+            return "bad_credentials"
+        await asyncio.sleep(2.0)
+        waited += 2.0
+    # One last check — the redirect may have landed right at the deadline.
+    if await _is_authenticated(page):
+        return "authenticated"
+    if await _login_challenge_visible(page):
+        return "challenge"
+    return "timeout"
 
 
 async def _ensure_logged_in(page) -> bool:
@@ -195,23 +281,35 @@ async def _auto_login(page) -> bool:
         logger.error("Cannot find sign-in button")
         return False
 
-    await _delay(3, 5)
-
-    if await _check_blocked(page):
+    # Ancestry's sign-in round-trip runs a silent background bot/identity check
+    # before it redirects away from /account/signin — this commonly takes
+    # 10-30s, far longer than a single fixed wait. Poll for the outcome instead
+    # of checking the URL once (the old bug: a fixed 3-5s wait aborted logins
+    # that would have succeeded moments later).
+    result = await _await_login_result(page, timeout_s=LOGIN_TIMEOUT_S)
+    if result == "authenticated":
+        logger.info("Login successful: %s", page.url)
+        # Warm-up
+        await page.goto(ANCESTRY_URL, wait_until="domcontentloaded")
+        _increment_page_loads()
+        await _delay(2, 3)
+        return True
+    if result == "challenge":
+        logger.error(
+            "Ancestry login hit a verification challenge (CAPTCHA/2FA/one-time code). "
+            "Automated login can't solve it — run a manual bootstrap login "
+            "(python src/ancestry_enricher.py bootstrap) to seed the session profile."
+        )
         return False
-
-    if "signin" in page.url.lower():
-        logger.error("Login failed — still on signin page")
+    if result == "bad_credentials":
+        logger.error("Ancestry login rejected — check ANCESTRY_EMAIL / ANCESTRY_PASSWORD")
         return False
-
-    logger.info("Login successful: %s", page.url)
-
-    # Warm-up
-    await page.goto(ANCESTRY_URL, wait_until="domcontentloaded")
-    _increment_page_loads()
-    await _delay(2, 3)
-
-    return True
+    logger.error(
+        "Ancestry login did not complete within %ds (still on signin). If this "
+        "persists, seed a session with: python src/ancestry_enricher.py bootstrap",
+        LOGIN_TIMEOUT_S,
+    )
+    return False
 
 
 # ── Browser lifecycle ───────────────────────────────────────────────
@@ -254,6 +352,58 @@ async def close_browser(pw, context):
             await pw.stop()
         except Exception:
             pass
+
+
+async def bootstrap_login(wait_s: int = 240) -> bool:
+    """Manual one-time login to seed the persistent profile.
+
+    Opens a headed browser on the signin page and waits for a human to complete
+    login (including any CAPTCHA / one-time-code / 2-step challenge). Once
+    authenticated, the session is saved to the persistent profile and reused by
+    all future automated runs. Use when automated login hits a hard challenge.
+    """
+    from playwright.async_api import async_playwright
+
+    if not cfg.ANCESTRY_EMAIL or not cfg.ANCESTRY_PASSWORD:
+        logger.warning("No ANCESTRY_EMAIL/PASSWORD set — you'll need to type them in the browser.")
+
+    PROFILE_DIR.mkdir(exist_ok=True)
+    pw = await async_playwright().start()
+    context = await pw.chromium.launch_persistent_context(
+        str(PROFILE_DIR),
+        headless=False,
+        viewport={"width": 1440, "height": 900},
+        args=["--disable-blink-features=AutomationControlled"],
+    )
+    page = context.pages[0] if context.pages else await context.new_page()
+    try:
+        if await _is_authenticated(page) or await _ensure_logged_in(page):
+            # _ensure_logged_in may already succeed via auto-login now.
+            pass
+        await page.goto(SIGNIN_URL, wait_until="domcontentloaded")
+        # Pre-fill to save typing; the human presses Sign in and solves any challenge.
+        try:
+            if cfg.ANCESTRY_EMAIL:
+                await page.fill("input[name='username']", cfg.ANCESTRY_EMAIL)
+            if cfg.ANCESTRY_PASSWORD:
+                await page.fill("input[name='password']", cfg.ANCESTRY_PASSWORD)
+        except Exception:
+            pass
+        logger.info("Complete the login in the browser window (solve any CAPTCHA/2FA). "
+                    "Waiting up to %ds…", wait_s)
+        waited = 0.0
+        while waited < wait_s:
+            if await _is_authenticated(page):
+                logger.info("✅ Ancestry session established and saved to %s", PROFILE_DIR)
+                await asyncio.sleep(2)
+                return True
+            await asyncio.sleep(3)
+            waited += 3
+        logger.error("Bootstrap timed out after %ds — session not established.", wait_s)
+        return False
+    finally:
+        await context.close()
+        await pw.stop()
 
 
 # ── Search: SSDI ────────────────────────────────────────────────────
@@ -1207,3 +1357,22 @@ async def lookup_deceased(
 
     logger.debug("Ancestry: no match for %s %s", first_name, last_name)
     return None
+
+
+# ── CLI: manual session bootstrap ───────────────────────────────────
+
+if __name__ == "__main__":
+    import sys
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)-7s %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "bootstrap"
+    if cmd == "bootstrap":
+        ok = asyncio.run(bootstrap_login())
+        sys.exit(0 if ok else 1)
+    else:
+        print("Usage: python src/ancestry_enricher.py bootstrap")
+        sys.exit(2)

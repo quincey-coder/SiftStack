@@ -9,7 +9,8 @@ from obituary_enricher import (
     parse_tax_owner_name, identify_decision_maker, _is_obituary_url,
     rank_decision_makers, _extract_structured_text, _is_listing_url,
     _extract_personal_from_trust_estate, _get_name_variants,
-    _parse_notice_owner_name,
+    _parse_notice_owner_name, _middle_name_conflict, _validate_obituary_match,
+    _norm_state, _dod_sanity_check,
 )
 from notice_parser import NoticeData
 
@@ -557,6 +558,122 @@ def test_nickname_case_insensitive():
     """Should work regardless of case."""
     variants = _get_name_variants("MARGARET")
     assert "maggie" in variants or "peggy" in variants
+
+
+# ── Match-validation gate: middle-name veto (fix #2) ────────────────
+
+
+def test_middle_name_conflict_initial_vs_full():
+    # 'Michael T Conner' vs 'Michael Ralph Conner' — different person.
+    assert _middle_name_conflict("Michael T Conner", "Michael Ralph Conner") is True
+
+
+def test_middle_name_conflict_tax_format():
+    # Surname-first tax name compares correctly (word order irrelevant).
+    assert _middle_name_conflict("CONNER MICHAEL T", "Michael Ralph Conner") is True
+
+
+def test_middle_name_owner_missing_middle_is_tolerant():
+    assert _middle_name_conflict("Michael Conner", "Michael Ralph Conner") is False
+
+
+def test_middle_name_obit_missing_middle_is_tolerant():
+    assert _middle_name_conflict("Robert Lee Jones", "Robert Jones") is False
+
+
+def test_middle_name_initial_compatible():
+    # 'B' is compatible with 'Bruce'.
+    assert _middle_name_conflict("John B Thornton", "John Bruce Thornton") is False
+
+
+def test_middle_name_identical():
+    assert _middle_name_conflict("John Bruce Thornton", "John Bruce Thornton") is False
+
+
+def test_middle_name_two_full_middles_conflict():
+    assert _middle_name_conflict("Mary Jane Smith", "Mary Ann Smith") is True
+
+
+def test_validate_rejects_middle_conflict():
+    n = NoticeData(owner_name="Michael T Conner", city="Waller", state="TX",
+                   date_added="2025-07-03")
+    parsed = {"full_name": "Michael Ralph Conner", "confidence": "high",
+              "date_of_death": "2025-07-03", "state": "TX"}
+    ok, why = _validate_obituary_match(parsed, n, "Michael T Conner", "snippet")
+    assert ok is False and "middle-name" in why
+
+
+# ── Match-validation gate: geographic veto (fix #3) ─────────────────
+
+
+def test_norm_state():
+    assert _norm_state("Kansas") == "KS"
+    assert _norm_state("tx") == "TX"
+    assert _norm_state("TX") == "TX"
+    assert _norm_state("zzz") == ""
+    assert _norm_state("") == ""
+
+
+def test_validate_rejects_out_of_state_no_tie():
+    n = NoticeData(owner_name="John Bruce Thornton", city="Austin", state="TX",
+                   date_added="2025-06-01")
+    parsed = {"full_name": "John Bruce Thornton", "confidence": "high",
+              "state": "KS", "city": "Wichita"}
+    ok, why = _validate_obituary_match(parsed, n, "John Bruce Thornton", "full_page", "")
+    assert ok is False and "geographic" in why
+
+
+def test_validate_allows_out_of_state_with_texas_tie():
+    n = NoticeData(owner_name="John Bruce Thornton", city="Austin", state="TX",
+                   date_added="2025-06-01")
+    parsed = {"full_name": "John Bruce Thornton", "confidence": "high",
+              "state": "KS", "city": "Wichita"}
+    text = "John moved to Wichita after decades in Austin, Texas."
+    ok, _ = _validate_obituary_match(parsed, n, "John Bruce Thornton", "full_page", text)
+    assert ok is True
+
+
+def test_validate_allows_texas_obituary():
+    n = NoticeData(owner_name="John Bruce Thornton", city="Austin", state="TX",
+                   date_added="2025-06-01")
+    parsed = {"full_name": "John Bruce Thornton", "confidence": "high",
+              "state": "TX", "city": "Austin"}
+    ok, _ = _validate_obituary_match(parsed, n, "John Bruce Thornton", "full_page", "")
+    assert ok is True
+
+
+def test_validate_no_state_no_veto():
+    n = NoticeData(owner_name="John Bruce Thornton", city="Austin", state="TX",
+                   date_added="2025-06-01")
+    parsed = {"full_name": "John Bruce Thornton", "confidence": "high",
+              "state": "", "city": ""}
+    ok, _ = _validate_obituary_match(parsed, n, "John Bruce Thornton", "full_page", "")
+    assert ok is True
+
+
+# ── DOD sanity guard (fix #2) ───────────────────────────────────────
+
+
+def test_dod_after_record_date_rejected():
+    # DOD materially after the record date is impossible / a parse artifact.
+    n = NoticeData(owner_name="X", date_added="2025-06-01")
+    assert _dod_sanity_check("2025-07-15", n) is False
+
+
+def test_dod_same_day_allowed():
+    # Same-day (within the 7-day skew window) is not rejected by this guard alone.
+    n = NoticeData(owner_name="X", date_added="2025-07-03")
+    assert _dod_sanity_check("2025-07-03", n) is True
+
+
+def test_dod_recent_past_allowed():
+    n = NoticeData(owner_name="X", date_added="2025-06-01")
+    assert _dod_sanity_check("2025-03-29", n) is True
+
+
+def test_dod_too_old_rejected():
+    n = NoticeData(owner_name="X", date_added="2025-06-01")
+    assert _dod_sanity_check("2018-01-01", n) is False
 
 
 if __name__ == "__main__":

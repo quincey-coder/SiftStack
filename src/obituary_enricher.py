@@ -56,7 +56,8 @@ def _dod_sanity_check(dod_str: str, notice: "NoticeData") -> bool:
     try:
         dod = datetime.strptime(dod_str.strip(), "%Y-%m-%d")
         ref = datetime.strptime(reference_date.strip(), "%Y-%m-%d")
-        gap_years = (ref - dod).days / 365.25
+        gap_days = (ref - dod).days
+        gap_years = gap_days / 365.25
         if gap_years > MAX_DOD_GAP_YEARS:
             logger.warning(
                 "  DOD sanity check FAILED: DOD %s is %.1f years before filing date %s "
@@ -64,10 +65,12 @@ def _dod_sanity_check(dod_str: str, notice: "NoticeData") -> bool:
                 dod_str, gap_years, reference_date, MAX_DOD_GAP_YEARS,
             )
             return False
-        if gap_years < -0.5:
-            # DOD is in the future relative to notice — clearly wrong
+        if gap_days < -7:
+            # DOD is (materially) after the record date — impossible/parse artifact
+            # (e.g. the LLM lifted the obituary's publication or "today" date). A
+            # 7-day window absorbs minor date skew.
             logger.warning(
-                "  DOD sanity check FAILED: DOD %s is after filing date %s — invalid match",
+                "  DOD sanity check FAILED: DOD %s is after record date %s — invalid match",
                 dod_str, reference_date,
             )
             return False
@@ -330,6 +333,7 @@ Return a JSON object with these exact keys:
 - "full_name": the deceased person's full name from the obituary
 - "date_of_death": date of death in YYYY-MM-DD format (empty string if not found)
 - "city": city where they lived/died
+- "state": two-letter US state where the deceased lived or died (e.g. "TX", "KS"); empty string if not stated
 - "age_at_death": integer age at death (0 if not found)
 - "survivors": array of objects with "name", "relationship", and "city" keys for each surviving family member. \
 Extract ALL survivors mentioned anywhere in the text. Look for "survived by", "leaves behind", "cherished by", \
@@ -343,8 +347,11 @@ someone the obituary names by first name only — return the name verbatim or om
 - "executor_named": name of executor/personal representative if mentioned, empty string if not
 
 Important: Only set "match" to true if the first AND last name match the owner. \
-Common names need location confirmation. Be conservative; a false negative is better \
-than a false positive.
+If the owner and obituary both have a middle name/initial and they CONFLICT \
+(e.g. owner "Michael T" vs obituary "Michael Ralph"), set match=false — that is a \
+different person. If the obituary is clearly anchored in a state other than Texas \
+and the text shows no Texas connection, set match=false. Common names need location \
+confirmation. Be conservative; a false negative is better than a false positive.
 
 CRITICAL grounding rule: For "survivors", "preceded_in_death", and "executor_named", \
 include ONLY people whose names are written verbatim in the obituary text below. Never \
@@ -410,6 +417,107 @@ def _is_same_person(a: str, b: str) -> bool:
         return "" if s in ("", "SR") else s
 
     return _bucket(_gen_suffix(a)) == _bucket(_gen_suffix(b))
+
+
+def _middle_name_conflict(owner_name: str, obit_name: str) -> bool:
+    """True when owner and obituary names carry *conflicting* middle names/
+    initials (e.g. 'Michael T Conner' vs 'Michael Ralph Conner' — a different
+    person the LLM let through on first+last alone).
+
+    Tolerant when either side omits a middle (records routinely do): the veto
+    fires only when BOTH names have a middle token and none are compatible.
+    Compatible = equal tokens, or an initial matching the other's first letter
+    ('T' vs 'Thomas'). Word order is irrelevant, so a surname-first tax name
+    ('CONNER MICHAEL T') compares correctly against 'Michael Ralph Conner'.
+    """
+    ow = [t for t in re.findall(r"[A-Z]+", (owner_name or "").upper()) if t not in _GEN_SUFFIXES]
+    ob = [t for t in re.findall(r"[A-Z]+", (obit_name or "").upper()) if t not in _GEN_SUFFIXES]
+    if len(ow) < 2 or len(ob) < 2:
+        return False
+    core = {ob[0], ob[-1]}          # obituary first + last name
+    owner_mids = [t for t in ow if t not in core]
+    obit_mids = [t for t in ob if t not in core]
+    if not owner_mids or not obit_mids:
+        return False
+
+    def _compat(x: str, y: str) -> bool:
+        if len(x) == 1 or len(y) == 1:
+            return x[0] == y[0]
+        return x == y
+
+    for x in owner_mids:
+        for y in obit_mids:
+            if _compat(x, y):
+                return False
+    return True
+
+
+_US_STATE_ABBR = {
+    "ALABAMA": "AL", "ALASKA": "AK", "ARIZONA": "AZ", "ARKANSAS": "AR",
+    "CALIFORNIA": "CA", "COLORADO": "CO", "CONNECTICUT": "CT", "DELAWARE": "DE",
+    "FLORIDA": "FL", "GEORGIA": "GA", "HAWAII": "HI", "IDAHO": "ID",
+    "ILLINOIS": "IL", "INDIANA": "IN", "IOWA": "IA", "KANSAS": "KS",
+    "KENTUCKY": "KY", "LOUISIANA": "LA", "MAINE": "ME", "MARYLAND": "MD",
+    "MASSACHUSETTS": "MA", "MICHIGAN": "MI", "MINNESOTA": "MN", "MISSISSIPPI": "MS",
+    "MISSOURI": "MO", "MONTANA": "MT", "NEBRASKA": "NE", "NEVADA": "NV",
+    "NEW HAMPSHIRE": "NH", "NEW JERSEY": "NJ", "NEW MEXICO": "NM", "NEW YORK": "NY",
+    "NORTH CAROLINA": "NC", "NORTH DAKOTA": "ND", "OHIO": "OH", "OKLAHOMA": "OK",
+    "OREGON": "OR", "PENNSYLVANIA": "PA", "RHODE ISLAND": "RI", "SOUTH CAROLINA": "SC",
+    "SOUTH DAKOTA": "SD", "TENNESSEE": "TN", "TEXAS": "TX", "UTAH": "UT",
+    "VERMONT": "VT", "VIRGINIA": "VA", "WASHINGTON": "WA", "WEST VIRGINIA": "WV",
+    "WISCONSIN": "WI", "WYOMING": "WY", "DISTRICT OF COLUMBIA": "DC",
+}
+_US_STATE_CODES = set(_US_STATE_ABBR.values())
+
+
+def _norm_state(s: str) -> str:
+    """Normalize a state string to a 2-letter USPS code, or '' if unrecognized."""
+    s = (s or "").strip().upper()
+    if not s:
+        return ""
+    if s in _US_STATE_CODES:
+        return s
+    return _US_STATE_ABBR.get(s, "")
+
+
+def _validate_obituary_match(parsed: dict, notice, owner_name: str,
+                             source_type: str, obituary_text: str = "") -> tuple[bool, str]:
+    """Post-LLM sanity gate applied to every accepted obituary match.
+
+    Catches wrong-person matches the LLM confirmed on weak evidence. Returns
+    (accept, reject_reason). A False result should drop the match entirely —
+    a false negative is cheaper than mailing the wrong heir.
+    """
+    if not parsed:
+        return False, "no parse"
+    obit_name = (parsed.get("full_name") or "").strip()
+
+    # Conflicting middle names → almost always a same-first/last different person.
+    if obit_name and _middle_name_conflict(owner_name, obit_name):
+        return False, (f"middle-name conflict: owner '{owner_name}' vs "
+                       f"obituary '{obit_name}'")
+
+    # Geographic veto: every property here is in Texas. An obituary anchored in
+    # another state with NO Texas tie is almost always a same-name different
+    # person (e.g. an Austin owner matched to a Kansas obituary). We only veto
+    # when the out-of-state signal is clear and there is no Texas connection —
+    # a Texan can legitimately have an out-of-state funeral, so we stay lenient.
+    obit_state = _norm_state(parsed.get("state", ""))
+    if obit_state and obit_state != "TX":
+        prop_city = (getattr(notice, "city", "") or "").strip().upper()
+        obit_city = (parsed.get("city") or "").strip().upper()
+        hay = f"{obituary_text}\n{parsed.get('city','')}".upper()
+        tx_tie = (
+            "TEXAS" in hay
+            or bool(re.search(r"\bTX\b", hay))
+            or (prop_city and prop_city == obit_city)
+            or (prop_city and prop_city in hay)
+        )
+        if not tx_tie:
+            return False, (f"geographic mismatch: obituary in {obit_state}, "
+                           f"property in TX ({getattr(notice, 'city', '')})")
+
+    return True, ""
 
 
 def _surname(name: str) -> str:
@@ -2515,6 +2623,11 @@ def _process_one_candidate(
             if parsed and parsed.get("confidence") in ("high", "medium"):
                 if not _dod_sanity_check(parsed.get("date_of_death", ""), notice):
                     continue
+                _owner_ref = notice.tax_owner_name.strip() or notice.owner_name.strip() or search_name
+                _ok, _why = _validate_obituary_match(parsed, notice, _owner_ref, "full_page", page_text)
+                if not _ok:
+                    logger.info("  Rejected full-page match for %s — %s", search_name, _why)
+                    continue
                 parsed["_raw_obituary_text"] = page_text
                 parsed["_search_name"] = search_name
                 parsed_match = parsed
@@ -2553,13 +2666,23 @@ def _process_one_candidate(
             )
 
             _conf = parsed.get("confidence", "") if parsed else ""
-            _snippet_ok = _conf == "high" or (
-                _conf == "medium"
-                and parsed.get("full_name", "").strip()
+            # Snippet matches are lower-evidence than a fetched obituary page, so
+            # only accept HIGH LLM confidence (was: medium also qualified). A
+            # snippet at medium confidence is exactly where wrong-person matches
+            # slip in — require a full-page fetch to confirm those instead.
+            _snippet_ok = _conf == "high" and bool(
+                parsed.get("full_name", "").strip()
                 and parsed.get("date_of_death", "").strip()
             )
             if parsed and _snippet_ok:
                 if not _dod_sanity_check(parsed.get("date_of_death", ""), notice):
+                    parsed = None
+                    _snippet_ok = False
+            if parsed and _snippet_ok:
+                _owner_ref = notice.tax_owner_name.strip() or notice.owner_name.strip() or search_name
+                _ok, _why = _validate_obituary_match(parsed, notice, _owner_ref, "snippet", snippet_text)
+                if not _ok:
+                    logger.info("  Rejected snippet match for %s — %s", search_name, _why)
                     parsed = None
                     _snippet_ok = False
             if parsed and _snippet_ok:
@@ -2806,7 +2929,10 @@ def enrich_obituary_data(
                 ancestry_hits = 0
                 pw, context, page = await ancestry_enricher.launch_browser()
                 if not page:
-                    logger.warning("Ancestry: could not launch browser — skipping fallback")
+                    logger.warning(
+                        "Ancestry: no authenticated session — skipping fallback. "
+                        "Seed one with: python src/ancestry_enricher.py bootstrap"
+                    )
                     return ancestry_hits
 
                 try:
