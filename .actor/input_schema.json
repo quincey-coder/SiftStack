@@ -287,6 +287,20 @@
             "editor": "textfield",
             "default": ""
         },
+        "google_drive_cleanup_folder_id": {
+            "title": "Google Drive Cleanup Folder ID (Sold/Resolved → 03_Sold-Cleanup)",
+            "type": "string",
+            "description": "Drive folder ID for the drop-off cleanup CSV (Sold + Resolved). Leave empty to nest 03_Sold-Cleanup under the inbox folder instead.",
+            "editor": "textfield",
+            "default": ""
+        },
+        "google_drive_forensics_folder_id": {
+            "title": "Google Drive Forensics Folder ID (diff JSON → 04_Forensics-&-Audit)",
+            "type": "string",
+            "description": "Drive folder ID for cross-run diff JSON reports. Leave empty to nest 04_Forensics-&-Audit under the inbox folder instead.",
+            "editor": "textfield",
+            "default": ""
+        },
         "google_drive_auto_folder": {
             "title": "Auto-organize Drive uploads into dated subfolders",
             "type": "boolean",

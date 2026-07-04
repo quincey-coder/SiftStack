@@ -355,6 +355,12 @@ async def actor_main() -> None:
             config.GOOGLE_DRIVE_FOLDER_ID = drive_folder_id
         if drive_reports_folder_id:
             config.GOOGLE_DRIVE_REPORTS_FOLDER_ID = drive_reports_folder_id
+        drive_cleanup_folder_id = actor_input.get("google_drive_cleanup_folder_id", "")
+        if drive_cleanup_folder_id:
+            config.GOOGLE_DRIVE_CLEANUP_FOLDER_ID = drive_cleanup_folder_id
+        drive_forensics_folder_id = actor_input.get("google_drive_forensics_folder_id", "")
+        if drive_forensics_folder_id:
+            config.GOOGLE_DRIVE_FORENSICS_FOLDER_ID = drive_forensics_folder_id
         if drive_key_b64:
             config.GOOGLE_SERVICE_ACCOUNT_KEY = drive_key_b64
         if bool(actor_input.get("google_drive_auto_folder", False)):
