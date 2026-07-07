@@ -127,6 +127,17 @@ def _apply_cad_result(notice: NoticeData, result: dict) -> None:
         notice.tax_delinquent_amount = result["delinquent_total"]
     if result.get("years_delinquent") and not notice.tax_delinquent_years:
         notice.tax_delinquent_years = result["years_delinquent"]
+    # Owner mailing address (from the tax roll) — fills, never overrides. Lets an
+    # absentee/LLC owner be reached at their real mailing address instead of the
+    # violation/property address the formatter would otherwise fall back to.
+    if result.get("mail_street") and not notice.owner_street:
+        notice.owner_street = result["mail_street"]
+        if result.get("mail_city") and not notice.owner_city:
+            notice.owner_city = result["mail_city"]
+        if result.get("mail_state") and not notice.owner_state:
+            notice.owner_state = result["mail_state"]
+        if result.get("mail_zip") and not notice.owner_zip:
+            notice.owner_zip = result["mail_zip"]
 
 
 def lookup_parcel_addresses(notices: list[NoticeData]) -> None:
@@ -161,7 +172,7 @@ def enrich_tax_delinquency(notices: list[NoticeData]) -> None:
       `bell_tax_cache` master appraisal XLSX, with delinquent fields
       overlaid from the delinquent XLSX where they match.
     """
-    from cad_lookup import lookup_property_by_address
+    from cad_lookup import lookup_property_by_address, lookup_property_by_parcel
     from collections import Counter
 
     counts = Counter()
@@ -173,19 +184,33 @@ def enrich_tax_delinquency(notices: list[NoticeData]) -> None:
         if county not in ("travis", "williamson", "bell"):
             continue
 
-        try:
-            result = lookup_property_by_address(n.address, n.county, zip_code=n.zip)
-        except Exception as e:
-            logger.debug("CAD lookup failed for %s: %s", n.address, e)
-            counts[f"{county}_error"] += 1
-            continue
+        result = None
+        # Parcel-first: exact-match owner recovery for records that arrive with a
+        # parcel id but no owner (Austin code-enforcement, absentee owners, …).
+        # An exact parcel match sidesteps the street-normalization fuzz that caps
+        # the address path around a third. Travis-only today (its cache carries a
+        # parcel index); falls through to address for other counties or misses.
+        if n.parcel_id.strip() and not n.tax_owner_name.strip():
+            try:
+                result = lookup_property_by_parcel(n.parcel_id, n.county)
+            except Exception as e:
+                logger.debug("CAD parcel lookup failed for %s: %s", n.parcel_id, e)
+            if result:
+                counts[f"{county}_parcel_hit"] += 1
 
         if not result:
-            counts[f"{county}_miss"] += 1
-            continue
+            try:
+                result = lookup_property_by_address(n.address, n.county, zip_code=n.zip)
+            except Exception as e:
+                logger.debug("CAD lookup failed for %s: %s", n.address, e)
+                counts[f"{county}_error"] += 1
+                continue
+            if not result:
+                counts[f"{county}_miss"] += 1
+                continue
+            counts[f"{county}_hit"] += 1
 
         _apply_cad_result(n, result)
-        counts[f"{county}_hit"] += 1
 
         # Fire deceased-indicator detection against the fresh CAD owner name —
         # catches LIFE ESTATE / PERSONAL REP / ET AL / TRUSTEE patterns the

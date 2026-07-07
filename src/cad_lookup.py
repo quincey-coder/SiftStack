@@ -361,3 +361,47 @@ def lookup_property_by_address(
 
     logger.debug("CAD address lookup not yet implemented for %s County", county)
     return None
+
+
+def lookup_property_by_parcel(
+    parcel_id: str,
+    county: str,
+) -> dict | None:
+    """Search county CAD for property data by parcel/geo id (exact match).
+
+    This is the high-leverage owner path for records that arrive with a parcel
+    but no owner (e.g. Austin code-enforcement). Exact-match avoids the address
+    normalization fuzz. Currently Travis-only (its tax-roll cache carries a
+    parcel index); returns None elsewhere so callers fall back to address.
+
+    Returns the same dict shape as `lookup_property_by_address`, or None.
+    """
+    if not parcel_id or not str(parcel_id).strip():
+        return None
+    if county.lower() != "travis":
+        return None
+    try:
+        from travis_tax_cache import search_by_parcel
+        rec = search_by_parcel(parcel_id)
+    except Exception as e:
+        logger.warning("Travis CAD parcel lookup failed: %s", e)
+        return None
+    if not rec:
+        return None
+    return {
+        "owner": rec.get("fullname", "").title(),
+        "owner_raw": rec.get("fullname", ""),
+        "value": rec.get("totalpropmktvalue", ""),
+        "parcel_id": rec.get("quickrefid", ""),
+        "property_type": rec.get("propertytypedesc", ""),
+        "delinquent_total": rec.get("delinquent_total", ""),
+        "years_delinquent": rec.get("years_delinquent", ""),
+        # Owner's tax-roll mailing address — where an absentee/LLC owner actually
+        # receives mail (differs from the violation property). Filled onto the
+        # record only when the owner mailing is otherwise blank.
+        "mail_street": rec.get("situsaddress", ""),
+        "mail_city": rec.get("scity", ""),
+        "mail_state": rec.get("sstate", "TX"),
+        "mail_zip": rec.get("szip", ""),
+        "source": "travis_parcel",
+    }

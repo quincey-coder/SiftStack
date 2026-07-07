@@ -44,7 +44,58 @@ _INDEX: dict[str, list[dict]] | None = None
 # because they carry real tax data.
 _ADDR_INDEX: dict[tuple[str, str], dict] | None = None
 
+# Lazy-loaded parcel index: {parcel10: property dict | "__AMBIG__"}.
+# Keyed by the 10-digit TCAD geo-id (first 10 digits of the 14-digit PARCEL /
+# Account #), which is exactly the format Austin's code-enforcement feed emits
+# as `parcelid`. This is an EXACT-match owner lookup that sidesteps the
+# street-normalization fuzz that caps the address path — the high-leverage path
+# for code-violation / absentee-owner records. A prefix shared by two different
+# current-roll owners (condos/apartments with non-0000 property suffixes) is
+# marked "__AMBIG__" and not returned; a delinquent-situs record is authoritative.
+_PARCEL_INDEX: dict[str, dict | str] | None = None
+
 _FIELD_LIMIT = 10 * 1024 * 1024  # 10 MB — TaxCurOpenData has long quoted rows
+
+
+def _normalize_parcel(parcel: str) -> str:
+    """Reduce a TCAD/Austin parcel identifier to its 10-digit geo-id key.
+
+    TCAD `PARCEL` / `Account #` are 14 digits (10-digit geo-id + 4-digit
+    property suffix, usually '0000'); Austin `parcelid` is the bare 10-digit
+    geo-id. Stripping to the first 10 digits makes them align."""
+    import re as _re
+    digits = _re.sub(r"\D", "", parcel or "")
+    return digits[:10] if len(digits) >= 10 else ""
+
+
+def _add_parcel(parcel_idx: dict, record: dict) -> None:
+    """Insert a record into the parcel index under its 10-digit geo key.
+
+    Delinquent-situs records are authoritative (kept over current-mailing).
+    Two *different* current-mailing owners at the same geo key → '__AMBIG__'
+    (a condo/apartment complex), which `search_by_parcel` declines to answer."""
+    pkey = _normalize_parcel(record.get("quickrefid", ""))
+    if not pkey:
+        return
+    existing = parcel_idx.get(pkey)
+    is_delq = record.get("source") == "delinquent_situs"
+    if existing is None:
+        parcel_idx[pkey] = record
+    elif existing == "__AMBIG__":
+        if is_delq:
+            parcel_idx[pkey] = record  # authoritative resolves ambiguity
+    else:  # existing is a dict
+        if existing.get("source") == "delinquent_situs":
+            return  # authoritative already present — keep it
+        if is_delq:
+            parcel_idx[pkey] = record  # authoritative wins over current_mailing
+        elif _normalize_last(existing.get("fullname", "")) != _normalize_last(
+            record.get("fullname", "")
+        ):
+            # Two genuinely different owners at one geo → condo/apartment.
+            # Compare on surname so mere formatting variants of the SAME owner
+            # ("SMITH JOHN & MARY" vs "SMITH JOHN") don't trip the guard.
+            parcel_idx[pkey] = "__AMBIG__"
 
 
 def _normalize_street(street: str) -> str:
@@ -126,6 +177,7 @@ def _load_delq(
     path: Path,
     idx: dict[str, list[dict]],
     addr_idx: dict[tuple[str, str], dict],
+    parcel_idx: dict[str, dict | str],
 ) -> int:
     """Parse TaxDelqOpenData.csv — has true situs address columns and the
     Delinquent Total + 1st Year Delinquent fields used by CAD-LIFT."""
@@ -163,6 +215,7 @@ def _load_delq(
                 # Property city is not in the delinquent CSV; Travis Tax Office
                 # situs defaults to Austin for the overwhelming majority.
                 "scity": "AUSTIN",
+                "sstate": "TX",
                 "szip": zip5,
                 "quickrefid": (row.get("Account #") or "").strip(),
                 "totalpropmktvalue": (row.get("Appraisal Value") or "").strip(),
@@ -177,6 +230,9 @@ def _load_delq(
             addr_key = (_normalize_street(situs), zip5)
             addr_idx[addr_key] = record
 
+            # Parcel index (authoritative)
+            _add_parcel(parcel_idx, record)
+
             count += 1
     return count
 
@@ -185,6 +241,7 @@ def _load_cur(
     path: Path,
     idx: dict[str, list[dict]],
     addr_idx: dict[tuple[str, str], dict],
+    parcel_idx: dict[str, dict | str],
 ) -> int:
     """Parse TaxCurOpenData.csv — owner + mailing address only, no situs.
 
@@ -216,20 +273,28 @@ def _load_cur(
             if len(zipc) == 9 and zipc.isdigit():
                 zipc = zipc[:5]
             state = (row.get("STATE") or "").strip().upper()
-            if state and state != "TX":
-                continue  # out-of-state mailing = not a TX probate property
             record = {
                 "fullname": owner,
                 "situsaddress": mailing,
                 "scity": (row.get("CITY") or "").strip().upper() or "AUSTIN",
+                "sstate": state or "TX",
                 "szip": zipc,
-                "quickrefid": (row.get("PARCEL") or "").strip().strip() or "",
+                "quickrefid": (row.get("PARCEL") or "").strip() or "",
                 "totalpropmktvalue": "",
                 "propertytypedesc": "",
                 "delinquent_total": "",
                 "years_delinquent": "",
                 "source": "current_mailing",
             }
+            # Parcel index gets EVERY owner regardless of mailing state — the
+            # parcel path recovers owners for code-enforcement / absentee records,
+            # where an out-of-state mailing owner is a valid (indeed wanted) hit.
+            _add_parcel(parcel_idx, record)
+            # Name + address indexes keep the TX-only heuristic: a probate
+            # decedent's mailing address is assumed to be their in-county home,
+            # so an out-of-state mailing shouldn't seed those indexes.
+            if state and state != "TX":
+                continue
             idx.setdefault(key, []).append(record)
             # Only populate address index if delinquent load didn't already.
             addr_key = (_normalize_street(mailing), zipc)
@@ -243,23 +308,28 @@ def load_index(force_download: bool = False) -> dict[str, list[dict]]:
 
     Also populates the sibling address index (see `search_by_address`).
     """
-    global _INDEX, _ADDR_INDEX
+    global _INDEX, _ADDR_INDEX, _PARCEL_INDEX
     if _INDEX is not None and not force_download:
         return _INDEX
     delq_path, cur_path = download_if_stale(force=force_download)
     idx: dict[str, list[dict]] = {}
     addr_idx: dict[tuple[str, str], dict] = {}
+    parcel_idx: dict[str, dict | str] = {}
     logger.info("Loading Travis tax delinquent CSV into index…")
-    n_delq = _load_delq(delq_path, idx, addr_idx)
+    n_delq = _load_delq(delq_path, idx, addr_idx, parcel_idx)
     logger.info("  %d delinquent-situs records indexed", n_delq)
     logger.info("Loading Travis tax current CSV into index (large file, ~60s)…")
-    n_cur = _load_cur(cur_path, idx, addr_idx)
+    n_cur = _load_cur(cur_path, idx, addr_idx, parcel_idx)
     logger.info("  %d current-mailing records indexed", n_cur)
     _INDEX = idx
     _ADDR_INDEX = addr_idx
+    _PARCEL_INDEX = parcel_idx
+    n_ambig = sum(1 for v in parcel_idx.values() if v == "__AMBIG__")
     logger.info(
-        "Travis tax cache ready: %d name keys, %d address keys, %d total records",
-        len(idx), len(addr_idx), sum(len(v) for v in idx.values()),
+        "Travis tax cache ready: %d name keys, %d address keys, %d parcel keys "
+        "(%d ambiguous), %d total records",
+        len(idx), len(addr_idx), len(parcel_idx), n_ambig,
+        sum(len(v) for v in idx.values()),
     )
     return idx
 
@@ -298,3 +368,22 @@ def search_by_address(street: str, zip5: str) -> dict | None:
         return None
     key = (_normalize_street(street), zip5)
     return _ADDR_INDEX.get(key)
+
+
+def search_by_parcel(parcel_id: str) -> dict | None:
+    """Return the property record for a parcel id (exact 10-digit geo-id match).
+
+    Accepts either Austin's 10-digit `parcelid` or TCAD's 14-digit `PARCEL`
+    (both reduce to the same 10-digit geo key). Returns None when the parcel is
+    unknown or maps to an ambiguous condo/apartment geo shared by multiple
+    owners — the caller should fall back to the address lookup in that case."""
+    global _PARCEL_INDEX
+    if _PARCEL_INDEX is None:
+        load_index()
+    if _PARCEL_INDEX is None:  # still None = load failed
+        return None
+    key = _normalize_parcel(parcel_id)
+    if not key:
+        return None
+    hit = _PARCEL_INDEX.get(key)
+    return hit if isinstance(hit, dict) else None

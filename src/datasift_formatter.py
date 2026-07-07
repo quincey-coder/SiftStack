@@ -534,13 +534,26 @@ def _get_contact_info(notice: NoticeData) -> dict:
         # Try entity research result (signing member, registered agent, etc.)
         if notice.entity_person_name:
             first, last, _et = _split_name(notice.entity_person_name)
-        # Try tax API owner name (sometimes has individual behind entity)
+        # Try tax API owner name (sometimes has individual behind entity).
+        # tax_owner_name is the tax roll's LAST-FIRST format (NAMELF), so
+        # normalize to FIRST LAST before splitting — otherwise "JEFFEIS TANISA"
+        # (surname JEFFEIS) comes out reversed as First=Jeffeis / Last=Tanisa,
+        # and "MCDONALD ROBERT J & MEGAN L" collapses to Last=J.
         if not first and not last:
             if notice.tax_owner_name and not _is_entity_name(notice.tax_owner_name):
-                first, last, _et = _split_name(notice.tax_owner_name)
+                from obituary_enricher import parse_tax_owner_name
+                _variants = parse_tax_owner_name(notice.tax_owner_name)
+                _norm = _variants[0] if _variants else notice.tax_owner_name
+                first, last, _et = _split_name(_norm)
         # Try decision maker (probate PR, etc.)
         if not first and not last and notice.decision_maker_name:
             first, last, _et = _split_name(notice.decision_maker_name)
+        # Final fallback: mail the organization by its own name. Absentee owners
+        # recovered from the tax roll (code-enforcement LLCs, trusts, etc.) are an
+        # entity with no person behind them — a company name at its mailing address
+        # beats a blank "unknown owner". Put the whole entity name in Last.
+        if not first and not last and notice.tax_owner_name.strip():
+            last = notice.tax_owner_name.strip().title()
 
     street = notice.owner_street or notice.address
     city = notice.owner_city or notice.city
