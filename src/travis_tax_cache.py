@@ -265,9 +265,11 @@ def _load_cur(
             key = _normalize_last(owner)
             if not key:
                 continue
-            mailing = (row.get("MAILINGADDRESS") or "").strip()
-            if not mailing:
-                continue
+            # Mailing address lives in MAILINGADDRESS for some rows and ADDRESS1
+            # for others (the two are mutually-exclusive in this feed). Fall back
+            # to ADDRESS1 so we don't drop owners like "LIEN TRAN INVESTMENT TRUST"
+            # whose address sits only in ADDRESS1.
+            mailing = (row.get("MAILINGADDRESS") or row.get("ADDRESS1") or "").strip()
             # 9-digit zip → 5-digit
             zipc = (row.get("ZIPCODE") or "").strip()
             if len(zipc) == 9 and zipc.isdigit():
@@ -286,13 +288,16 @@ def _load_cur(
                 "years_delinquent": "",
                 "source": "current_mailing",
             }
-            # Parcel index gets EVERY owner regardless of mailing state — the
-            # parcel path recovers owners for code-enforcement / absentee records,
-            # where an out-of-state mailing owner is a valid (indeed wanted) hit.
+            # Parcel index gets EVERY owner with a parcel — even when BOTH address
+            # fields are blank (we only need the owner name for the parcel path;
+            # the formatter falls the mailing back to the property address). This
+            # is what recovers the "not in roll" code-violation records.
             _add_parcel(parcel_idx, record)
-            # Name + address indexes keep the TX-only heuristic: a probate
-            # decedent's mailing address is assumed to be their in-county home,
-            # so an out-of-state mailing shouldn't seed those indexes.
+            # Name + address indexes need a real mailing address, and keep the
+            # TX-only heuristic (a probate decedent's mailing is assumed to be
+            # their in-county home, so out-of-state mailings shouldn't seed them).
+            if not mailing:
+                continue
             if state and state != "TX":
                 continue
             idx.setdefault(key, []).append(record)
