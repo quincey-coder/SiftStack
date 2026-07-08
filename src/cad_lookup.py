@@ -391,19 +391,39 @@ def lookup_property_by_address(
     return None
 
 
-def lookup_property_by_parcel(
-    parcel_id: str,
-    county: str,
-) -> dict | None:
+def lookup_property_by_parcel(parcel_id: str, county: str) -> dict | None:
     """Search county CAD for property data by parcel/geo id (exact match).
 
-    This is the high-leverage owner path for records that arrive with a parcel
-    but no owner (e.g. Austin code-enforcement, absentee LLC owners). Exact-match
-    avoids the address normalization fuzz. Travis + Bell carry a parcel index;
-    other counties return None so callers fall back to the address lookup.
+    High-leverage owner path for records that arrive with a parcel but no owner
+    (Austin code-enforcement, absentee LLC owners). Exact-match avoids the
+    address-normalization fuzz.
 
-    Returns the same dict shape as `lookup_property_by_address`, or None.
+    Tries the tagged county first, then falls back to the OTHER counties: an
+    address can sit on a neighbouring county's roll (Austin's ETJ spills into
+    Williamson, so many "Travis" Austin records are physically Williamson), and
+    an `R`-number is the WCAD/TCAD property-ID format shared across rolls.
+    Returns the standard result dict, or None.
     """
+    if not parcel_id or not str(parcel_id).strip():
+        return None
+    cl = county.lower()
+    result = _parcel_lookup_one(parcel_id, cl)
+    if result:
+        return result
+    # Cross-county fallback — order Williamson first (the common Austin-ETJ /
+    # R-number overlap), then the remaining local caches.
+    for other in ("williamson", "travis", "bell"):
+        if other == cl:
+            continue
+        result = _parcel_lookup_one(parcel_id, other)
+        if result:
+            return result
+    return None
+
+
+def _parcel_lookup_one(parcel_id: str, county: str) -> dict | None:
+    """Single-county parcel→owner lookup (Travis/Bell local caches, Williamson
+    live WCAD). Returns the standard result dict or None."""
     if not parcel_id or not str(parcel_id).strip():
         return None
     cl = county.lower()
