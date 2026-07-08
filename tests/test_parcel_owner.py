@@ -80,16 +80,55 @@ def test_tax_owner_middle_initial_not_lost():
     assert c["first"] == "Robert" and c["last"] == "Mcdonald"  # not Last='J'
 
 
-def test_entity_owner_filled_in_last():
+def test_entity_owner_filled_in_business():
+    # Entity owners now route to Business Name (not Last Name).
     c = _get_contact_info(_cv("GO GREEN LIVING LLC"))
-    assert c["first"] == "" and "Go Green Living" in c["last"]
+    assert c["first"] == "" and c["last"] == "" and "Go Green Living" in c["business"]
 
 
 def test_no_tax_owner_stays_blank():
     n = NoticeData(notice_type="code_violation", county="Travis",
                    address="1 Main St", city="Austin", state="TX", zip="78702")
     c = _get_contact_info(n)
-    assert c["first"] == "" and c["last"] == ""
+    assert c["first"] == "" and c["last"] == "" and c["business"] == ""
+
+
+# ── Business Name routing ───────────────────────────────────────────
+
+def test_entity_routes_to_business_not_last():
+    c = _get_contact_info(_cv("SOUTHPARK JV LLC"))
+    assert "Southpark Jv" in c["business"] and c["first"] == "" and c["last"] == ""
+
+
+def test_individual_no_business():
+    c = _get_contact_info(_cv("WILHITE MADLYN L"))
+    assert c["business"] == "" and c["first"] == "Madlyn" and c["last"] == "Wilhite"
+
+
+def test_owner_name_entity_with_agent_gets_both():
+    n = NoticeData(notice_type="foreclosure", county="Travis",
+                   address="1 Main St", city="Austin", state="TX", zip="78702")
+    n.owner_name = "NESTOR SOLUTIONS LLC"
+    n.entity_person_name = "Jane Doe"
+    c = _get_contact_info(n)
+    assert "Nestor Solutions" in c["business"] and c["first"] == "Jane" and c["last"] == "Doe"
+
+
+def test_mailing_always_populated_falls_back_to_property():
+    n = NoticeData(notice_type="tax_sale", county="Travis",
+                   address="100 Main St", city="Austin", state="TX", zip="78702")
+    n.owner_name = "Cora Berenguer"
+    c = _get_contact_info(n)
+    assert c["street"] == "100 Main St" and c["city"] == "Austin"  # mailing = property
+
+
+def test_validate_row_business_satisfies_owner():
+    from datasift_formatter import _validate_row
+    row = {"Business Name": "Acme Holdings Inc", "Owner First Name": "",
+           "Owner Last Name": "", "Property Street Address": "1 Main St",
+           "Mailing Street Address": "1 Main St"}
+    complete, issues = _validate_row(row)
+    assert complete and not issues  # business name → not flagged incomplete
 
 
 if __name__ == "__main__":

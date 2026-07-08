@@ -30,6 +30,7 @@ DATASIFT_COLUMNS = [
     "Property City",
     "Property State",
     "Property ZIP Code",
+    "Business Name",
     "Owner First Name",
     "Owner Last Name",
     "Mailing Street Address",
@@ -520,41 +521,48 @@ def _get_contact_info(notice: NoticeData) -> dict:
         return {
             "first": first,
             "last": last,
+            "business": "",
             "street": street,
             "city": city,
             "state": state,
             "zip": zip_code,
         }
 
-    # Living owner — try owner_name first
-    first, last, _et = _split_name(notice.owner_name)
+    # Living owner. Split into a person (First/Last) and/or a business (Business
+    # Name): an LLC/trust/government owner routes to Business Name, an individual
+    # to First/Last. When a real person is found *behind* an entity (entity
+    # research agent, individual on the tax roll), we keep BOTH.
+    business = ""
+    first, last, entity_type = _split_name(notice.owner_name)
+    if entity_type:  # owner_name itself is a business/government entity
+        business = notice.owner_name.strip()
 
-    # If owner_name was an entity (LLC/Trust), try fallbacks for a real person
     if not first and not last:
         # Try entity research result (signing member, registered agent, etc.)
         if notice.entity_person_name:
             first, last, _et = _split_name(notice.entity_person_name)
-        # Try tax API owner name (sometimes has individual behind entity).
-        # tax_owner_name is the tax roll's LAST-FIRST format (NAMELF), so
-        # normalize to FIRST LAST before splitting — otherwise "JEFFEIS TANISA"
-        # (surname JEFFEIS) comes out reversed as First=Jeffeis / Last=Tanisa,
-        # and "MCDONALD ROBERT J & MEGAN L" collapses to Last=J.
-        if not first and not last:
-            if notice.tax_owner_name and not _is_entity_name(notice.tax_owner_name):
+        # Try tax-roll owner. tax_owner_name is LAST-FIRST (NAMELF): normalize to
+        # FIRST LAST before splitting (else "JEFFEIS TANISA" reverses and
+        # "MCDONALD ROBERT J & MEGAN L" collapses to Last=J). If the tax owner is
+        # itself an entity, route it to Business Name instead of a person field.
+        if not first and not last and notice.tax_owner_name.strip():
+            if not _is_entity_name(notice.tax_owner_name):
                 from obituary_enricher import parse_tax_owner_name
                 _variants = parse_tax_owner_name(notice.tax_owner_name)
                 _norm = _variants[0] if _variants else notice.tax_owner_name
                 first, last, _et = _split_name(_norm)
+            elif not business:
+                business = notice.tax_owner_name.strip()
         # Try decision maker (probate PR, etc.)
         if not first and not last and notice.decision_maker_name:
             first, last, _et = _split_name(notice.decision_maker_name)
-        # Final fallback: mail the organization by its own name. Absentee owners
-        # recovered from the tax roll (code-enforcement LLCs, trusts, etc.) are an
-        # entity with no person behind them — a company name at its mailing address
-        # beats a blank "unknown owner". Put the whole entity name in Last.
-        if not first and not last and notice.tax_owner_name.strip():
-            last = notice.tax_owner_name.strip().title()
 
+    # Tidy the business display: drop a trailing "ET AL", title-case.
+    if business:
+        business = _ETAL_TRAILING_RE.sub("", business).strip().title()
+
+    # Mailing is ALWAYS populated — the owner's tax-roll mailing when known,
+    # otherwise the property address (never left blank, even when identical).
     street = notice.owner_street or notice.address
     city = notice.owner_city or notice.city
     state = notice.owner_state or notice.state
@@ -562,6 +570,7 @@ def _get_contact_info(notice: NoticeData) -> dict:
     return {
         "first": first,
         "last": last,
+        "business": business,
         "street": street,
         "city": city,
         "state": state,
@@ -970,10 +979,13 @@ def _validate_row(row: dict) -> tuple[bool, list[str]]:
         (is_complete, issues) — True if record will be "clean" in DataSift.
     """
     issues = []
-    if not row.get("Owner First Name"):
-        issues.append("no_first_name")
-    if not row.get("Owner Last Name"):
-        issues.append("no_last_name")
+    # A Business Name satisfies the owner-identity requirement (entity-owned
+    # property mailed to the company); otherwise we need a person first+last.
+    if not row.get("Business Name"):
+        if not row.get("Owner First Name"):
+            issues.append("no_first_name")
+        if not row.get("Owner Last Name"):
+            issues.append("no_last_name")
     if not row.get("Property Street Address"):
         issues.append("no_property_address")
     if not row.get("Mailing Street Address"):
@@ -1042,6 +1054,7 @@ def _build_row(notice: NoticeData, notes_override: str | None = None) -> dict:
         "Property City": notice.city,
         "Property State": notice.state or "TX",
         "Property ZIP Code": notice.zip,
+        "Business Name": contact.get("business", ""),
         "Owner First Name": contact["first"],
         "Owner Last Name": contact["last"],
         "Mailing Street Address": contact["street"],
