@@ -36,6 +36,9 @@ logger = logging.getLogger(__name__)
 
 _INDEX: dict[str, list[dict]] | None = None
 _ADDR_INDEX: dict[tuple[str, str], dict] | None = None
+# Parcel index: {prop_id: record | "__AMBIG__"}. Bell's prop_id (quickrefid) is an
+# exact per-parcel key, so this is a clean exact-match owner lookup (like Travis).
+_PARCEL_INDEX: dict[str, dict | str] | None = None
 
 
 # ── URL discovery ────────────────────────────────────────────────────
@@ -381,13 +384,54 @@ def load_index(force_download: bool = False) -> dict[str, list[dict]]:
     else:
         logger.warning("Bell appraisal master unavailable — probate/foreclosure backfill disabled for Bell")
 
+    # Build the parcel index from the loaded records (delinquent-situs is
+    # authoritative; two different owners at one prop_id → ambiguous, declined).
+    global _PARCEL_INDEX
+    parcel_idx: dict[str, dict | str] = {}
+    for lst in idx.values():
+        for rec in lst:
+            q = (rec.get("quickrefid", "") or "").strip()
+            if not q:
+                continue
+            existing = parcel_idx.get(q)
+            if existing is None:
+                parcel_idx[q] = rec
+            elif existing == "__AMBIG__":
+                if rec.get("source") == "delinquent_situs":
+                    parcel_idx[q] = rec
+            elif existing.get("source") == "delinquent_situs":
+                continue
+            elif rec.get("source") == "delinquent_situs":
+                parcel_idx[q] = rec
+            elif _normalize_last(existing.get("fullname", "")) != _normalize_last(
+                rec.get("fullname", "")
+            ):
+                parcel_idx[q] = "__AMBIG__"
+
     _INDEX = idx
     _ADDR_INDEX = addr_idx
+    _PARCEL_INDEX = parcel_idx
     logger.info(
-        "Bell tax cache ready: %d name keys, %d address keys, %d total records",
-        len(idx), len(addr_idx), sum(len(v) for v in idx.values()),
+        "Bell tax cache ready: %d name keys, %d address keys, %d parcel keys, "
+        "%d total records",
+        len(idx), len(addr_idx), len(parcel_idx), sum(len(v) for v in idx.values()),
     )
     return idx
+
+
+def search_by_parcel(parcel_id: str) -> dict | None:
+    """Return the Bell property record for an exact prop_id match, or None
+    (unknown, or ambiguous across owners). Mirrors travis_tax_cache."""
+    global _PARCEL_INDEX
+    if _PARCEL_INDEX is None:
+        load_index()
+    if _PARCEL_INDEX is None:
+        return None
+    key = (parcel_id or "").strip()
+    if not key:
+        return None
+    hit = _PARCEL_INDEX.get(key)
+    return hit if isinstance(hit, dict) else None
 
 
 def search_by_name(last_name: str, first_name: str = "") -> list[dict]:

@@ -131,6 +131,17 @@ def test_validate_row_business_satisfies_owner():
     assert complete and not issues  # business name → not flagged incomplete
 
 
+
+# ── ZIP normalization ───────────────────────────────────────────────
+
+def test_zip5_normalizes():
+    from datasift_formatter import _zip5
+    assert _zip5("78704-3845") == "78704"
+    assert _zip5("787043845") == "78704"
+    assert _zip5("78704") == "78704"
+    assert _zip5("") == ""
+
+
 if __name__ == "__main__":
     passed = failed = 0
     for name, fn in sorted(globals().items()):

@@ -370,24 +370,34 @@ def lookup_property_by_parcel(
     """Search county CAD for property data by parcel/geo id (exact match).
 
     This is the high-leverage owner path for records that arrive with a parcel
-    but no owner (e.g. Austin code-enforcement). Exact-match avoids the address
-    normalization fuzz. Currently Travis-only (its tax-roll cache carries a
-    parcel index); returns None elsewhere so callers fall back to address.
+    but no owner (e.g. Austin code-enforcement, absentee LLC owners). Exact-match
+    avoids the address normalization fuzz. Travis + Bell carry a parcel index;
+    other counties return None so callers fall back to the address lookup.
 
     Returns the same dict shape as `lookup_property_by_address`, or None.
     """
     if not parcel_id or not str(parcel_id).strip():
         return None
-    if county.lower() != "travis":
-        return None
+    cl = county.lower()
     try:
-        from travis_tax_cache import search_by_parcel
-        rec = search_by_parcel(parcel_id)
+        if cl == "travis":
+            from travis_tax_cache import search_by_parcel
+            rec = search_by_parcel(parcel_id)
+            source = "travis_parcel"
+        elif cl == "bell":
+            from bell_tax_cache import search_by_parcel
+            rec = search_by_parcel(parcel_id)
+            source = "bell_parcel"
+        else:
+            return None
     except Exception as e:
-        logger.warning("Travis CAD parcel lookup failed: %s", e)
+        logger.warning("%s CAD parcel lookup failed: %s", county, e)
         return None
     if not rec:
         return None
+    # Owner mailing: Bell stores a combined mailing string in "mailing"; Travis
+    # uses the (current-roll) mailing as its situs. Fall back to whichever exists.
+    mail_street = (rec.get("mailing") or rec.get("situsaddress") or "").strip()
     return {
         "owner": rec.get("fullname", "").title(),
         "owner_raw": rec.get("fullname", ""),
@@ -397,11 +407,10 @@ def lookup_property_by_parcel(
         "delinquent_total": rec.get("delinquent_total", ""),
         "years_delinquent": rec.get("years_delinquent", ""),
         # Owner's tax-roll mailing address — where an absentee/LLC owner actually
-        # receives mail (differs from the violation property). Filled onto the
-        # record only when the owner mailing is otherwise blank.
-        "mail_street": rec.get("situsaddress", ""),
+        # receives mail. Filled only when the owner mailing is otherwise blank.
+        "mail_street": mail_street,
         "mail_city": rec.get("scity", ""),
         "mail_state": rec.get("sstate", "TX"),
         "mail_zip": rec.get("szip", ""),
-        "source": "travis_parcel",
+        "source": source,
     }

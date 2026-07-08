@@ -143,6 +143,13 @@ def _is_entity_name(name: str) -> bool:
     return bool(_ENTITY_SUFFIXES.search(name))
 
 
+def _zip5(z: str) -> str:
+    """Normalize a ZIP to 5 digits (strip ZIP+4 / dashes). Tax-roll mailing
+    ZIPs arrive as ZIP+4 ('78704-3845'); DataSift lists want a clean 5-digit."""
+    digits = re.sub(r"\D", "", z or "")
+    return digits[:5] if len(digits) >= 5 else (z or "").strip()
+
+
 # Tokens that look like part of a name but aren't: generational suffixes and
 # "and others" markers that appear on tax-roll / court-record data.
 _SUFFIX_TOKENS = {"JR", "SR", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "ESQ"}
@@ -1053,14 +1060,14 @@ def _build_row(notice: NoticeData, notes_override: str | None = None) -> dict:
         "Property Street Address": notice.address,
         "Property City": notice.city,
         "Property State": notice.state or "TX",
-        "Property ZIP Code": notice.zip,
+        "Property ZIP Code": _zip5(notice.zip),
         "Business Name": contact.get("business", ""),
         "Owner First Name": contact["first"],
         "Owner Last Name": contact["last"],
         "Mailing Street Address": contact["street"],
         "Mailing City": contact["city"],
         "Mailing State": contact["state"],
-        "Mailing ZIP Code": contact["zip"],
+        "Mailing ZIP Code": _zip5(contact["zip"]),
         # ── Phone/Email (Tracerfy → DataSift generic Phone N format) ──
         "Phone 1": notice.primary_phone,
         "Phone 2": notice.mobile_1,
