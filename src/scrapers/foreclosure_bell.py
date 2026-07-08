@@ -16,7 +16,15 @@ Each PDF contains one or more foreclosure notices with:
 import io
 import logging
 import re
+import time
 from datetime import datetime, timedelta
+
+# Cumulative wall-clock budget for ALL Bell foreclosure OCR in a run. Scanned
+# PDFs are slow to OCR; once this is exhausted we stop OCR-ing further pages so a
+# large notice backlog can never hang the whole Actor run (it previously blew
+# past the 3600s Actor timeout and produced zero output).
+_OCR_BUDGET_S = 420.0
+_ocr_elapsed = 0.0
 
 import cv2
 import numpy as np
@@ -60,38 +68,48 @@ _SALE_DATE_RE = re.compile(
 def _ocr_pdf_bytes(pdf_bytes: bytes) -> str:
     """Render PDF pages to images and OCR them.
 
-    Uses pypdfium2 to render at 200 DPI, applies bilateral filter + Otsu
-    threshold for clean text, then runs Tesseract with PSM=3.
+    Renders at 150 DPI and denoises with a light median blur before an Otsu
+    threshold. (The old 200-DPI + bilateralFilter(d=15) path was tuned for
+    screen-photo moiré — which scanned PDFs don't have — and was so slow, ~1-3
+    min/page, that a month of notices timed out the whole run.) A cumulative
+    time budget stops OCR once exhausted so it can never hang the Actor.
     """
+    global _ocr_elapsed
     try:
         import pypdfium2 as pdfium
     except ImportError:
         logger.warning("pypdfium2 not installed — cannot OCR scanned PDFs")
         return ""
 
+    if _ocr_elapsed >= _OCR_BUDGET_S:
+        return ""  # budget already spent — skip further OCR this run
+
     all_text = []
     try:
         pdf = pdfium.PdfDocument(pdf_bytes)
         for page_idx in range(len(pdf)):
+            if _ocr_elapsed >= _OCR_BUDGET_S:
+                logger.warning(
+                    "Bell OCR budget (%.0fs) exhausted — skipping remaining pages",
+                    _OCR_BUDGET_S,
+                )
+                break
+            t0 = time.time()
             page = pdf[page_idx]
-            # Render at 200 DPI
-            bitmap = page.render(scale=200 / 72)
+            # Render at 150 DPI — enough for OCR, far fewer pixels to process.
+            bitmap = page.render(scale=150 / 72)
             pil_image = bitmap.to_pil()
 
-            # Convert to grayscale numpy array for preprocessing
             gray = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2GRAY)
-
-            # Bilateral filter — removes noise while preserving text edges
-            filtered = cv2.bilateralFilter(gray, 15, 75, 75)
-
-            # Otsu threshold — auto-determines optimal binary threshold
+            # Fast denoise for scans (median blur is O(n), unlike bilateral).
+            filtered = cv2.medianBlur(gray, 3)
+            # Otsu threshold — auto-determines optimal binary threshold.
             _, binary = cv2.threshold(filtered, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-            # Convert back to PIL for Tesseract
             processed = Image.fromarray(binary)
 
             # OCR with PSM=3 (fully automatic)
             page_text = ocr_page(processed, psm=3)
+            _ocr_elapsed += time.time() - t0
             if page_text:
                 all_text.append(page_text)
 
