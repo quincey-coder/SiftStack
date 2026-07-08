@@ -1000,6 +1000,58 @@ def _validate_row(row: dict) -> tuple[bool, list[str]]:
     return (len(issues) == 0, issues)
 
 
+def clean_datasift_rows(rows: list[dict], label: str = "") -> tuple[list[dict], dict]:
+    """Final audit + cleanup pass on built rows, run before a list is delivered.
+
+    Guarantees the CSV is clean regardless of upstream messiness:
+      - de-duplicates by Parcel ID (falling back to a house-numbered Property
+        address+ZIP) so the same property never ships twice, while distinct
+        vacant-land parcels that share a street name are preserved;
+      - strips trailing punctuation and collapses whitespace in addresses;
+      - guarantees 5-digit ZIPs.
+
+    Returns (cleaned_rows, stats) and logs a one-line audit summary.
+    """
+    stats = {"in": len(rows), "dup_removed": 0, "addr_cleaned": 0, "zip_fixed": 0}
+    seen: set = set()
+    out: list[dict] = []
+    for r in rows:
+        pid = (r.get("Parcel ID", "") or "").strip()
+        if pid:
+            key = ("p", pid.upper())
+        else:
+            addr = (r.get("Property Street Address", "") or "").strip().upper()
+            if addr[:1].isdigit():
+                key = ("a", re.sub(r"\s+", " ", addr), _zip5(r.get("Property ZIP Code", "")))
+            else:
+                key = ("u", id(r))  # vacant / no-parcel — never merge distinct parcels
+        if key[0] != "u" and key in seen:
+            stats["dup_removed"] += 1
+            continue
+        seen.add(key)
+        for col in ("Property Street Address", "Mailing Street Address"):
+            v = r.get(col, "") or ""
+            nv = re.sub(r"\s+", " ", v).strip().rstrip(".,").strip()
+            if nv != v:
+                r[col] = nv
+                stats["addr_cleaned"] += 1
+        for col in ("Property ZIP Code", "Mailing ZIP Code"):
+            v = r.get(col, "") or ""
+            nv = _zip5(v)
+            if nv != v:
+                r[col] = nv
+                stats["zip_fixed"] += 1
+        out.append(r)
+    stats["out"] = len(out)
+    if stats["dup_removed"] or stats["addr_cleaned"] or stats["zip_fixed"]:
+        logger.info(
+            "  audit/clean%s: %d→%d rows (dedup -%d, addr %d, zip %d)",
+            f" [{label}]" if label else "", stats["in"], stats["out"],
+            stats["dup_removed"], stats["addr_cleaned"], stats["zip_fixed"],
+        )
+    return out, stats
+
+
 def _build_row(notice: NoticeData, notes_override: str | None = None) -> dict:
     """Build a single CSV row dict for a NoticeData record.
 
@@ -1205,22 +1257,24 @@ def write_datasift_csv(
     govt_dropped = 0
     issue_counts: dict[str, int] = {}
 
+    built_rows = []
+    for notice in notices:
+        if not keep_government and _is_government_owner(notice):
+            govt_dropped += 1
+            continue
+        _check_city_zip(notice)
+        built_rows.append(_build_row(notice))
+    built_rows, _ = clean_datasift_rows(built_rows)
+
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=DATASIFT_COLUMNS)
         writer.writeheader()
-
-        for notice in notices:
-            if not keep_government and _is_government_owner(notice):
-                govt_dropped += 1
-                continue
-            _check_city_zip(notice)
-            row = _build_row(notice)
+        for row in built_rows:
             is_complete, issues = _validate_row(row)
             if not is_complete:
                 incomplete += 1
                 for issue in issues:
                     issue_counts[issue] = issue_counts.get(issue, 0) + 1
-                logger.debug("Incomplete record %s: %s", notice.address, issues)
             writer.writerow(row)
             written += 1
 
@@ -1430,15 +1484,22 @@ def write_datasift_by_notice_type(
         prefix = f"{county_slug}_" if county_slug else ""
         csv_path = OUTPUT_DIR / f"datasift_{prefix}{slug}_{timestamp}.csv"
 
+        label_disp = f"{county} {list_name}".strip() if county else list_name
+        # Build all rows, then run the final audit/cleaner before writing so the
+        # delivered list is deduped + clean regardless of upstream messiness.
+        built_rows = []
+        for notice in group:
+            _check_city_zip(notice)
+            built_rows.append(_build_row(notice, notes_override=_build_dm_notes(notice)))
+        built_rows, _ = clean_datasift_rows(built_rows, label=label_disp)
+
         written = 0
         incomplete = 0
         issue_counts: dict[str, int] = {}
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=DATASIFT_COLUMNS)
             writer.writeheader()
-            for notice in group:
-                _check_city_zip(notice)
-                row = _build_row(notice, notes_override=_build_dm_notes(notice))
+            for row in built_rows:
                 is_complete, issues = _validate_row(row)
                 if not is_complete:
                     incomplete += 1
@@ -1446,8 +1507,6 @@ def write_datasift_by_notice_type(
                         issue_counts[issue] = issue_counts.get(issue, 0) + 1
                 writer.writerow(row)
                 written += 1
-
-        label_disp = f"{county} {list_name}".strip() if county else list_name
         logger.info("%s CSV: %d records → %s", label_disp, written, csv_path)
         if incomplete:
             logger.warning(

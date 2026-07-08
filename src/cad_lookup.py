@@ -105,6 +105,34 @@ def _wcad_address_search(address: str) -> list[dict]:
         return []
 
 
+def _wcad_parcel_search(parcel_id: str) -> list[dict]:
+    """Search WCAD by parcel/quickref id (Williamson's R-number) via SODA API.
+
+    Williamson records carry an `R`-number that matches WCAD's `quickrefid` —
+    an exact key, so this is the reliable owner path when the address fuzz
+    misses. Returns the owner + separated mailing address (mailing1/mcity/…)."""
+    pid = (parcel_id or "").strip().replace("'", "")
+    if not pid:
+        return []
+    where = f"quickrefid='{pid}'"
+    select = (
+        "propertyid,fullname,namelast,namefirst,situsaddress,scity,szip,"
+        "mailing1,mcity,mstate,mzip,totalpropmktvalue,quickrefid,propertytypedesc"
+    )
+    url = f"{WCAD_API_BASE}/{WCAD_OWNER_DATASET}.json"
+    try:
+        resp = requests.get(
+            url, params={"$where": where, "$select": select, "$limit": 5},
+            timeout=REQUEST_TIMEOUT,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+        return []
+    except requests.RequestException as e:
+        logger.warning("WCAD parcel search failed: %s", e)
+        return []
+
+
 # ── Unified lookup interface ──────────────────────────────────────────
 
 
@@ -388,6 +416,22 @@ def lookup_property_by_parcel(
             from bell_tax_cache import search_by_parcel
             rec = search_by_parcel(parcel_id)
             source = "bell_parcel"
+        elif cl == "williamson":
+            results = _wcad_parcel_search(parcel_id)
+            w = results[0] if results else None
+            rec = None
+            if w:
+                rec = {
+                    "fullname": w.get("fullname", ""),
+                    "quickrefid": w.get("quickrefid", ""),
+                    "totalpropmktvalue": w.get("totalpropmktvalue", ""),
+                    "propertytypedesc": w.get("propertytypedesc", ""),
+                    "mailing": w.get("mailing1", ""),
+                    "scity": (w.get("mcity") or "").upper(),
+                    "sstate": (w.get("mstate") or "TX").upper(),
+                    "szip": (w.get("mzip") or "")[:5],
+                }
+            source = "wcad_parcel"
         else:
             return None
     except Exception as e:

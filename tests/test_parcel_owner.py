@@ -142,6 +142,31 @@ def test_zip5_normalizes():
     assert _zip5("") == ""
 
 
+
+# ── Final audit/cleaner step ────────────────────────────────────────
+
+def test_clean_dedups_by_parcel_preserves_vacant():
+    from datasift_formatter import clean_datasift_rows
+    rows = [
+        {"Parcel ID": "491790", "Property Street Address": "8610 Stonehollow Dr", "Property ZIP Code": "76502"},
+        {"Parcel ID": "491790", "Property Street Address": "8610 Stonehollow Dr", "Property ZIP Code": "76502"},
+        {"Parcel ID": "", "Property Street Address": "High Canyon Pass", "Property ZIP Code": "78738"},
+        {"Parcel ID": "", "Property Street Address": "High Canyon Pass", "Property ZIP Code": "78738"},
+    ]
+    out, stats = clean_datasift_rows(rows)
+    assert stats["dup_removed"] == 1 and len(out) == 3  # parcel dup gone, both vacant kept
+
+
+def test_clean_strips_punct_and_zip():
+    from datasift_formatter import clean_datasift_rows
+    out, stats = clean_datasift_rows([
+        {"Parcel ID": "1", "Property Street Address": "7906 Boyd Avenue.",
+         "Property ZIP Code": "76543", "Mailing ZIP Code": "76543-1234"},
+    ])
+    assert out[0]["Property Street Address"] == "7906 Boyd Avenue"
+    assert out[0]["Mailing ZIP Code"] == "76543"
+
+
 if __name__ == "__main__":
     passed = failed = 0
     for name, fn in sorted(globals().items()):
