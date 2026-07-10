@@ -785,6 +785,48 @@ def _is_obituary_url(url: str) -> bool:
 _ddgs_lock = threading.Lock()
 
 
+def _web_search(query: str, max_results: int = 8) -> list[dict]:
+    """Web search: free DDGS backends first, Serper.dev (paid) as fallback.
+
+    Under sustained load the free backends rate-limit and silently return
+    zero results (Google serves /sorry/ CAPTCHAs) — every miss then looks
+    like "owner not deceased". Serper keeps the sweep honest when that
+    happens. Set OBIT_SEARCH_BACKEND=serper to skip DDGS entirely for bulk
+    jobs. Serper items are normalized to the DDGS shape (href/title/body).
+    """
+    results = []
+    if os.environ.get("OBIT_SEARCH_BACKEND", "").strip().lower() != "serper":
+        try:
+            with _ddgs_lock:
+                results = DDGS().text(query, max_results=max_results,
+                                      backend="google,duckduckgo,brave")
+        except Exception as e:
+            logger.debug("DDGS search failed for '%s': %s", query, e)
+            results = []
+    if results:
+        return results
+    import config as cfg
+    if not cfg.SERPER_API_KEY:
+        return []
+    try:
+        resp = requests.post(
+            "https://google.serper.dev/search",
+            headers={"X-API-KEY": cfg.SERPER_API_KEY,
+                     "Content-Type": "application/json"},
+            json={"q": query, "num": max_results},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return [
+            {"href": it.get("link", ""), "title": it.get("title", ""),
+             "body": it.get("snippet", "")}
+            for it in resp.json().get("organic", [])
+        ]
+    except Exception as e:
+        logger.debug("Serper search failed for '%s': %s", query, e)
+        return []
+
+
 def _search_obituary(name: str, city: str, extra_terms: str = "") -> list[dict]:
     """Search DuckDuckGo for obituary pages matching the person.
 
@@ -799,11 +841,8 @@ def _search_obituary(name: str, city: str, extra_terms: str = "") -> list[dict]:
     keyword = extra_terms if extra_terms else "obituary"
     query = f'{name} {keyword} Texas' if not city else f'{name} {keyword} {city} Texas'
 
-    try:
-        with _ddgs_lock:
-            results = DDGS().text(query, max_results=8, backend="google,duckduckgo,brave")
-    except Exception as e:
-        logger.debug("Search failed for '%s': %s", query, e)
+    results = _web_search(query, 8)
+    if not results:
         return []
 
     obituary_results = []
@@ -966,7 +1005,7 @@ def _refetch_specific_obituary(
 
     for query in queries:
         try:
-            results = DDGS().text(query, max_results=5, backend="google,duckduckgo,brave")
+            results = _web_search(query, 5)
         except Exception:
             continue
 
@@ -1059,7 +1098,7 @@ def _search_survivors_targeted(
     all_snippets = []
     for query in queries:
         try:
-            results = DDGS().text(query, max_results=5, backend="google,duckduckgo,brave")
+            results = _web_search(query, 5)
             for r in results:
                 snippet = r.get("body", "")
                 title = r.get("title", "")
@@ -1220,7 +1259,7 @@ def _lookup_dm_address_web(name: str, city: str, api_key: str) -> dict | None:
 
     for query in queries:
         try:
-            results = DDGS().text(query, max_results=5, backend="google,duckduckgo,brave")
+            results = _web_search(query, 5)
         except Exception:
             time.sleep(random.uniform(SEARCH_DELAY_MIN, SEARCH_DELAY_MAX))
             continue
