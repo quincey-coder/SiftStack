@@ -183,7 +183,7 @@ def _collect_sold_records() -> list:
       (status→Sold, remove all lists, clear tasks/assignee).
     - LAST_RUN_RESOLVED (code-enforcement scraper): cases that closed/complied
       → tagged "Code Violation Resolved" → scoped "Code Violation Cleanup"
-      sequence (removes ONLY the Code Violation list — other signals survive).
+      sequence (removes ONLY the "Code Enforcement" list — other signals survive).
     """
     from importlib import import_module
 
@@ -897,7 +897,13 @@ async def actor_main() -> None:
                             )
                             if link:
                                 Actor.log.info("  %s → Drive: %s", info["label"], link)
-                                drive_links.append({"label": info["label"], "url": link})
+                                drive_links.append({
+                                    "label": info["label"],
+                                    "county": info.get("county", ""),
+                                    "records": info.get("count"),
+                                    "filename": Path(info["path"]).name,
+                                    "url": link,
+                                })
                             else:
                                 Actor.log.error("  %s: Drive upload failed", info["label"])
                     except Exception as e:
@@ -926,6 +932,12 @@ async def actor_main() -> None:
                     clink = _upload_cleanup_csv_to_drive(cleanup_info)
                     if clink:
                         Actor.log.info("  Cleanup CSV → Drive (03_Sold-Cleanup): %s", clink)
+                        drive_links.append({
+                            "label": "Cleanup (Sold/Resolved)",
+                            "records": cleanup_info.get("count"),
+                            "filename": Path(cleanup_info["path"]).name,
+                            "url": clink,
+                        })
             except Exception as e:
                 Actor.log.warning("Cleanup CSV generation failed: %s", e)
 
@@ -1112,6 +1124,7 @@ async def actor_main() -> None:
                     from slack_notifier import (
                         send_slack_notification, _send_webhook,
                         build_rawpipe_block, build_pdf_block,
+                        build_drive_csv_block,
                     )
                     # TIGHTFEED message ①: slim daily report. Suppressed
                     # internally when notices is empty.
@@ -1119,6 +1132,12 @@ async def actor_main() -> None:
                         notices,
                         cost_breakdown=cost_breakdown,
                     )
+                    # TIGHTFEED message ①b: every CSV created this run with
+                    # its Drive link — independent of RAWPIPE so the links
+                    # arrive even when no DataSift API upload happened.
+                    drive_csv_block = build_drive_csv_block(drive_links)
+                    if drive_csv_block:
+                        _send_webhook(drive_csv_block)
                     # TIGHTFEED message ②: RAWPIPE upload summary with
                     # clickable list URLs + per-record addresses + Drive
                     # CSV links. Manual-fallback message (old ③) is gone.
@@ -2894,7 +2913,13 @@ def _run_scrape_pipeline(args, targets) -> None:
             )
             if link:
                 logging.info("  %s → Drive: %s", info["label"], link)
-                drive_links.append({"label": info["label"], "url": link})
+                drive_links.append({
+                    "label": info["label"],
+                    "county": info.get("county", ""),
+                    "records": info.get("count"),
+                    "filename": Path(info["path"]).name,
+                    "url": link,
+                })
             else:
                 logging.error("  %s: Drive upload failed", info["label"])
     elif getattr(args, "no_drive", False):
@@ -3136,6 +3161,16 @@ def _run_scrape_pipeline(args, targets) -> None:
             notices,
             cost_breakdown=cli_cost_breakdown or None,
         )
+
+        # TIGHTFEED ①b: every CSV created this run with its Drive link —
+        # sent regardless of whether a DataSift API upload happened.
+        try:
+            from slack_notifier import build_drive_csv_block
+            drive_csv_block = build_drive_csv_block(drive_links)
+            if drive_csv_block:
+                _send_webhook(drive_csv_block)
+        except Exception:
+            logging.exception("Drive CSV Slack block failed")
 
         # TIGHTFEED ②: RAWPIPE upload summary (CLI-side, fired when
         # --upload-datasift-api was used and produced api_results).

@@ -350,6 +350,31 @@ def build_rawpipe_block(
     return "\n".join(lines)
 
 
+def build_drive_csv_block(drive_links: list[dict] | None) -> str:
+    """Build the standalone *Drive CSVs* webhook block.
+
+    One line per CSV created this run — county + list type up front, record
+    count, and the timestamped filename as the clickable Drive link. Unlike
+    the RAWPIPE block this does NOT depend on a DataSift API upload having
+    run, so the Drive links reach Slack on every run that produced data.
+
+    Returns "" if no links — caller should skip the webhook.
+    """
+    links = [d for d in (drive_links or []) if d.get("url")]
+    if not links:
+        return ""
+    lines = [f"*:file_folder: Drive CSVs this run ({len(links)}):*"]
+    for d in links:
+        county = (d.get("county") or "").strip()
+        label = (d.get("label") or "CSV").strip()
+        head = f"{county} · {label}" if county else label
+        records = d.get("records")
+        rec_txt = f" — {records} record(s)" if records not in (None, "", "?") else ""
+        fname = d.get("filename") or f"{label}.csv"
+        lines.append(f"• *{head}*{rec_txt} — <{d['url']}|{fname}>")
+    return "\n".join(lines)
+
+
 def build_pdf_block(
     pdf_links: list[dict],
     *,
@@ -371,7 +396,10 @@ def build_pdf_block(
 
     # Top-line Drive CSV links — one per notice type that has data.
     if drive_links:
-        csv_parts = [f"<{d['url']}|{d['label']}.csv>" for d in drive_links if d.get("url")]
+        csv_parts = [
+            f"<{d['url']}|{d.get('filename') or d['label'] + '.csv'}>"
+            for d in drive_links if d.get("url")
+        ]
         if csv_parts:
             lines.append(f":bookmark: Full CSV in Drive: {' · '.join(csv_parts)}")
 
