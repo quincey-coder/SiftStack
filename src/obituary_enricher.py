@@ -3144,16 +3144,24 @@ def enrich_obituary_data(
     dm_addr_sources = {"tx_cad": 0, "people_search": 0,
                        "ddg_people_search": 0, "inline_tracerfy": 0, "batch_tracerfy": 0}
 
-    for j, (notice, parsed, url, source_type, raw_name, is_tax_name) in enumerate(matches, 1):
+    # Phase B is per-record independent — each iteration mutates only its own
+    # notice, and every shared primitive it calls is thread-safe (llm_client is
+    # already run concurrently in Phase A; DDGS via _ddgs_lock; Firecrawl budget
+    # via _firecrawl_lock; Serper via requests). So process records concurrently
+    # like Phase A instead of one-at-a-time. The worker's counters are
+    # function-local (same names the body already increments) and summed after
+    # the pool; a record past the deadline returns ran=False and uploads
+    # unenriched (graceful degradation preserved, now across the whole batch).
+    def _pb_worker(j, item):
+        notice, parsed, url, source_type, raw_name, is_tax_name = item
+        heir_verified_count = 0
+        joint_owner_dm_count = 0
+        research_dm_count = 0
+        snippet_dm_count = 0
+        estate_fallback_count = 0
+        dm_addr_sources = {}
         if _deadline_reached():
-            logger.warning(
-                "Obituary time budget reached after %.0fs — stopping Phase B "
-                "early: %d/%d deceased records left without heir/DM enrichment "
-                "(they still upload). Raise obituary_deadline_secs or "
-                "parallelize Phase B to enrich more.",
-                time.monotonic() - _t0, len(matches) - j + 1, len(matches),
-            )
-            break
+            return (False, 0, 0, 0, 0, 0, {})
         city = notice.city.strip() or "Austin"
         survivors = parsed.get("survivors", [])
         has_survivors = bool(survivors) or bool(parsed.get("executor_named", ""))
@@ -3589,11 +3597,42 @@ def enrich_obituary_data(
             error_info=error_info,
         )
 
-        if j % 10 == 0:
-            logger.info(
-                "Phase B progress: %d/%d (heir-verified=%d, joint-owner-DM=%d)",
-                j, len(matches), heir_verified_count, joint_owner_dm_count,
-            )
+        return (True, heir_verified_count, joint_owner_dm_count,
+                research_dm_count, snippet_dm_count, estate_fallback_count,
+                dm_addr_sources)
+
+    # Run Phase B records concurrently, then fold the per-record stats together.
+    pb_skipped = 0
+    pb_done = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        pb_futures = [
+            pool.submit(_pb_worker, j, item)
+            for j, item in enumerate(matches, 1)
+        ]
+        for fut in as_completed(pb_futures):
+            ran, hv, jo, rd, sd, ef, addr = fut.result()
+            heir_verified_count += hv
+            joint_owner_dm_count += jo
+            research_dm_count += rd
+            snippet_dm_count += sd
+            estate_fallback_count += ef
+            for k, v in addr.items():
+                dm_addr_sources[k] = dm_addr_sources.get(k, 0) + v
+            pb_done += 1
+            if not ran:
+                pb_skipped += 1
+            elif pb_done % 10 == 0:
+                logger.info(
+                    "Phase B progress: %d/%d (heir-verified=%d, joint-owner-DM=%d)",
+                    pb_done, len(matches), heir_verified_count, joint_owner_dm_count,
+                )
+    if pb_skipped:
+        logger.warning(
+            "Obituary time budget reached after %.0fs — %d/%d Phase B records "
+            "skipped, uploaded without heir/DM enrichment (raise "
+            "obituary_deadline_secs or obituary_workers to enrich more).",
+            time.monotonic() - _t0, pb_skipped, len(matches),
+        )
 
     # ── Phase C: Batch Tracerfy for remaining DMs without addresses ──
     import config as cfg
