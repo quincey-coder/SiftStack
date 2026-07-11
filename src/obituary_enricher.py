@@ -785,27 +785,9 @@ def _is_obituary_url(url: str) -> bool:
 _ddgs_lock = threading.Lock()
 
 
-def _web_search(query: str, max_results: int = 8) -> list[dict]:
-    """Web search: free DDGS backends first, Serper.dev (paid) as fallback.
-
-    Under sustained load the free backends rate-limit and silently return
-    zero results (Google serves /sorry/ CAPTCHAs) — every miss then looks
-    like "owner not deceased". Serper keeps the sweep honest when that
-    happens. Set OBIT_SEARCH_BACKEND=serper to skip DDGS entirely for bulk
-    jobs. Serper items are normalized to the DDGS shape (href/title/body).
-    """
-    results = []
-    if os.environ.get("OBIT_SEARCH_BACKEND", "").strip().lower() != "serper":
-        try:
-            with _ddgs_lock:
-                results = DDGS().text(query, max_results=max_results,
-                                      backend="google,duckduckgo,brave")
-        except Exception as e:
-            logger.debug("DDGS search failed for '%s': %s", query, e)
-            results = []
-    if results:
-        return results
-    import config as cfg
+def _serper_search(query: str, max_results: int = 8) -> list[dict]:
+    """Serper.dev (paid Google API). Items normalized to the DDGS shape."""
+    import config as cfg  # noqa: PLC0415
     if not cfg.SERPER_API_KEY:
         return []
     try:
@@ -825,6 +807,47 @@ def _web_search(query: str, max_results: int = 8) -> list[dict]:
     except Exception as e:
         logger.debug("Serper search failed for '%s': %s", query, e)
         return []
+
+
+def _ddgs_search(query: str, max_results: int = 8) -> list[dict]:
+    """Free DuckDuckGo/Google/Brave via the ddgs lib (primp under the hood)."""
+    try:
+        with _ddgs_lock:
+            return DDGS().text(query, max_results=max_results,
+                               backend="google,duckduckgo,brave")
+    except Exception as e:
+        logger.debug("DDGS search failed for '%s': %s", query, e)
+        return []
+
+
+def _web_search(query: str, max_results: int = 8) -> list[dict]:
+    """Web search: Serper.dev-first when a key is configured, DDGS fallback.
+
+    DuckDuckGo/DDGS free backends are routinely IP-blocked from datacenter
+    ranges (Apify): every request ConnectTimeouts across all 3 backends before
+    giving up, wasting seconds per search *and* returning zero results — which
+    then reads as "owner not deceased". Serper is fast + reliable, so when a
+    SERPER_API_KEY is set we hit it first and only fall back to the free
+    backends if Serper is unset or errors. Behaviour is overridable:
+      OBIT_SEARCH_BACKEND=serper  → Serper only (skip DDGS)
+      OBIT_SEARCH_BACKEND=ddg     → DDGS only (skip Serper; free)
+    Serper items are normalized to the DDGS shape (href/title/body).
+    """
+    import config as cfg  # noqa: PLC0415
+    backend = os.environ.get("OBIT_SEARCH_BACKEND", "").strip().lower()
+
+    if backend == "serper":
+        return _serper_search(query, max_results)
+    if backend in ("ddg", "ddgs", "duckduckgo"):
+        return _ddgs_search(query, max_results)
+
+    # Auto (default): Serper-first when configured, DDGS as free fallback.
+    if cfg.SERPER_API_KEY:
+        results = _serper_search(query, max_results)
+        if results:
+            return results
+        return _ddgs_search(query, max_results)
+    return _ddgs_search(query, max_results)
 
 
 def _search_obituary(name: str, city: str, extra_terms: str = "") -> list[dict]:
