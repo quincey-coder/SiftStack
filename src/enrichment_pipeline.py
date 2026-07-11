@@ -53,6 +53,11 @@ class PipelineOptions:
     skip_dm_address: bool = False
     tracerfy_tier1: bool = False
     obituary_workers: int = 4
+    # Absolute time.monotonic() deadline past which the obituary step stops
+    # starting new work and lets remaining records flow through unenriched.
+    # Prevents the sequential Phase B from blowing a bounded runtime (Apify
+    # actor timeout). None = unbounded (CLI/local runs).
+    obituary_deadline: float | None = None
 
     # Smart detection flags (set by detect_existing_enrichment)
     has_smarty: bool = False
@@ -718,6 +723,7 @@ def run_enrichment_pipeline(
                     tracerfy_tier1=getattr(opts, "tracerfy_tier1", False),
                     skip_ancestry=opts.skip_ancestry,
                     workers=getattr(opts, "obituary_workers", 4),
+                    deadline=getattr(opts, "obituary_deadline", None),
                 )
                 confirmed = sum(1 for n in notices if n.owner_deceased)
                 logger.info(

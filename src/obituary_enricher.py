@@ -2761,6 +2761,7 @@ def enrich_obituary_data(
     tracerfy_tier1: bool = False,
     skip_ancestry: bool = False,
     workers: int = 4,
+    deadline: float | None = None,
 ) -> None:
     """Search for obituaries and enrich notices with deceased owner data.
 
@@ -2775,6 +2776,19 @@ def enrich_obituary_data(
     if not api_key:
         logger.warning("No Anthropic API key — skipping obituary enrichment")
         return
+
+    # Wall-clock budget guard. When running under a bounded runtime (e.g. the
+    # Apify 3600s actor timeout), `deadline` is an absolute time.monotonic()
+    # value past which we stop *starting* new obituary work. Phase B (heir
+    # verification + per-heir DM address lookups) is sequential and its runtime
+    # scales with #deceased × #heirs — on heavy days it can run 30+ min and blow
+    # the actor timeout, which aborts the whole run and loses the upload. With a
+    # deadline we instead stop early and let the remaining records flow through
+    # unenriched (they still upload; deceased flag/preset DMs are already set).
+    _t0 = time.monotonic()
+
+    def _deadline_reached() -> bool:
+        return deadline is not None and time.monotonic() >= deadline
 
     # Build candidate list: notices with owner names to search
     # Tuple: (notice, raw_name, is_tax_name)
@@ -2866,6 +2880,14 @@ def enrich_obituary_data(
         total_parallel, workers, probate_preset_count,
     )
 
+    if parallel_candidates and _deadline_reached():
+        logger.warning(
+            "Obituary time budget exhausted before Phase A — skipping %d live "
+            "obituary searches (probate presets already handled)",
+            len(parallel_candidates),
+        )
+        parallel_candidates = []
+
     if parallel_candidates:
         processed = 0
         with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -2948,7 +2970,11 @@ def enrich_obituary_data(
     # Saves page loads (100/day limit) and time (~15s/lookup).
 
     import config as cfg  # noqa: PLC0415
-    if not skip_ancestry and cfg.ANCESTRY_EMAIL and cfg.ANCESTRY_PASSWORD:
+    if _deadline_reached():
+        logger.warning(
+            "Obituary time budget reached — skipping Ancestry fallback"
+        )
+    elif not skip_ancestry and cfg.ANCESTRY_EMAIL and cfg.ANCESTRY_PASSWORD:
         import asyncio
         import ancestry_enricher
 
@@ -3096,6 +3122,15 @@ def enrich_obituary_data(
                        "ddg_people_search": 0, "inline_tracerfy": 0, "batch_tracerfy": 0}
 
     for j, (notice, parsed, url, source_type, raw_name, is_tax_name) in enumerate(matches, 1):
+        if _deadline_reached():
+            logger.warning(
+                "Obituary time budget reached after %.0fs — stopping Phase B "
+                "early: %d/%d deceased records left without heir/DM enrichment "
+                "(they still upload). Raise obituary_deadline_secs or "
+                "parallelize Phase B to enrich more.",
+                time.monotonic() - _t0, len(matches) - j + 1, len(matches),
+            )
+            break
         city = notice.city.strip() or "Austin"
         survivors = parsed.get("survivors", [])
         has_survivors = bool(survivors) or bool(parsed.get("executor_named", ""))
@@ -3453,6 +3488,13 @@ def enrich_obituary_data(
                 signing_heirs.insert(0, ranked_dms[0])
 
             for dm in signing_heirs:
+                if _deadline_reached():
+                    logger.warning(
+                        "  [%d/%d] Time budget reached mid-record — stopping "
+                        "heir address lookups (applying what's collected)",
+                        j, len(matches),
+                    )
+                    break
                 dm_name = dm["name"]
                 # Get DM's city from survivor data if available
                 dm_city_hint = ""
@@ -3532,7 +3574,7 @@ def enrich_obituary_data(
 
     # ── Phase C: Batch Tracerfy for remaining DMs without addresses ──
     import config as cfg
-    if not skip_dm_address and cfg.TRACERFY_API_KEY:
+    if not skip_dm_address and cfg.TRACERFY_API_KEY and not _deadline_reached():
         dm_needs_addr = [
             n for n in notices
             if n.decision_maker_name and not n.decision_maker_street

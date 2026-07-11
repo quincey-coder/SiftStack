@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -24,6 +25,11 @@ from config import (
 from data_formatter import deduplicate, write_csv, write_csv_by_type
 
 logger = logging.getLogger(__name__)
+
+# Monotonic anchor for the whole process (≈ actor container start). Used to
+# derive an absolute wall-clock deadline for the obituary step so it can't blow
+# the bounded Apify actor timeout. See `obituary_deadline` in enrichment_pipeline.
+_PROCESS_START = time.monotonic()
 
 
 # ── CLI incremental state ─────────────────────────────────────────────
@@ -395,6 +401,16 @@ async def actor_main() -> None:
         skip_dm_address = bool(actor_input.get("skip_dm_address", False))
         max_heir_depth = int(actor_input.get("max_heir_depth", 2) or 2)
         obituary_workers = int(actor_input.get("obituary_workers", 4) or 4)
+        # Wall-clock ceiling (seconds from actor start) for the obituary step.
+        # Keeps the sequential Phase B from blowing the actor timeout: past this
+        # point it stops enriching and lets remaining records flow through and
+        # upload. 0 disables. Default 2700s (45min) leaves margin under the 3600s
+        # actor timeout for scraping + upload/Drive/Slack/reports.
+        obituary_deadline_secs = int(actor_input.get("obituary_deadline_secs", 2700) or 0)
+        obituary_deadline = (
+            _PROCESS_START + obituary_deadline_secs
+            if obituary_deadline_secs > 0 else None
+        )
 
         # Legacy buy-box toggles (kept for backwards compatibility)
         exclude_vacant = bool(actor_input.get("exclude_vacant", False))
@@ -640,6 +656,7 @@ async def actor_main() -> None:
                 skip_dm_address=skip_dm_address,
                 tracerfy_tier1=False,
                 obituary_workers=obituary_workers,
+                obituary_deadline=obituary_deadline,
                 skip_zip_filter=skip_zip_filter,
                 skip_condo_filter=skip_condo_filter,
                 skip_mls_filter=keep_listed,

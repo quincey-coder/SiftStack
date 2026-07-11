@@ -177,6 +177,15 @@
             "maximum": 16,
             "editor": "number"
         },
+        "obituary_deadline_secs": {
+            "title": "Obituary Time Budget (secs from start)",
+            "type": "integer",
+            "description": "Wall-clock ceiling for the obituary step, measured from actor start. Past this, obituary enrichment stops and remaining records flow through unenriched (they still upload) — prevents the sequential Phase B from blowing the actor timeout. Set below your run timeout minus ~15min for upload/reports. 0 = unbounded.",
+            "default": 2700,
+            "minimum": 0,
+            "maximum": 7200,
+            "editor": "number"
+        },
 
         "exclude_vacant": {
             "title": "Exclude Vacant Land",
