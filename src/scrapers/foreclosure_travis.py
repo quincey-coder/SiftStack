@@ -33,6 +33,7 @@ from playwright.async_api import async_playwright, Page
 
 from notice_parser import NoticeData
 from scrapers import register
+from scrapers.tccsearch_common import safe_check, wait_ready
 
 logger = logging.getLogger(__name__)
 
@@ -384,9 +385,12 @@ class TravisForeclosureScraper:
                 # Step 2: Navigate to search
                 await page.goto(SEARCH_URL, wait_until="domcontentloaded")
                 await page.wait_for_timeout(1500)
+                # Fail fast (~12s) with a clear message if the client framework
+                # was withheld (datacenter-IP block) instead of a 30s check timeout.
+                await wait_ready(page)
 
                 # Step 3: Check foreclosure document type
-                await page.check(_doc_type_selector(DOC_TYPE_FORECLOSURE))
+                await safe_check(page, _doc_type_selector(DOC_TYPE_FORECLOSURE))
 
                 # Step 4: Set date range
                 await _set_date_range(page, from_date, to_date)

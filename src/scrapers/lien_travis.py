@@ -43,6 +43,7 @@ from playwright.async_api import async_playwright, Page
 from notice_parser import NoticeData, normalize_court_name
 from scrapers import register
 from scrapers.lien_common import pick_debtor
+from scrapers.tccsearch_common import safe_check, wait_ready
 
 logger = logging.getLogger(__name__)
 
@@ -322,12 +323,12 @@ class TravisLienScraper:
                 await _accept_disclaimer(page)
                 await page.goto(SEARCH_URL, wait_until="domcontentloaded")
                 await page.wait_for_timeout(1500)
+                # Fail fast (~12s) with a clear message if the client framework
+                # was withheld (datacenter-IP block) instead of dying on $find.
+                await wait_ready(page)
 
                 for idx in self.doc_types:
-                    try:
-                        await page.check(_doc_type_selector(idx))
-                    except Exception as e:
-                        logger.warning("Could not check doc type %s: %s", idx, e)
+                    await safe_check(page, _doc_type_selector(idx))
 
                 await _set_date_range(page, from_date, to_date)
 
