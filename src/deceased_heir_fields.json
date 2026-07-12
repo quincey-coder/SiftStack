@@ -1,0 +1,35 @@
+{
+  "group": {
+    "entity_type": "property",
+    "label": "Deceased & Heir Intelligence",
+    "description": "Deceased-owner and decision-maker enrichment from the deep-prospecting research flow. Filterable fields drive deceased-owner presets and sequences; text fields store research for the closer. Field labels match the SiftStack CSV headers 1:1."
+  },
+  "fields": [
+    { "label": "Owner Deceased", "field_type": "select", "placeholder": "Is the owner of record deceased?", "options": ["Yes", "No", "Suspected", "Unknown"] },
+    { "label": "Date of Death", "field_type": "date", "placeholder": "Owner date of death" },
+    { "label": "Decision-Maker Confidence", "field_type": "select", "placeholder": "Confidence the primary DM is correct", "options": ["High", "Medium", "Low"] },
+    { "label": "Decision-Maker Status", "field_type": "select", "placeholder": "Living status of primary decision maker", "options": ["Verified Living", "Unverified", "Deceased", "Unknown"] },
+    { "label": "DM 2 Status", "field_type": "select", "placeholder": "Living status of secondary decision maker", "options": ["Verified Living", "Unverified", "Deceased", "Unknown"] },
+    { "label": "DM 3 Status", "field_type": "select", "placeholder": "Living status of tertiary decision maker", "options": ["Verified Living", "Unverified", "Deceased", "Unknown"] },
+    { "label": "Heir Count", "field_type": "number", "placeholder": "Total heirs identified" },
+    { "label": "Heirs Living", "field_type": "number", "placeholder": "Heirs verified living" },
+    { "label": "Signatures to Close", "field_type": "number", "placeholder": "Signing-chain count needed to convey title" },
+    { "label": "Title Flag", "field_type": "select", "placeholder": "CAD title complication", "options": ["Life Estate", "Et Al", "None", "Other"] },
+    { "label": "Notice Type", "field_type": "select", "placeholder": "Distress source type", "options": ["Foreclosure", "Tax Sale", "Tax Delinquent", "Probate", "Eviction", "Code Violation", "Divorce", "Lien"] },
+    { "label": "County", "field_type": "select", "placeholder": "County of record", "options": ["Travis", "Bell", "Williamson", "Other"] },
+    { "label": "Date Added", "field_type": "date", "placeholder": "Date the lead entered SiftStack" },
+    { "label": "Decedent Name", "field_type": "text_input", "placeholder": "Name of deceased owner" },
+    { "label": "Decision Maker (Name)", "field_type": "text_input", "placeholder": "Primary decision maker name" },
+    { "label": "DM Relationship", "field_type": "text_input", "placeholder": "Relationship of DM to decedent" },
+    { "label": "DM Source", "field_type": "text_input", "placeholder": "Where the DM was identified" },
+    { "label": "DM 2 Name / Relationship", "field_type": "text_input", "placeholder": "Secondary DM name and relationship" },
+    { "label": "DM 3 Name / Relationship", "field_type": "text_input", "placeholder": "Tertiary DM name and relationship" },
+    { "label": "Obituary URL", "field_type": "text_input", "placeholder": "Link to obituary" },
+    { "label": "Source URL", "field_type": "text_input", "placeholder": "Source record / data portal link" },
+    { "label": "Data Flags", "field_type": "text_input", "placeholder": "Raw research flags (pipe-separated)" },
+    { "label": "Entity Type", "field_type": "text_input", "placeholder": "LLC / Trust / Corp / etc." },
+    { "label": "Entity Contact + Role", "field_type": "text_input", "placeholder": "Registered agent / manager and role" },
+    { "label": "Signing Chain Names", "field_type": "text", "placeholder": "Ordered list of parties who must sign" },
+    { "label": "DM Confidence Reason", "field_type": "text", "placeholder": "Why this DM / confidence level" }
+  ]
+}

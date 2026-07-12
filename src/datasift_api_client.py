@@ -303,6 +303,64 @@ class DataSiftAPIClient:
         """Return just the total count for a filter (limit=1 to stay light)."""
         return int(self.search_records(must, mode=mode, limit=1).get("count", 0))
 
+    # ─── Delete (DESTRUCTIVE) ────────────────────────────────────
+    #
+    # Endpoints from the SPA bundle (DeletionPrompt.js):
+    #   POST /api/internal/property/delete/   (APIv2.deleteProperties)
+    #   POST /api/internal/owner/delete/      (APIv2.deleteOwners)
+    # Both take the SAME body as the other bulk actions: {"query": {...}}.
+    # The SPA's `actionsFilterQuery` builds it two ways:
+    #   - Select-all-matching: body is just the filter, e.g.
+    #       {"query": {"must": {"owner_type": "clean"}}}  → deletes ALL matches
+    #   - Explicit selection: adds the id list under the page's metric key —
+    #       property page → must.properties:[uuid…]; owner page → must.owners:[…]
+    # There is NO undo. Unlike the read path this is a real POST (no
+    # X-HTTP-Method-Override), so it mutates.
+
+    def delete_owners(
+        self,
+        *,
+        must: dict | None = None,
+        owner_uuids: list[str] | None = None,
+    ) -> dict:
+        """Delete owner/contact records. DESTRUCTIVE — no undo.
+
+        Pass EITHER a filter `must` (select-all-matching, e.g.
+        {"owner_type": "clean"} to purge every owner) OR an explicit
+        `owner_uuids` list. Passing neither raises (the backend rejects an
+        empty filter anyway, but we fail louder and earlier).
+        """
+        if not must and not owner_uuids:
+            raise ValueError(
+                "delete_owners needs a `must` filter or `owner_uuids`; "
+                "refusing to send an empty selection."
+            )
+        query_must: dict = dict(must or {})
+        if owner_uuids:
+            query_must["owners"] = list(owner_uuids)
+        return self._request_json(
+            "POST", "/api/internal/owner/delete/", json={"query": {"must": query_must}}
+        )
+
+    def delete_properties(
+        self,
+        *,
+        must: dict | None = None,
+        property_uuids: list[str] | None = None,
+    ) -> dict:
+        """Delete property/seller records. DESTRUCTIVE — no undo. See delete_owners."""
+        if not must and not property_uuids:
+            raise ValueError(
+                "delete_properties needs a `must` filter or `property_uuids`; "
+                "refusing to send an empty selection."
+            )
+        query_must: dict = dict(must or {})
+        if property_uuids:
+            query_must["properties"] = list(property_uuids)
+        return self._request_json(
+            "POST", "/api/internal/property/delete/", json={"query": {"must": query_must}}
+        )
+
     # ─── Skip-trace ──────────────────────────────────────────────
     #
     # Endpoint discovered from the SPA's bundled main.min.js (DataSift
@@ -541,3 +599,168 @@ class DataSiftAPIClient:
             "verified_in_lists": verified,
             "suggested_mapping": mapping,
         }
+
+    # ─── Custom fields ───────────────────────────────────────────
+    #
+    # Endpoints live-verified 2026-07-08 (SPA bundle + probe upload):
+    #   GET/POST /api/internal/custom-fields/group/   — folders (key is "label")
+    #   GET/POST /api/internal/custom-fields/         — fields; options=[{label}]
+    #   DELETE   /api/internal/custom-fields/{id}/
+    #   GET      /api/internal/property/{uuid}/custom-field/  — values on a record
+    #
+    # field_type vocabulary: text = MULTI-line, text_input = SINGLE-line
+    # (inverted from intuition — verified against live fields).
+    #
+    # Upload mapping: suggested-mapping auto-fills property.custom_fields keyed
+    # by field UUID when a CSV header exactly matches a field label. Select
+    # values match option labels CASE-SENSITIVELY — "yes" is silently dropped
+    # where "Yes" stores. Date values accept both M/D/YYYY and YYYY-MM-DD.
+
+    def list_custom_field_groups(self) -> list[dict]:
+        """Return all custom-field groups (folders)."""
+        data = self._request_json("GET", "/api/internal/custom-fields/group/")
+        if isinstance(data, dict):
+            return data.get("results") or data.get("data") or []
+        return data
+
+    def create_custom_field_group(
+        self, label: str, *, entity_type: str = "property", description: str = "",
+    ) -> dict:
+        """Create a custom-field group. Returns the created group (has int id)."""
+        return self._request_json(
+            "POST", "/api/internal/custom-fields/group/",
+            json={
+                "entity_type": entity_type,
+                "label": label,
+                "description": description,
+                "is_active": True,
+            },
+        )
+
+    def list_custom_fields(self, limit: int = 300) -> list[dict]:
+        """Return all custom fields. Each has {id, uuid, label, field_type, group:{id,label}}."""
+        data = self._request_json("GET", f"/api/internal/custom-fields/?limit={limit}")
+        if isinstance(data, dict):
+            return data.get("results") or data.get("data") or []
+        return data
+
+    def create_custom_field(
+        self,
+        *,
+        label: str,
+        field_type: str,
+        group_id: int,
+        entity_type: str = "property",
+        placeholder: str = "",
+        options: list[str] | None = None,
+        required: bool = False,
+    ) -> dict:
+        """Create one custom field. options is a list of label strings (select only)."""
+        payload: dict = {
+            "entity_type": entity_type,
+            "group_id": group_id,
+            "label": label,
+            "field_type": field_type,
+            "required": required,
+            "is_active": True,
+            "placeholder": placeholder,
+        }
+        if options:
+            payload["options"] = [{"label": o} for o in options]
+        return self._request_json("POST", "/api/internal/custom-fields/", json=payload)
+
+    def get_property_custom_field_values(self, property_uuid: str) -> list[dict]:
+        """Return the custom-field values set on one property record."""
+        data = self._request_json(
+            "GET", f"/api/internal/property/{property_uuid}/custom-field/"
+        )
+        if isinstance(data, dict):
+            return data.get("results") or data.get("data") or []
+        return data
+
+    @staticmethod
+    def unmapped_columns(mapping: dict, header: list[str], required: list[str]) -> list[str]:
+        """Return the required CSV headers NOT covered by an upload mapping.
+
+        Walks the mapping tree collecting every non-negative column index
+        (native slots and custom_fields alike); a required header whose
+        index never appears is silently-dropped data — abort the upload.
+        """
+        covered: set = set()
+
+        def walk(node):
+            if isinstance(node, dict):
+                for v in node.values():
+                    walk(v)
+            elif isinstance(node, list):
+                for v in node:
+                    walk(v)
+            elif isinstance(node, int) and node >= 0:
+                covered.add(node)
+
+        walk(mapping)
+        return [h for h in required if h in header and header.index(h) not in covered]
+
+    # ─── Tags ────────────────────────────────────────────────────
+
+    def create_tag(self, title: str) -> dict:
+        """Create a tag. Returns {uuid, title, properties_count}."""
+        return self._request_json("POST", "/api/internal/tag/", json={"title": title})
+
+    def get_or_create_tag(self, title: str) -> dict:
+        """Return the existing tag with this exact title, or create it."""
+        for t in self.list_tags(limit=300):
+            if (t.get("title") or t.get("name")) == title:
+                return t
+        return self.create_tag(title)
+
+    def add_property_tags(self, property_uuid: str, tags: list[str]) -> dict:
+        """Add tags (by name) to a property — fires the property.tags.added trigger."""
+        return self._request_json(
+            "POST", f"/api/internal/property/{property_uuid}/add-tags/",
+            json={"tags": tags},
+        )
+
+    # ─── Sequences ───────────────────────────────────────────────
+    #
+    # Sequences are plain JSON with full CRUD — no Playwright drag-and-drop.
+    # Create body (from the SPA's toSequencePayload): {title, trigger,
+    # conditions[], actions[], folder?}. folder is a UUID string (optional).
+    # A condition: {condition: "has_all", payload: {field: "tags_uuid",
+    #   label: "property.tags.added", values: [<tag uuid>], resource: false}}.
+    # A list-remove action: {action: "remove", payload: {field: "lists",
+    #   label: "property.lists.remove", values: [<list NAMES as strings>]}}.
+
+    def list_sequences(self, limit: int = 100) -> list[dict]:
+        data = self._request_json("GET", f"/api/internal/sequence/?limit={limit}")
+        if isinstance(data, dict):
+            return data.get("results") or data.get("data") or []
+        return data
+
+    def get_sequence(self, sequence_id: str) -> dict:
+        return self._request_json("GET", f"/api/internal/sequence/{sequence_id}/")
+
+    def create_sequence(
+        self,
+        *,
+        title: str,
+        trigger: str,
+        conditions: list[dict],
+        actions: list[dict],
+        folder_uuid: str | None = None,
+    ) -> dict:
+        """Create a sequence. Returns the created sequence object."""
+        payload: dict = {
+            "title": title,
+            "trigger": trigger,
+            "conditions": conditions,
+            "actions": actions,
+        }
+        if folder_uuid:
+            payload["folder"] = folder_uuid
+        return self._request_json("POST", "/api/internal/sequence/", json=payload)
+
+    def delete_sequence(self, sequence_id: str) -> None:
+        resp = self._request("DELETE", f"/api/internal/sequence/{sequence_id}/")
+        if resp.status_code >= 400:
+            raise DataSiftAPIError(resp.status_code, resp.text, "/sequence/delete")

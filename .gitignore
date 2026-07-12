@@ -68,3 +68,11 @@ _brand_tmp/
 _tmp_skill/
 autoresearch/
 .pytest_cache/
+
+# Local scratch / backups (do not commit or deploy)
+state_backups/
+probe_datasift_routes.py
+# Timestamped lead-data backups (PII) + purge/poll logs — never commit
+*_backup_*.csv
+owner_purge_poll.log
+purge_all_*.log

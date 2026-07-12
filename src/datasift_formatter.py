@@ -74,37 +74,37 @@ DATASIFT_COLUMNS = [
     "Bedrooms",
     "Bathrooms",
     "Lot (Acres)",
-    # ── Custom fields (SiftStack group) ──
+    # ── Custom fields ("Deceased & Heir Intelligence" group) ──
+    # Headers MUST match the DataSift custom-field labels 1:1
+    # (deceased_heir_fields.json) — upload auto-maps on exact label match.
     "Notice Type",
     "County",
     "Date Added",
     "Owner Deceased",
     "Date of Death",
     "Decedent Name",
-    "Decision Maker",
+    "Decision Maker (Name)",
     "DM Relationship",
-    "DM Confidence",
-    "DM 2 Name",
-    "DM 2 Relationship",
-    "DM 3 Name",
-    "DM 3 Relationship",
+    "Decision-Maker Confidence",
+    "DM 2 Name / Relationship",
+    "DM 3 Name / Relationship",
     "Obituary URL",
     "Source URL",
     # ── Deep prospecting fields ──
-    "DM 1 Status",
-    "DM 1 Source",
+    "Decision-Maker Status",
+    "DM Source",
     "DM 2 Status",
     "DM 3 Status",
     "Heir Count",
     "Heirs Living",
-    "Signing Chain Count",
+    "Signatures to Close",
     "Signing Chain Names",
     "DM Confidence Reason",
     "Data Flags",
+    "Title Flag",
     # ── Entity research fields ──
     "Entity Type",
-    "Entity Contact",
-    "Entity Contact Role",
+    "Entity Contact + Role",
 ]
 
 
@@ -117,6 +117,80 @@ def _format_date(iso_date: str) -> str:
         return f"{dt.month}/{dt.day}/{dt.year}"
     except ValueError:
         return iso_date
+
+
+# ── Select-option normalization ─────────────────────────────────────
+# DataSift select fields match option labels CASE-SENSITIVELY on import
+# ("yes" drops silently where "Yes" stores — live-verified), so every value
+# destined for a select column must ship as its exact option label.
+
+_NOTICE_TYPE_LABELS = {
+    "foreclosure": "Foreclosure",
+    "tax_sale": "Tax Sale",
+    "tax_delinquent": "Tax Delinquent",
+    "probate": "Probate",
+    "eviction": "Eviction",
+    "code_violation": "Code Violation",
+    "divorce": "Divorce",
+    "lien": "Lien",
+}
+
+_OWNER_DECEASED_LABELS = {"yes": "Yes", "no": "No", "suspected": "Suspected"}
+
+_DM_STATUS_LABELS = {
+    "verified_living": "Verified Living",
+    "unverified": "Unverified",
+    "deceased": "Deceased",
+    "unknown": "Unknown",
+}
+
+_CONFIDENCE_LABELS = {"high": "High", "medium": "Medium", "low": "Low"}
+
+_COUNTY_OPTIONS = {"Travis", "Bell", "Williamson"}
+
+
+def _select_label(value: str, mapping: dict) -> str:
+    """Normalize a raw enum to its select option label; blank stays blank.
+
+    Unknown values pass through unchanged — visible in the CSV even though
+    the select won't store them (closed sets from our own enrichment code).
+    """
+    v = (value or "").strip()
+    if not v:
+        return ""
+    return mapping.get(v.lower(), v)
+
+
+def _county_label(county: str) -> str:
+    """Map county to its select option; unexpected non-blank → Other."""
+    c = (county or "").strip().title()
+    if not c:
+        return ""
+    return c if c in _COUNTY_OPTIONS else "Other"
+
+
+def _title_flag(flags: str) -> str:
+    """Derive the Title Flag select from the raw research/CAD flags.
+
+    Life Estate outranks Et Al when both are present (it dictates the
+    signer). No title complication → blank, so clean records stay
+    unfiltered; the None/Other options exist for manual use.
+    """
+    f = (flags or "").lower()
+    if "cad_life_estate" in f:
+        return "Life Estate"
+    if "cad_et_al" in f:
+        return "Et Al"
+    return ""
+
+
+def _name_rel(name: str, rel: str) -> str:
+    """Combine name + relationship/role into one readable value: "Name (rel)"."""
+    name = (name or "").strip()
+    rel = (rel or "").strip()
+    if not name:
+        return ""
+    return f"{name} ({rel})" if rel else name
 
 
 def _heir_count(notice: NoticeData) -> str:
@@ -349,15 +423,21 @@ def _split_name(full_name: str) -> tuple[str, str, str]:
 
 # Map notice_type → DataSift list name for niche sequential marketing.
 # DataSift auto-creates lists from CSV if they don't exist yet.
+# notice_type → DataSift LIST name. These MUST match the account's existing
+# built-in list titles (not SiftStack's internal concept names) so records
+# land on the right list and the Sold -> Reset / cleanup sequences — which
+# act on list titles — actually fire. code_violation → "Code Enforcement"
+# and lien → "Liens" are the account's default list names; "Tax Sale" has no
+# built-in equivalent and stays its own SiftStack list (by design).
 NOTICE_TYPE_TO_LIST = {
     "foreclosure": "Foreclosure",
     "probate": "Probate",
     "tax_sale": "Tax Sale",
     "tax_delinquent": "Tax Delinquent",
     "eviction": "Eviction",
-    "code_violation": "Code Violation",
+    "code_violation": "Code Enforcement",
     "divorce": "Divorce",
-    "lien": "Lien",
+    "lien": "Liens",
 }
 
 
@@ -391,7 +471,7 @@ def _build_tags(notice: NoticeData) -> str:
 
     # Resolved code-enforcement case: a scoped tag-update row. "Code Violation
     # Resolved" is the trigger for the "Code Violation Cleanup" sequence, which
-    # removes ONLY the Code Violation list — this is NOT a Sold, so other
+    # removes ONLY the "Code Enforcement" list — this is NOT a Sold, so other
     # distress signals on the same property (probate/tax/lien) survive.
     if notice.record_status == "resolved":
         res_tags = ["Code Violation Resolved"]
@@ -1076,16 +1156,16 @@ def _build_row(notice: NoticeData, notes_override: str | None = None) -> dict:
             f"{_format_date(notice.date_added)} — likely paid off or sold."
         )
     elif notice.record_status == "resolved":
-        # Scoped cleanup: blank Lists so we don't re-add to the Code Violation
-        # list — the "Code Violation Cleanup" sequence removes only that list.
-        # Value/tax fields stay blank so this tag-update row doesn't overwrite
-        # the record. The resolution note always wins over notes_override.
+        # Scoped cleanup: blank Lists so we don't re-add to the "Code
+        # Enforcement" list — the "Code Violation Cleanup" sequence removes only
+        # that list. Value/tax fields stay blank so this tag-update row doesn't
+        # overwrite the record. The resolution note always wins over notes_override.
         list_name = ""
         detail = notice.resolution_note or "resolved"
         case_ref = f" {notice.case_id}" if notice.case_id else ""
         notes = (
             f"Code-enforcement case{case_ref} resolved ({detail}) — "
-            "removed from Code Violation marketing."
+            "removed from Code Enforcement marketing."
         )
     else:
         list_name = NOTICE_TYPE_TO_LIST.get(notice.notice_type, "")
@@ -1157,37 +1237,40 @@ def _build_row(notice: NoticeData, notes_override: str | None = None) -> dict:
         "Bedrooms": notice.bedrooms,
         "Bathrooms": notice.bathrooms,
         "Lot (Acres)": notice.lot_size,
-        # ── Custom fields (SiftStack group) ──
-        "Notice Type": notice.notice_type,
-        "County": notice.county,
+        # ── Custom fields ("Deceased & Heir Intelligence" group) ──
+        # Headers match the custom-field labels 1:1; select values must be
+        # exact option labels (case-sensitive match on import).
+        "Notice Type": _select_label(notice.notice_type, _NOTICE_TYPE_LABELS),
+        "County": _county_label(notice.county),
         "Date Added": _format_date(notice.date_added),
-        "Owner Deceased": notice.owner_deceased,
+        "Owner Deceased": _select_label(notice.owner_deceased, _OWNER_DECEASED_LABELS),
         "Date of Death": notice.date_of_death,
         "Decedent Name": notice.decedent_name,
-        "Decision Maker": notice.decision_maker_name,
+        "Decision Maker (Name)": notice.decision_maker_name,
         "DM Relationship": notice.decision_maker_relationship,
-        "DM Confidence": notice.dm_confidence,
-        "DM 2 Name": notice.decision_maker_2_name,
-        "DM 2 Relationship": notice.decision_maker_2_relationship,
-        "DM 3 Name": notice.decision_maker_3_name,
-        "DM 3 Relationship": notice.decision_maker_3_relationship,
+        "Decision-Maker Confidence": _select_label(notice.dm_confidence, _CONFIDENCE_LABELS),
+        "DM 2 Name / Relationship": _name_rel(
+            notice.decision_maker_2_name, notice.decision_maker_2_relationship),
+        "DM 3 Name / Relationship": _name_rel(
+            notice.decision_maker_3_name, notice.decision_maker_3_relationship),
         "Obituary URL": notice.obituary_url,
         "Source URL": notice.source_url,
         # ── Deep prospecting fields ──
-        "DM 1 Status": notice.decision_maker_status,
-        "DM 1 Source": notice.decision_maker_source,
-        "DM 2 Status": notice.decision_maker_2_status,
-        "DM 3 Status": notice.decision_maker_3_status,
+        "Decision-Maker Status": _select_label(notice.decision_maker_status, _DM_STATUS_LABELS),
+        "DM Source": notice.decision_maker_source,
+        "DM 2 Status": _select_label(notice.decision_maker_2_status, _DM_STATUS_LABELS),
+        "DM 3 Status": _select_label(notice.decision_maker_3_status, _DM_STATUS_LABELS),
         "Heir Count": _heir_count(notice),
         "Heirs Living": notice.heirs_verified_living,
-        "Signing Chain Count": notice.signing_chain_count,
+        "Signatures to Close": notice.signing_chain_count,
         "Signing Chain Names": notice.signing_chain_names,
         "DM Confidence Reason": notice.dm_confidence_reason,
         "Data Flags": notice.missing_data_flags,
+        "Title Flag": _title_flag(notice.missing_data_flags),
         # ── Entity research fields ──
         "Entity Type": notice.entity_type,
-        "Entity Contact": notice.entity_person_name,
-        "Entity Contact Role": notice.entity_person_role,
+        "Entity Contact + Role": _name_rel(
+            notice.entity_person_name, notice.entity_person_role),
     }
 
 
