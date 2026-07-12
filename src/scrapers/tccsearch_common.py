@@ -16,10 +16,42 @@ is ready at t=0 there, so both return immediately.
 """
 
 import logging
+import os
+from urllib.parse import unquote, urlparse
 
 from playwright.async_api import Page
 
 logger = logging.getLogger(__name__)
+
+
+def proxy_kwargs(env_var: str = "SCRAPER_PROXY_URL") -> dict:
+    """Playwright ``new_context(**proxy_kwargs())`` — route the browser through a
+    proxy when one is configured, else no-op.
+
+    tccsearch.org blocks Apify's datacenter IP (see wait_ready), so on the
+    platform these scrapers must go out through a residential proxy. main.py
+    sets SCRAPER_PROXY_URL from the Apify residential proxy when
+    ``use_residential_proxy`` is on; when it's unset (local/CLI runs) this
+    returns ``{}`` and behaviour is unchanged.
+    """
+    url = (os.environ.get(env_var) or "").strip()
+    if not url:
+        return {}
+    p = urlparse(url)
+    if not p.hostname:
+        logger.warning("Ignoring malformed %s (no host): %s", env_var, url[:40])
+        return {}
+    server = f"{p.scheme or 'http'}://{p.hostname}"
+    if p.port:
+        server += f":{p.port}"
+    proxy = {"server": server}
+    if p.username:
+        proxy["username"] = unquote(p.username)
+    if p.password:
+        proxy["password"] = unquote(p.password)
+    logger.info("Routing browser via proxy %s (user %s…)",
+                server, (proxy.get("username") or "")[:24])
+    return {"proxy": proxy}
 
 # The ASP.NET-AJAX runtime is "ready" once $find is callable AND the Sys
 # application has finished initializing (widgets registered → $find resolves).

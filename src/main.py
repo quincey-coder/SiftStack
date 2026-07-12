@@ -442,13 +442,21 @@ async def actor_main() -> None:
         )
 
         # ── Residential proxy (default OFF on Free plan) ──
+        # tccsearch.org (Travis foreclosure/probate/lien) blocks Apify's
+        # datacenter IP — the client framework/checkboxes never render, so those
+        # scrapers fail. Export the residential proxy URL as SCRAPER_PROXY_URL;
+        # the tccsearch scrapers pick it up via tccsearch_common.proxy_kwargs().
         if use_proxy:
             try:
                 proxy_config = await Actor.create_proxy_configuration(groups=["RESIDENTIAL"])
-                _ = await proxy_config.new_url()
-                Actor.log.info("Residential proxy configured")
-            except Exception:
-                Actor.log.warning("Could not configure residential proxy — continuing without")
+                proxy_url = await proxy_config.new_url()
+                if proxy_url:
+                    os.environ["SCRAPER_PROXY_URL"] = proxy_url
+                    Actor.log.info("Residential proxy configured (routing tccsearch scrapers)")
+                else:
+                    Actor.log.warning("Residential proxy returned no URL — continuing without")
+            except Exception as e:
+                Actor.log.warning("Could not configure residential proxy — continuing without: %s", e)
 
         if config.ANTHROPIC_API_KEY:
             Actor.log.info("LLM fallback enabled (Claude Haiku)")

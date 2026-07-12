@@ -43,7 +43,7 @@ from playwright.async_api import async_playwright, Page
 from notice_parser import NoticeData, normalize_court_name
 from scrapers import register
 from scrapers.lien_common import pick_debtor
-from scrapers.tccsearch_common import safe_check, wait_ready
+from scrapers.tccsearch_common import proxy_kwargs, safe_check, wait_ready
 
 logger = logging.getLogger(__name__)
 
@@ -315,6 +315,7 @@ class TravisLienScraper:
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/131.0.0.0 Safari/537.36"
                 ),
+                **proxy_kwargs(),
             )
             page = await context.new_page()
             page.set_default_timeout(30000)
