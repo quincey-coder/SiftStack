@@ -67,21 +67,40 @@ class TccNotReady(RuntimeError):
     IP-level block (datacenter anti-bot) rather than a transient timing issue."""
 
 
-async def wait_ready(page: Page, timeout_ms: int = 12000) -> None:
+async def wait_ready(page: Page, timeout_ms: int | None = None) -> None:
     """Block until the Infragistics client framework is live, or fail fast.
 
-    Raises TccNotReady on timeout so the caller aborts in ~12s with a clear
-    message instead of burning ~30s per checkbox and dying on `$find is not
-    defined`.
+    Through a residential proxy the heavy Infragistics script bundles load much
+    slower than on a direct connection (where they're ready at t≈0), so allow
+    more time when proxied. On timeout, capture the real page state so the
+    failure is self-diagnosing: `$find`/`Sys` becoming defined just after the
+    deadline means the timeout was merely too short, whereas a near-empty or
+    challenge-page body means the IP itself is blocked.
     """
+    proxied = bool((os.environ.get("SCRAPER_PROXY_URL") or "").strip())
+    if timeout_ms is None:
+        timeout_ms = 35000 if proxied else 12000
     try:
         await page.wait_for_function(_READY_JS, timeout=timeout_ms)
     except Exception:
+        diag = {}
+        try:
+            diag = await page.evaluate(
+                "() => ({find: typeof $find, sys: typeof Sys, "
+                "title: document.title, "
+                "bodylen: document.body ? document.body.innerText.length : 0, "
+                "snippet: document.body ? document.body.innerText.slice(0, 140) : ''})"
+            )
+        except Exception:
+            pass
         raise TccNotReady(
-            f"tccsearch client framework ($find/Sys.Application) not ready after "
-            f"{timeout_ms / 1000:.0f}s — the page is almost certainly being served "
-            "a degraded/blocked response (datacenter-IP anti-bot). Route this "
-            "scraper through a residential proxy (set use_residential_proxy=true)."
+            f"tccsearch client framework not ready after {timeout_ms / 1000:.0f}s "
+            f"(proxy={'on' if proxied else 'off'}). page state: "
+            f"$find={diag.get('find')} Sys={diag.get('sys')} "
+            f"title={diag.get('title')!r} bodylen={diag.get('bodylen')} "
+            f"snippet={diag.get('snippet')!r} — $find='function' here means the "
+            "timeout was just too short; a near-empty/challenge body means the IP "
+            "is blocked (rotate proxy session or the residential IP is flagged)."
         ) from None
 
 
