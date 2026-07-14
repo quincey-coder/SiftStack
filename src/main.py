@@ -17,6 +17,7 @@ from pathlib import Path
 
 import config
 from config import (
+    DEFAULT_SCRAPE_TYPES,
     LOG_DIR,
     NOTICE_TYPES,
     OUTPUT_DIR,
@@ -119,11 +120,13 @@ def _filter_targets(
 ) -> list[tuple[str, str]]:
     """Build list of (county, notice_type) pairs to scrape.
 
-    Returns all combinations of TX_COUNTIES × NOTICE_TYPES, filtered by
-    the --counties and --types CLI args.
+    Returns all combinations of TX_COUNTIES × DEFAULT_SCRAPE_TYPES, filtered by
+    the --counties and --types CLI args. The default excludes code_violation
+    (weak standalone distressor, high per-run cost); an explicit --types can
+    still select it since the filter matches against the full NOTICE_TYPES.
     """
     target_counties = TX_COUNTIES
-    target_types = NOTICE_TYPES
+    target_types = DEFAULT_SCRAPE_TYPES
 
     if counties:
         county_set = {c.lower() for c in counties}

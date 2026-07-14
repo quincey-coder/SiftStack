@@ -123,6 +123,13 @@ TESSERACT_PSM_PHOTO = 4  # assume single column of variable-size text — best f
 # have no live source (open-records only) and warn harmlessly as unregistered.
 NOTICE_TYPES = ["foreclosure", "tax_sale", "tax_delinquent", "probate", "code_violation", "lien"]
 
+# Notice types run automatically on the default daily/historical scrape (no --types
+# given). code_violation is deliberately excluded: it's a weak standalone distressor
+# (only useful stacked) and adds meaningful runtime/cost per day. It stays in
+# NOTICE_TYPES so it remains a valid manual pull — run it explicitly with
+# `--types code_violation` to top up data when the daily run is thin.
+DEFAULT_SCRAPE_TYPES = [t for t in NOTICE_TYPES if t != "code_violation"]
+
 # ── Texas Counties ────────────────────────────────────────────────────
 # Target counties for scraping. Each maps to its data sources.
 TX_COUNTIES = ["Travis", "Bell", "Williamson"]
