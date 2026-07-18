@@ -272,7 +272,15 @@ async def lookup_decedent_properties(notices: list) -> None:
                         cad_owner_raw = result.get("owner_raw") or (result.get("owner") or "").upper()
                         cad_owner_clean = _clean_cad_owner_for_display(cad_owner_raw)
                         if cad_owner_clean and not (notice.owner_name or "").strip():
-                            notice.owner_name = cad_owner_clean
+                            # CAD names are LAST FIRST MIDDLE — normalize the order
+                            # here exactly like the primary branch above. Assigning
+                            # cad_owner_clean directly only title-cases; it does NOT
+                            # flip, so the downstream positional Owner First/Last
+                            # split silently REVERSES the name ("SPENCER KIMBERLY
+                            # ANN" → First=Spencer, Last=Ann).
+                            notice.owner_name = _cad_owner_to_first_last(
+                                cad_owner_raw, avoid_name=notice.decedent_name or "",
+                            ) or cad_owner_clean
                             if not (notice.tax_owner_name or "").strip():
                                 notice.tax_owner_name = cad_owner_raw
                         found += 1

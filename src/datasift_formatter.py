@@ -487,9 +487,17 @@ def _build_tags(notice: NoticeData) -> str:
 
     tags = ["Courthouse Data"]
 
-    # Notice type
+    # Notice type — use the DataSift display name (e.g. "Foreclosure",
+    # "Probate", "Code Enforcement") so the tag reads cleanly and matches the
+    # account's list titles. Falls back to a title-cased form for any type not
+    # in the map.
     if notice.notice_type:
-        tags.append(notice.notice_type)
+        tags.append(
+            NOTICE_TYPE_TO_LIST.get(
+                notice.notice_type,
+                notice.notice_type.replace("_", " ").title(),
+            )
+        )
 
     # Specific lien type (e.g. "abstract_of_judgment") for finer filter presets
     if notice.lien_type:
@@ -636,8 +644,23 @@ def _get_contact_info(notice: NoticeData) -> dict:
             if not _is_entity_name(notice.tax_owner_name):
                 from obituary_enricher import parse_tax_owner_name
                 _variants = parse_tax_owner_name(notice.tax_owner_name)
-                _norm = _variants[0] if _variants else notice.tax_owner_name
-                first, last, _et = _split_name(_norm)
+                # NEVER fall back to the raw tax_owner_name here. It is stored in
+                # LAST-FIRST (NAMELF) order; splitting it positionally reverses the
+                # name ("SPENCER KIMBERLY ANN" → First=Spencer, Last=Ann) and can
+                # drop the real first name entirely. A reversed name is worse than
+                # no name — it silently ships wrong contacts to marketing — so when
+                # the NAMELF parser can't resolve a person, leave the person fields
+                # blank and let the entity/DM fallbacks below handle it.
+                if _variants:
+                    first, last, _et = _split_name(_variants[0])
+                elif not business:
+                    # Unparseable as a person AND we can't trust the word order.
+                    # In practice these are organisations `_is_entity_name` misses
+                    # (churches, housing authorities, rental cos: "MT ZION BAPTIST
+                    # CHURCH" → First=Mt/Last=Church). Preserve the value in
+                    # Business Name so the record still carries an owner — just
+                    # never as a fabricated person.
+                    business = notice.tax_owner_name.strip()
             elif not business:
                 business = notice.tax_owner_name.strip()
         # Try decision maker (probate PR, etc.)

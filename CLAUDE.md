@@ -170,6 +170,44 @@ enrichment **Step 3c-lien**.
 - **Texas is a disclosure state** — actual sale prices are available in public records (unlike non-disclosure states).
 - **Texas has no state transfer tax** — closing cost calculations should not include transfer tax.
 
+## Owner-Name Orientation (NAMELF) — the #1 silent data corruptor
+
+Owner names enter from sources with **two incompatible orientations**, and getting it
+wrong ships reversed contacts to marketing. Rules, learned the hard way (2026-07-16):
+
+- **`tax_owner_name` is ALWAYS raw `LAST FIRST MIDDLE` (NAMELF, no comma)** — that is
+  its contract. `owner_name` is ALWAYS consumed as `FIRST [MIDDLE] LAST`. Never assign
+  one to the other without conversion.
+- **CAD/TCAD/BCAD `fullname` is NAMELF** (`"SPENCER KIMBERLY ANN"` = Kimberly Spencer).
+  Convert with `parse_tax_owner_name()` (obituary_enricher) or
+  `property_lookup._cad_owner_to_first_last()`. **`_clean_cad_owner_for_display()` only
+  title-cases — it does NOT flip.** Never use it as an `owner_name` value.
+- **NEVER fall back to the raw NAMELF string when the parser fails.** The positional
+  split (`_split_name`: `parts[0]`=first) reverses it AND can drop the real first name
+  (`"SPENCER KIMBERLY ANN"` → First=Spencer, Last=Ann — "Kimberly" vanishes). Instead
+  route the value to **Business Name** — never fabricate a person. In practice every
+  unparseable non-entity is an org `_is_entity_name` misses (`"MT ZION BAPTIST CHURCH"`
+  → First=Mt/Last=Church; churches, housing authorities, rental cos), so the record
+  keeps a marketable owner and loses nothing. A fabricated name is worse than no person:
+  skip-tracing "Pleasanton Finance" burns a lookup or returns a **stranger's** phone.
+- **`normalize_court_name()` blindly flips** — only call it from scrapers whose source
+  is *known* LAST-FIRST. It is NOT idempotent and will wrongly flip an already-correct
+  `FIRST LAST` name. **CAD is not uniformly NAMELF** (`"DONALD D BRIM & DANIELLE BRIM"`
+  is FIRST-LAST), so blind flipping corrupts real records.
+- **ALL-CAPS `Owner First/Last` in an output CSV is a red flag** — every correct path
+  title-cases. ALL-CAPS ⇒ the value bypassed normalization and is probably reversed.
+  Use it as a cheap audit signal.
+- **Never "repair" names by swapping First/Last.** The pair is lossy (middle names are
+  already dropped). Re-derive from CAD by `parcel_id`
+  (`cad_lookup.lookup_property_by_parcel`) and re-run `parse_tax_owner_name`.
+- **Only `code_violation` (and ownerless foreclosures) may take the CAD owner.** Their
+  scrapers set `owner_name=""` by design. **Probate** owner must stay the PR/executor
+  and **lien** owner must stay the grantee/debtor — overwriting those from CAD violates
+  the domain rules above.
+- Audit with a name oracle (`pip install names-dataset`), scoring current vs flipped
+  orientation — but treat it as a *hint only*: ambiguous names (`Shay Dori`,
+  `Marshall Hussain`) score "backwards" while being correct. CAD is the only truth.
+
 ## Tax-Delinquent Cross-Run Diff + Sold Tagging
 
 All three tax-delinquent scrapers (Travis CSV, Bell/Williamson XLSX) diff each pull against the prior run's parcel-ID set and persist state across runs (`data/{county}_tax_state/` locally; Apify KVS keys `travis_texdel_state` / `bell_texdel_state` / `williamson_texdel_state`). State modules: `travis_texdel_state.py` (Travis) and the county-parameterized `tax_delinquent_state.py` (Bell + Williamson). Per-run diff JSON + raw-file archive are written for forensics; the diff is surfaced to Slack via `--notify-slack`.
