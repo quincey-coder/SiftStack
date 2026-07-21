@@ -156,12 +156,14 @@ def test_formatter_lien_wiring():
     n = _parse_body_text(SAMPLE_GRID)[0]
     n.zip = "78701"  # pretend CAD lookup filled the property location
     tags = _build_tags(n)
-    assert "lien" in tags.split(",")
+    # notice_type is tagged with its DataSift display name ("Liens"), plus the
+    # specific lien-type tag; the Lists column / built-in list is "Liens".
+    assert "Liens" in tags.split(",")
     assert "abstract_of_judgment" in tags
     assert "Courthouse Data" in tags
     row = _build_row(n)
-    assert row["Lists"] == "Lien"
-    assert NOTICE_TYPE_TO_LIST["lien"] == "Lien"
+    assert row["Lists"] == "Liens"
+    assert NOTICE_TYPE_TO_LIST["lien"] == "Liens"
     # Lien context surfaced in Notes
     assert "Abstract Of Judgment" in row["Notes"]
     assert "Citibank" in row["Notes"]

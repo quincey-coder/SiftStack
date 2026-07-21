@@ -78,9 +78,22 @@ SEL_DATE_TO_ID = "cphNoMargin_f_ddcDateFiledTo"
 REQUEST_DELAY_MIN = 1.0
 REQUEST_DELAY_MAX = 2.0
 
-# A record-start grid line: "1\t\t\t2026076222" → row number + instrument #.
-_ROW_START_RE = re.compile(r"^\d+\t")
+# An instrument number in the grid ("2026076222"), 8+ digits.
 _INSTRUMENT_RE = re.compile(r"(\d{8,})")
+# The tccsearch grid renders each record in one of TWO layouts depending on
+# indexing status, and we must parse BOTH:
+#   • Temp (freshly filed, not yet indexed):
+#         "1\t\t\t2026086312"                 ← row# + instrument on ONE line
+#         "07/21/2026\tABSTRACT OF JUDGMENT\t[R] ..."
+#   • Perm (indexed — the records we actually want, they carry party names):
+#         "1"                                  ← row# alone
+#         "View"                               ← image link
+#         "2026078204"                         ← instrument on its OWN line
+#         "07/01/2026\tABSTRACT OF JUDGMENT\t[R] CAPITAL ONE (+)"
+# Anchoring on the row-number line misses Perm rows (after strip() "1\t" → "1",
+# no tab). Instead we anchor on the always-present DATE line and recover the
+# instrument from the immediately preceding lines — layout-agnostic.
+_DATE_LINE_RE = re.compile(r"^\d{2}/\d{2}/\d{4}\t")
 # Date + doc type + creditor: "06/29/2026\tABSTRACT OF JUDGMENT\t[R] CITIBANK"
 _DATE_RE = re.compile(r"^(\d{2}/\d{2}/\d{4})")
 _GRANTOR_RE = re.compile(r"\[R\]\s*(.+?)(?:\s*\(\+\))?$")   # creditor (filer)
@@ -209,7 +222,11 @@ def _parse_record(instrument: str, block: list[str]) -> NoticeData | None:
     # Preserve the pristine county-record debtor name for deep prospecting /
     # CAD name search; owner_name is the cleaned display form.
     notice.tax_owner_name = debtor.upper()
-    notice.owner_name = normalize_court_name(debtor)
+    # Title-case BEFORE flipping (matches Bell/Williamson lien scrapers). The
+    # grid debtor is raw ALL-CAPS "LAST FIRST MIDDLE"; without _clean_name the
+    # emitted owner_name stays ALL-CAPS, which the NAMELF rules flag as a
+    # probably-unnormalized/reversed value.
+    notice.owner_name = normalize_court_name(_clean_name(debtor))
     if address:
         notice.address = address
         notice.city = city
@@ -219,34 +236,45 @@ def _parse_record(instrument: str, block: list[str]) -> NoticeData | None:
 
 
 def _parse_body_text(body_text: str) -> list[NoticeData]:
-    """Pure parser over the results-grid inner_text (unit-testable)."""
+    """Pure parser over the results-grid inner_text (unit-testable).
+
+    Anchors on each record's DATE line (present in both the Temp and Perm grid
+    layouts — see _DATE_LINE_RE) rather than the row-number line, which the Perm
+    layout splits away from the instrument. The instrument number is recovered
+    from the handful of lines immediately preceding the date line, and the date
+    line plus the next few lines (grantor [R], grantee [E], legal/status) form
+    the record block handed to _parse_record.
+    """
     lines = [l.strip() for l in body_text.split("\n") if l.strip()]
+    n = len(lines)
 
     notices: list[NoticeData] = []
-    i = 0
-    n = len(lines)
-    while i < n:
-        line = lines[i]
-        if not _ROW_START_RE.match(line):
-            i += 1
+    for idx, line in enumerate(lines):
+        if not _DATE_LINE_RE.match(line):
             continue
-        inst_m = _INSTRUMENT_RE.search(line)
-        if not inst_m:
-            i += 1
-            continue
-        instrument = inst_m.group(1)
 
-        # Collect this record's lines until the next record-start (or ~6 lines).
-        block: list[str] = []
-        j = i + 1
-        while j < n and not _ROW_START_RE.match(lines[j]) and j < i + 7:
+        # Instrument = nearest 8+ digit number in the up-to-4 preceding lines
+        # ("2026078204" on its own line for Perm, "1\t\t\t2026086312" for Temp).
+        instrument = ""
+        for k in range(idx - 1, max(-1, idx - 5), -1):
+            m = _INSTRUMENT_RE.search(lines[k])
+            if m:
+                instrument = m.group(1)
+                break
+        if not instrument:
+            continue
+
+        # Block = the date line + following lines up to the next date line
+        # (capped) — carries [R]/[E]/legal for _parse_record.
+        block: list[str] = [line]
+        j = idx + 1
+        while j < n and not _DATE_LINE_RE.match(lines[j]) and j < idx + 5:
             block.append(lines[j])
             j += 1
 
         notice = _parse_record(instrument, block)
         if notice:
             notices.append(notice)
-        i = j
 
     return notices
 

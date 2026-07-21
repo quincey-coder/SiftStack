@@ -48,14 +48,20 @@ logger = logging.getLogger(__name__)
 
 # Lien document-type names to request in Advanced Search. Names not offered by a
 # given county's dropdown simply don't add a chip (logged, then skipped).
+# These MUST be the EXACT leaf labels as they appear in the GovOS
+# tokenized-nested-select (verified live against Bell, 2026-07-18). The picker
+# and the results-table doc-type cell both use these canonical spellings:
+#   - no apostrophe in "MECHANICS LIEN"
+#   - child-support liens are indexed simply as "CHILD SUPPORT" (no "LIEN")
+# Getting these wrong means the type is silently never selected (see
+# _add_doc_types, which now requires an EXACT leaf match, not a substring).
 LIEN_DOC_TYPE_NAMES = [
     "ABSTRACT OF JUDGMENT",
     "FEDERAL TAX LIEN",
     "STATE TAX LIEN",
-    "MECHANIC'S LIEN",
     "MECHANICS LIEN",
     "HOSPITAL LIEN",
-    "CHILD SUPPORT LIEN",
+    "CHILD SUPPORT",
 ]
 
 _DISMISS_JS = """() => {
@@ -197,6 +203,49 @@ async def _dismiss_popups(page: Page) -> None:
         pass
 
 
+# JS that finds the leaf whose *trimmed visible text* equals the wanted name and
+# clicks its <label> to tick the checkbox. Matching on visible text (not the
+# checkbox `name` attribute) is deliberate: some GovOS doc-type checkboxes carry
+# a stray TRAILING SPACE in `name` ("STATE TAX LIEN ", "ABSTRACT OF JUDGMENT ")
+# so name-based matching silently misses them. Anchoring to the exact trimmed
+# text also rejects the many decoy leaves that merely *contain* the name
+# ("PARTIAL RELEASE STATE TAX LIEN", "MECHANICS LIEN TRANSFER"). Returns:
+#   "checked"  — the box is (now) ticked -> committed to the query
+#   "clicked"  — label click fired (state reflects on next tick / row de-renders)
+#   "absent"   — no exact-text leaf rendered yet (keep polling)
+_COMMIT_LEAF_JS = """(nm) => {
+  const want = nm.trim().toUpperCase();
+  const items = [...document.querySelectorAll('.tokenized-nested-select__item')];
+  const it = items.find(e => (e.innerText || '').trim().toUpperCase() === want);
+  if (!it) return 'absent';
+  const box = it.querySelector('input[type=checkbox]');
+  if (box && box.checked) return 'checked';
+  const lbl = it.querySelector('label') || it;
+  lbl.click();
+  const after = it.querySelector('input[type=checkbox]');
+  return (after && after.checked) ? 'checked' : 'clicked';
+}"""
+
+
+async def _commit_leaf(page: Page, name: str) -> bool:
+    """Tick the doc-type leaf for `name`, confirming it actually committed.
+
+    The list is virtualized (only filtered rows render) so we poll for the row
+    to appear, click its label, and accept either a checked box or a fired click
+    (once selected the row can also de-render). Returns True on commit.
+    """
+    for _ in range(12):  # ~3.6s max for the filtered row to virtualize in
+        await page.wait_for_timeout(300)
+        try:
+            state = await page.evaluate(_COMMIT_LEAF_JS, name)
+        except Exception:
+            state = "absent"
+        if state in ("checked", "clicked"):
+            await page.wait_for_timeout(250)
+            return True
+    return False
+
+
 async def _add_doc_types(page: Page) -> list[str]:
     """Select lien document types in the GovOS tokenized-nested-select.
 
@@ -226,14 +275,14 @@ async def _add_doc_types(page: Page) -> list[str]:
                 await dt.press_sequentially(name, delay=35, timeout=8000)
             except AttributeError:
                 await dt.type(name, delay=35)  # older Playwright
-            await page.wait_for_timeout(1300)
-            # Click the matching LEAF item (not the OPR parent button).
-            leaf = page.locator(".tokenized-nested-select__item").filter(has_text=name)
-            if await leaf.count() > 0:
-                await leaf.first.click(timeout=5000)
+            if await _commit_leaf(page, name):
                 if name not in added:
                     added.append(name)
-                await page.wait_for_timeout(300)
+            else:
+                logger.warning(
+                    "lien doc type %r: no leaf committed in the GovOS dropdown "
+                    "— source label may have changed; SKIPPED (not selected)", name,
+                )
             await dt.fill("")  # reset filter for the next type
             await page.wait_for_timeout(150)
         except Exception as e:
