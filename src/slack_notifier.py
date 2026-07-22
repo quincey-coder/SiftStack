@@ -332,8 +332,9 @@ def build_rawpipe_block(
                 if (p or "").strip()
             ]
             addr_str = ", ".join(addr_parts)
-            owner_parts = [p for p in [n.owner_first_name, n.owner_last_name] if (p or "").strip()]
-            owner = " ".join(owner_parts)
+            # NoticeData carries the full display name (owner_name), not
+            # first/last splits — those only exist on the formatted CSV row.
+            owner = (n.owner_name or "").strip()
             line = f"  • {addr_str}"
             if owner:
                 line += f" — {owner}"
