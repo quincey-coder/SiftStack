@@ -36,6 +36,24 @@ FETCH_TIMEOUT = 20
 MAX_OBITUARY_TEXT = 6000
 MAX_ADDRESS_TEXT = 15000  # Larger limit for people search pages (CBC has 250+ results)
 
+# Heir-verification LLM budget per deceased record. Each survivor we verify is a
+# Claude call (obituary search + parse), and deceased heirs recurse into their
+# own sub-heirs — so a single obituary listing a large family fans out into
+# dozens of calls. On 2026-07-10/11 a couple of records with 20+ named survivors
+# drove daily runs to 525-920 Claude calls (normal is ~30) and blew the Actor
+# timeout mid-verification. These caps bound the verification budget per record:
+# the closest heirs (spouse/children/executor) are verified first, and every
+# survivor BEYOND the cap is still recorded in heir_map_json (status
+# "unverified", flagged verification_skipped) so its name/relationship/city
+# still reaches the DataSift Notes field — nothing is lost, we just don't spend
+# an LLM call chasing peripheral relatives. Env-overridable.
+MAX_HEIRS_VERIFIED = int(os.getenv("OBITUARY_MAX_HEIRS_VERIFIED", "6"))      # depth-0 survivors
+MAX_SUBHEIRS_VERIFIED = int(os.getenv("OBITUARY_MAX_SUBHEIRS_VERIFIED", "6"))  # depth-1 sub-heirs
+# Hard ceiling on recursion depth regardless of the max_heir_depth input, so a
+# stray input can't reintroduce the deep heirs-of-heirs fan-out. 1 = verify
+# survivors and, for any confirmed-deceased survivor, their direct sub-heirs.
+MAX_HEIR_DEPTH_CEILING = int(os.getenv("OBITUARY_MAX_HEIR_DEPTH", "1"))
+
 # Maximum years between DOD and notice filing date to accept an obituary match.
 # Probate is typically filed within 1-2 years of death. 3 years gives margin.
 MAX_DOD_GAP_YEARS = 3
@@ -2111,6 +2129,10 @@ def rank_decision_makers(
             "status": status,
             "source": "obituary_survivors",
         }
+        # Carry the "not chased with an LLM call" marker through to the heir map
+        # so Notes can label these survivors as captured-only (see build_heir_map).
+        if s.get("verification_skipped"):
+            entry["verification_skipped"] = True
 
         # Check in-laws FIRST (before child_terms, since "daughter-in-law" contains "daughter")
         if any(t in rel for t in inlaw_terms) or "in-law" in rel or "in law" in rel:
@@ -2303,6 +2325,33 @@ def verify_heir_status(
     return result
 
 
+def _heir_verify_priority(s: dict) -> int:
+    """Sort key for the limited verification budget (lower = verify first).
+
+    Spend the LLM-call budget on the closest heirs — the ones who actually hold
+    signing authority under TX intestate succession (executor, spouse, children)
+    — and let peripheral relatives (grandchildren, in-laws, friends) fall past
+    the cap. They're still captured in Notes; we just don't chase them with a
+    call. Mirrors the relationship tiers in rank_decision_makers().
+    """
+    rel = (s.get("relationship") or "").strip().lower()
+    if "executor" in rel or "personal representative" in rel:
+        return 0
+    if ("in-law" not in rel and "in law" not in rel and "'s " not in rel
+            and any(t in rel for t in ("wife", "husband", "spouse", "partner"))):
+        return 1
+    if ("in-law" not in rel and "step" not in rel
+            and any(t in rel for t in ("son", "daughter", "child"))):
+        return 2
+    if "in-law" not in rel and any(t in rel for t in ("mother", "father", "parent")):
+        return 3
+    if "in-law" not in rel and any(t in rel for t in ("brother", "sister", "sibling")):
+        return 4
+    if any(t in rel for t in ("grandson", "granddaughter", "grandchild")):
+        return 5
+    return 6  # in-laws, step-children, friends, unknown relationship
+
+
 def build_heir_map(
     parsed: dict,
     city: str,
@@ -2315,7 +2364,16 @@ def build_heir_map(
     For each survivor from the obituary, verifies alive/dead status.
     If a survivor is deceased and depth allows, recursively checks their heirs.
     Returns ranked decision-makers and an error/metadata dict.
+
+    Verification is budgeted (MAX_HEIRS_VERIFIED / MAX_SUBHEIRS_VERIFIED): the
+    closest heirs are verified first and any survivors beyond the cap are kept
+    unverified in the returned map (so they still reach Notes) rather than each
+    costing an LLM call — see the module-level caps for why.
     """
+    # Never recurse deeper than the ceiling regardless of the caller's input,
+    # so a stray max_heir_depth can't reintroduce the deep heirs-of-heirs fan-out.
+    max_depth = min(max_depth, MAX_HEIR_DEPTH_CEILING)
+
     survivors = list(parsed.get("survivors", []))
     executor = parsed.get("executor_named", "")
     preceded = set(parsed.get("preceded_in_death", []))
@@ -2366,6 +2424,24 @@ def build_heir_map(
 
         to_verify.append((name, s))
 
+    # Budget the depth-0 verification: verify the closest heirs first and leave
+    # the rest unverified (but still in `survivors` → heir_map_json → Notes).
+    if len(to_verify) > MAX_HEIRS_VERIFIED:
+        to_verify.sort(key=lambda ns: _heir_verify_priority(ns[1]))
+        over_cap = to_verify[MAX_HEIRS_VERIFIED:]
+        to_verify = to_verify[:MAX_HEIRS_VERIFIED]
+        for _n, _s in over_cap:
+            _s["verification_skipped"] = True  # surfaced in Notes, no LLM call spent
+        error_info["heirs_over_cap"] = len(over_cap)
+        error_info["missing_flags"].append(
+            f"heir_verification_capped_{len(over_cap)}_survivors_unverified"
+        )
+        logger.info(
+            "  Heir verification capped at %d of %d survivors — %d peripheral "
+            "survivor(s) captured unverified for Notes (no LLM call)",
+            MAX_HEIRS_VERIFIED, len(to_verify) + len(over_cap), len(over_cap),
+        )
+
     # Parallel depth-0 heir verification
     def _verify_depth0(args):
         vname, _ = args
@@ -2398,6 +2474,23 @@ def build_heir_map(
                 continue
             verified_names.add(sub_name)
             sub_verify_tasks.append((sub_name, sub))
+
+    # Budget the depth-1 fan-out too: verify up to the cap, and record the rest
+    # unverified so a deceased heir with a huge family still can't explode the
+    # call count (the overflow sub-heirs still land in Notes via heir_map_json).
+    if len(sub_verify_tasks) > MAX_SUBHEIRS_VERIFIED:
+        over_subs = sub_verify_tasks[MAX_SUBHEIRS_VERIFIED:]
+        sub_verify_tasks = sub_verify_tasks[:MAX_SUBHEIRS_VERIFIED]
+        for sub_name, sub in over_subs:
+            survivors.append({
+                "name": sub_name,
+                "relationship": sub.get("relationship", "grandchild"),
+                "verification_skipped": True,
+            })
+        error_info["heirs_over_cap"] = error_info.get("heirs_over_cap", 0) + len(over_subs)
+        error_info["missing_flags"].append(
+            f"subheir_verification_capped_{len(over_subs)}_unverified"
+        )
 
     def _verify_depth1(args):
         vname, _ = args

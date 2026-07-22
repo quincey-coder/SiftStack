@@ -133,6 +133,7 @@ _NOTICE_TYPE_LABELS = {
     "code_violation": "Code Violation",
     "divorce": "Divorce",
     "lien": "Lien",
+    "lis_pendens": "Lis Pendens",
 }
 
 _OWNER_DECEASED_LABELS = {"yes": "Yes", "no": "No", "suspected": "Suspected"}
@@ -438,6 +439,9 @@ NOTICE_TYPE_TO_LIST = {
     "code_violation": "Code Enforcement",
     "divorce": "Divorce",
     "lien": "Liens",
+    # No built-in DataSift list equivalent — SiftStack-only list (like Tax Sale);
+    # DataSift auto-creates it from the CSV on first upload.
+    "lis_pendens": "Lis Pendens",
 }
 
 
@@ -721,7 +725,10 @@ def _build_heir_summary(notice: NoticeData) -> str:
             name = h.get("name", "?")
             rel = h.get("relationship", "unknown")
             status = h.get("status", "unverified")
-            status_label = "ALIVE" if status == "verified_living" else status.upper()
+            if h.get("verification_skipped"):
+                status_label = "NOT VERIFIED (reference only)"
+            else:
+                status_label = "ALIVE" if status == "verified_living" else status.upper()
 
             # Phone info
             phones = h.get("phones", [])
@@ -748,21 +755,29 @@ def _build_heir_summary(notice: NoticeData) -> str:
     else:
         lines.append("=== NO SIGNING CHAIN IDENTIFIED ===")
 
-    # ── Non-signing family section (compact) ──
+    # ── Non-signing family section ──
+    # List EVERY non-signing survivor (no truncation). Large obituaries get their
+    # peripheral relatives captured here for reference even though we don't chase
+    # them — including the survivors intentionally left unverified to bound LLM
+    # cost (flagged "reference only"; see obituary_enricher heir-verification cap).
     if non_signers:
         entries = []
-        for h in non_signers[:6]:
+        for h in non_signers:
             name = h.get("name", "?")
             rel = h.get("relationship", "")
             status = h.get("status", "unverified")
-            tag = "living" if status == "verified_living" else "deceased" if status == "deceased" else status
+            if h.get("verification_skipped"):
+                tag = "reference only — not verified"
+            elif status == "verified_living":
+                tag = "living"
+            elif status == "deceased":
+                tag = "deceased"
+            else:
+                tag = status
             entries.append(f"{name} ({rel}) [{tag}]")
         lines.append("")
-        lines.append("=== OTHER FAMILY (no signing authority) ===")
+        lines.append(f"=== OTHER FAMILY / SURVIVORS ({len(entries)}) ===")
         lines.append(", ".join(entries))
-        remaining = len(non_signers) - 6
-        if remaining > 0:
-            lines.append(f"(+{remaining} more)")
 
     return "\n".join(lines)
 
@@ -900,12 +915,18 @@ def _build_property_section(notice: NoticeData) -> str:
     if notice.notice_type:
         parts.append(notice.notice_type.replace("_", " ").title())
 
-    # Lien context: the specific lien type + the creditor who filed it. The
-    # debtor (our lead) is already the owner; this surfaces WHY they're distressed.
-    if notice.lien_type:
-        parts.append(f"Lien: {notice.lien_type}")
-    if notice.lien_creditor:
-        parts.append(f"Creditor: {notice.lien_creditor}")
+    # Lien / lis-pendens context: WHY the owner (our lead) is distressed.
+    # Lis pendens reuses lien_creditor to carry the PLAINTIFF who filed the suit
+    # (the suit type is always "Lis Pendens", already shown via the notice_type
+    # line above, so lien_type is left unset for these).
+    if notice.notice_type == "lis_pendens":
+        if notice.lien_creditor:
+            parts.append(f"Plaintiff: {notice.lien_creditor}")
+    else:
+        if notice.lien_type:
+            parts.append(f"Lien: {notice.lien_type}")
+        if notice.lien_creditor:
+            parts.append(f"Creditor: {notice.lien_creditor}")
 
     if notice.violation_description:
         parts.append(f"Violation: {notice.violation_description}")

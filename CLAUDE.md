@@ -335,6 +335,25 @@ Courthouse probate records have decedent name + PR/executor name but NO property
 - Prevents matching a 2014 obituary to a 2025 court filing (wrong person with same name)
 - Applied to both full-page and snippet matches
 
+**Heir-Verification Budget** (obituary enricher, `build_heir_map`) — cost guard:
+- Each survivor verified = a Claude call (obituary search + parse), and deceased
+  heirs recurse into their sub-heirs, so one obituary listing a large family fans
+  out into dozens of calls. A couple of 20+-survivor records on 2026-07-10/11
+  drove daily runs to 525-920 Claude calls (normal ~30) and blew the Actor
+  timeout mid-verification.
+- Caps: `MAX_HEIRS_VERIFIED = 6` (depth-0 survivors) + `MAX_SUBHEIRS_VERIFIED = 6`
+  (depth-1 sub-heirs), and `MAX_HEIR_DEPTH_CEILING = 1` clamps recursion depth
+  regardless of the `max_heir_depth` input (so the schedule input value is now
+  effectively moot). All three are env-overridable
+  (`OBITUARY_MAX_HEIRS_VERIFIED` / `_MAX_SUBHEIRS_VERIFIED` / `_MAX_HEIR_DEPTH`).
+- Closest heirs (executor > spouse > children > …, via `_heir_verify_priority`)
+  are verified first so the cap keeps the people with signing authority.
+- **Nothing is lost:** survivors beyond the cap stay in `heir_map_json` with
+  status `unverified` + a `verification_skipped` flag, so every name/relationship
+  still renders in the DataSift **Notes** field (`_build_heir_summary`) — the
+  signing chain labels them "NOT VERIFIED (reference only)" and the OTHER FAMILY
+  section (no longer truncated) lists them all as "reference only — not verified".
+
 ### Dropbox Folder Structure
 ```
 {DROPBOX_ROOT_FOLDER}/
