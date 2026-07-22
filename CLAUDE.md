@@ -99,13 +99,54 @@ All source files are in `src/` and imports assume `src/` is the working director
 
 ## TX Data Source Details
 
-All Texas data sources are **public** — no logins, CAPTCHAs, or credentials required for any county source.
+All Texas data sources are **public** — no logins or credentials required for any county source. (tccsearch.org sits behind Cloudflare — see below — and the Odyssey portals use reCAPTCHA, but neither needs an account.)
 
-- **tccsearch.org** (Travis foreclosures) — Infragistics UI grid. Click "Results List" to get all results as a batched PDF popup. No pagination needed.
+- **tccsearch.org** (Travis foreclosure/probate/lien) — Infragistics UI grid. Click "Results List" to get all results as a batched PDF popup. No pagination needed. **Behind Cloudflare's managed "Just a moment…" JS challenge** — see "tccsearch.org Cloudflare" below; requires a headed browser + playwright-stealth + a **US** residential IP.
 - **Odyssey portals** (Tyler Tech) — Used for probate court records across all 3 counties. Each county has its own URL (see `ODYSSEY_URLS` in `config.py`).
 - **Travis Tax Office** — Tax delinquent data is a direct CSV download (no scraping). Tax sale listings at a separate URL.
 - **MVBA Law Firm** — Posts tax sale PDFs covering Bell + Williamson counties. One scraper handles both.
 - **Bell/Williamson County Clerks** — Standard HTML pages for foreclosure/trustee sale listings.
+
+### tccsearch.org Cloudflare (Travis foreclosure/probate/lien) — hard-won 2026-07-22
+
+All three Travis tccsearch scrapers share `scrapers/tccsearch_common.py`. The
+site is behind **Cloudflare's managed "Just a moment…" JS challenge**. What was
+learned running it down on Apify (the block had killed every Travis pull since
+~2026-07-16, silently — the scrapers logged only "client framework not ready"):
+
+- **The decisive factor is a US residential exit IP.** Cloudflare challenges
+  low-reputation / non-US residential IPs and never lets them clear (verified:
+  headed browser + full stealth + a random-country residential IP still stuck on
+  "Just a moment…" after 60s across three different IPs). `main.py` now pins
+  `create_proxy_configuration(groups=["RESIDENTIAL"], country_code="US")`
+  (override via `proxy_country` input / `SIFT_PROXY_COUNTRY` env). With a US IP
+  the challenge clears **sub-second** — often no interstitial at all.
+- **Also required (necessary, not sufficient):** a **headed** browser
+  (`launch_tcc_context`, headed by default; Xvfb on Apify — the Actor start
+  command already wraps `xvfb-run`), `--disable-blink-features=AutomationControlled`,
+  and the **`playwright-stealth`** evasion suite applied to the context
+  (`Stealth().apply_stealth_async`). Stealth matters because headed-under-Xvfb
+  otherwise leaks a SwiftShader WebGL renderer and `navigator.webdriver` — both
+  bot tells; stealth spoofs WebGL to Intel and sets `webdriver=false`.
+- **Keep the fingerprint internally consistent.** UA + platform are a **Linux**
+  profile (`X11; Linux x86_64`) because on Apify the browser genuinely *is*
+  Chromium-on-Linux — a Mac/Windows UA over a Linux browser mismatches the real
+  `sec-ch-ua-platform` header and is itself a tell. Override for local debugging
+  only via `TCC_HEADLESS=1`.
+- **`tccsearch_common` helpers, in call order:** `launch_tcc_context(p)` →
+  `pass_cloudflare(page)` (polls the "Just a moment…" markers away, reloads once
+  at ~40% to pick up the cf_clearance cookie; folded into `wait_ready`) →
+  `goto_with_retry(page, url)` (the disclaimer "Accept" fires its own redirect,
+  so a manual goto races it → `net::ERR_ABORTED`; retried) → `wait_ready(page)`
+  (waits for the ASP.NET framework **and** the Search button `#cphNoMargin_SearchButtons1_btnSearch`
+  to render — the form lags the framework on a cold proxy connection, which
+  otherwise threw "checkbox not checkable / btnSearch is null") → `safe_check`
+  (15s per doc-type checkbox).
+- **If Travis goes dark again:** first suspect the proxy landed a bad/again-non-US
+  IP or the whole Apify residential pool got flagged; the `pass_cloudflare`
+  failure log now reports `turnstile=True/False` — `True` means Cloudflare
+  escalated to an embedded Turnstile widget needing a solved cf-clearance token
+  (2captcha, already a dependency), `False` means it's still the IP/pool.
 
 ## Data Sources
 

@@ -247,8 +247,10 @@ def main() -> int:
         print(f"  authenticated as: {user.get('username', '?')} (id={user.get('id', '?')})")
         print(f"Opening named KVS: {args.kvs_name}")
         kvs_info = client.key_value_stores().get_or_create(name=args.kvs_name)
-        kvs = client.key_value_store(kvs_info["id"])
-        print(f"  KVS id: {kvs_info['id']}")
+        # apify-client 2.x returns a dict, 3.x a typed KeyValueStore model
+        kvs_id = kvs_info["id"] if isinstance(kvs_info, dict) else kvs_info.id
+        kvs = client.key_value_store(kvs_id)
+        print(f"  KVS id: {kvs_id}")
 
     # Write tax-delinquent / seen records.
     if seed_texdel and not args.dry_run:

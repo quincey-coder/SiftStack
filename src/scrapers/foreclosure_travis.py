@@ -33,7 +33,13 @@ from playwright.async_api import async_playwright, Page
 
 from notice_parser import NoticeData
 from scrapers import register
-from scrapers.tccsearch_common import proxy_kwargs, safe_check, wait_ready
+from scrapers.tccsearch_common import (
+    goto_with_retry,
+    launch_tcc_context,
+    pass_cloudflare,
+    safe_check,
+    wait_ready,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +142,9 @@ def _parse_address_from_legal(legal_desc: str) -> tuple[str, str, str]:
 async def _accept_disclaimer(page: Page) -> None:
     """Click the disclaimer acceptance link on the landing page."""
     await page.goto(BASE_URL, wait_until="domcontentloaded")
+    # First navigation to the domain — clear the Cloudflare interstitial here so
+    # the cf_clearance cookie is set before the disclaimer/search steps.
+    await pass_cloudflare(page)
     accept = page.locator(SEL_DISCLAIMER_ACCEPT)
     if await accept.count() > 0:
         await accept.click()
@@ -367,24 +376,15 @@ class TravisForeclosureScraper:
         all_notices: list[NoticeData] = []
 
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/131.0.0.0 Safari/537.36"
-                ),
-                **proxy_kwargs(),
-            )
-            page = await context.new_page()
-            page.set_default_timeout(30000)
+            # Cloudflare-resistant headed launch (see tccsearch_common).
+            browser, context, page = await launch_tcc_context(p)
 
             try:
                 # Step 1: Accept disclaimer
                 await _accept_disclaimer(page)
 
                 # Step 2: Navigate to search
-                await page.goto(SEARCH_URL, wait_until="domcontentloaded")
+                await goto_with_retry(page, SEARCH_URL)
                 await page.wait_for_timeout(1500)
                 # Fail fast (~12s) with a clear message if the client framework
                 # was withheld (datacenter-IP block) instead of a 30s check timeout.

@@ -38,3 +38,9 @@ dropbox_state.json
 photo_state.json
 *.tmp
 *.bak
+NEPQ Sales Transcripts/
+Novation King Playbook/
+Novation King Transcripts/
+Novation King Transcripts.log
+youtube_transcripts.py
+venv/

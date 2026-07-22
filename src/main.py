@@ -451,11 +451,26 @@ async def actor_main() -> None:
         # the tccsearch scrapers pick it up via tccsearch_common.proxy_kwargs().
         if use_proxy:
             try:
-                proxy_config = await Actor.create_proxy_configuration(groups=["RESIDENTIAL"])
+                # Pin to US residential exits — tccsearch is a US county site and
+                # Cloudflare trusts US residential IPs far more than random-country
+                # ones (a foreign IP hitting a Texas clerk site is itself a bot
+                # signal). country_code="US" is overridable via the SIFT_PROXY_COUNTRY
+                # input/env for experimentation.
+                country = (
+                    actor_input.get("proxy_country")
+                    or os.environ.get("SIFT_PROXY_COUNTRY")
+                    or "US"
+                ).strip().upper() or None
+                proxy_config = await Actor.create_proxy_configuration(
+                    groups=["RESIDENTIAL"], country_code=country,
+                )
                 proxy_url = await proxy_config.new_url()
                 if proxy_url:
                     os.environ["SCRAPER_PROXY_URL"] = proxy_url
-                    Actor.log.info("Residential proxy configured (routing tccsearch scrapers)")
+                    Actor.log.info(
+                        "Residential proxy configured (country=%s, routing tccsearch scrapers)",
+                        country or "any",
+                    )
                 else:
                     Actor.log.warning("Residential proxy returned no URL — continuing without")
             except Exception as e:
@@ -496,9 +511,11 @@ async def actor_main() -> None:
             _kvs_info = await _user_client.key_value_stores().get_or_create(
                 name=_state_kvs_name,
             )
-            _state_kvs = _user_client.key_value_store(_kvs_info["id"])
+            # apify-client 2.x returns a dict, 3.x a typed KeyValueStore model
+            _kvs_id = _kvs_info["id"] if isinstance(_kvs_info, dict) else _kvs_info.id
+            _state_kvs = _user_client.key_value_store(_kvs_id)
             Actor.log.info(
-                "Cross-run KVS '%s' opened (id=%s)", _state_kvs_name, _kvs_info["id"],
+                "Cross-run KVS '%s' opened (id=%s)", _state_kvs_name, _kvs_id,
             )
 
             # Thin async wrappers mirroring the Actor-SDK KVS API so downstream
