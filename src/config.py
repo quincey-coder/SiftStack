@@ -121,7 +121,7 @@ TESSERACT_PSM_PHOTO = 4  # assume single column of variable-size text — best f
 # ── Notice Types ───────────────────────────────────────────────────────
 # code_violation is scraped for Travis (Austin Code Socrata API); Bell/Williamson
 # have no live source (open-records only) and warn harmlessly as unregistered.
-NOTICE_TYPES = ["foreclosure", "tax_sale", "tax_delinquent", "probate", "code_violation", "lien"]
+NOTICE_TYPES = ["foreclosure", "tax_sale", "tax_delinquent", "probate", "code_violation", "lien", "lis_pendens"]
 
 # Notice types run automatically on the default daily/historical scrape (no --types
 # given). code_violation is deliberately excluded: it's a weak standalone distressor

@@ -454,21 +454,23 @@ def run_enrichment_pipeline(
         except Exception as e:
             logger.warning("  Probate property lookup failed: %s", e)
 
-    # ── Step 3c-lien: Lien Property Lookup ───────────────────────────
-    # County-clerk liens are NAME-indexed with no property address. Search the
-    # county CAD/tax roll by the debtor name to find the property they own
-    # in-county. Records with no match keep their blank address and drop out
-    # downstream (ZIP filter / row validation) — which also discards the mostly
-    # business-owned State Tax Liens automatically (the safety property).
+    # ── Step 3c-lien: Lien / Lis-Pendens Property Lookup ─────────────
+    # County-clerk liens are NAME-indexed with no property address; lis pendens
+    # carry only a subdivision legal (not a mailing address) unless one was
+    # parsed inline. Search the county CAD/tax roll by the debtor/defendant name
+    # to find the property they own in-county. Records with no match keep their
+    # blank address and drop out downstream (ZIP filter / row validation) —
+    # which also discards mostly business-owned State Tax Liens and lis pendens
+    # against entities automatically (the safety property).
     lien_no_addr = [
         n for n in notices
-        if n.notice_type == "lien"
+        if n.notice_type in ("lien", "lis_pendens")
         and not n.address.strip()
         and (n.tax_owner_name.strip() or n.owner_name.strip())
         and n.county.lower() in ("travis", "bell", "williamson")
     ]
     if lien_no_addr:
-        logger.info("── Step 3c-lien: Lien Property Lookup (%d candidates) ──", len(lien_no_addr))
+        logger.info("── Step 3c-lien: Lien / Lis-Pendens Property Lookup (%d candidates) ──", len(lien_no_addr))
         try:
             from cad_lookup import lookup_property_by_name
             found = 0

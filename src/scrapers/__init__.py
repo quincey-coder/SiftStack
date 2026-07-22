@@ -187,3 +187,21 @@ try:
     from scrapers import lien_tyler  # noqa: F401
 except ImportError as e:
     logger.debug("Could not import lien_tyler: %s", e)
+
+# Lis pendens (county-clerk OPR, Tex. Prop. Code § 12.007) — same three sources
+# as liens: Travis via tccsearch.org (doc-type 63), Bell via publicsearch.us
+# (headed), Williamson via Tyler Self-Service (headed).
+try:
+    from scrapers import lis_pendens_travis  # noqa: F401
+except ImportError as e:
+    logger.debug("Could not import lis_pendens_travis: %s", e)
+
+try:
+    from scrapers import lis_pendens_publicsearch  # noqa: F401
+except ImportError as e:
+    logger.debug("Could not import lis_pendens_publicsearch: %s", e)
+
+try:
+    from scrapers import lis_pendens_tyler  # noqa: F401
+except ImportError as e:
+    logger.debug("Could not import lis_pendens_tyler: %s", e)
