@@ -54,6 +54,10 @@ _ADDR_INDEX: dict[tuple[str, str], dict] | None = None
 # marked "__AMBIG__" and not returned; a delinquent-situs record is authoritative.
 _PARCEL_INDEX: dict[str, dict | str] | None = None
 
+# Lazy sibling of _ADDR_INDEX for the street-only fallback in
+# search_by_address: {normalized_street: [zip5, ...]} — Austin-area ZIPs only.
+_STREET_FALLBACK: dict[str, list[str]] | None = None
+
 _FIELD_LIMIT = 10 * 1024 * 1024  # 10 MB — TaxCurOpenData has long quoted rows
 
 
@@ -98,9 +102,24 @@ def _add_parcel(parcel_idx: dict, record: dict) -> None:
             parcel_idx[pkey] = "__AMBIG__"
 
 
+# Spelled-out street suffix/directional words → the USPS abbreviations TCAD
+# uses. Applied token-wise and SYMMETRICALLY (index build + lookup), so keys
+# only ever collapse toward each other — external feeds that spell words out
+# ("2105 East Cesar Chavez Street", CTECC fire feed) match TCAD's
+# "E CESAR CHAVEZ ST" style keys.
+_STREET_TOKEN_MAP = {
+    "STREET": "ST", "DRIVE": "DR", "AVENUE": "AVE", "BOULEVARD": "BLVD",
+    "ROAD": "RD", "LANE": "LN", "COURT": "CT", "CIRCLE": "CIR",
+    "PLACE": "PL", "TERRACE": "TER", "TRAIL": "TRL", "PARKWAY": "PKWY",
+    "HIGHWAY": "HWY", "COVE": "CV", "CROSSING": "XING", "CROSSINGS": "XING",
+    "NORTH": "N", "SOUTH": "S", "EAST": "E", "WEST": "W",
+}
+
+
 def _normalize_street(street: str) -> str:
-    """Uppercase, collapse whitespace, strip punctuation. Output aligns with
-    TCAD's `Street Number + Street Name` concatenation format (e.g.
+    """Uppercase, collapse whitespace, strip punctuation, abbreviate
+    spelled-out suffix/directional words. Output aligns with TCAD's
+    `Street Number + Street Name` concatenation format (e.g.
     `'1512 W 9TH ST'`)."""
     if not street:
         return ""
@@ -108,7 +127,7 @@ def _normalize_street(street: str) -> str:
     s = street.upper()
     s = _re.sub(r"[.,]", "", s)
     s = _re.sub(r"\s+", " ", s).strip()
-    return s
+    return " ".join(_STREET_TOKEN_MAP.get(tok, tok) for tok in s.split(" "))
 
 
 def _cache_path(filename: str) -> Path:
@@ -313,9 +332,10 @@ def load_index(force_download: bool = False) -> dict[str, list[dict]]:
 
     Also populates the sibling address index (see `search_by_address`).
     """
-    global _INDEX, _ADDR_INDEX, _PARCEL_INDEX
+    global _INDEX, _ADDR_INDEX, _PARCEL_INDEX, _STREET_FALLBACK
     if _INDEX is not None and not force_download:
         return _INDEX
+    _STREET_FALLBACK = None  # derived from _ADDR_INDEX — rebuild with it
     delq_path, cur_path = download_if_stale(force=force_download)
     idx: dict[str, list[dict]] = {}
     addr_idx: dict[tuple[str, str], dict] = {}
@@ -362,17 +382,43 @@ def search_by_address(street: str, zip5: str) -> dict | None:
     The delinquent CSV is authoritative — if a delinquent_situs record
     exists at this address, it wins over a current_mailing record. Returns
     None when no TCAD record matches.
+
+    When the exact (street, zip) key misses — or the caller has no ZIP at
+    all — falls back to a street-only match, accepted ONLY when the full
+    "NUM STREET" string resolves to a single Austin-area ZIP (786xx/787xx).
+    Reverse-geocoded ZIPs are routinely wrong (Nominatim returns PO-box ZIPs
+    like 78715 for 78745 streets), and the ZIP guard keeps out-of-county
+    MAILING-address keys (absentee owners in Houston/Dallas) from matching.
     """
     global _ADDR_INDEX
     if _ADDR_INDEX is None:
         load_index()
     if _ADDR_INDEX is None:  # still None = load failed
         return None
-    zip5 = (zip5 or "").strip()[:5]
-    if not street or not zip5:
+    street_key = _normalize_street(street)
+    if not street_key:
         return None
-    key = (_normalize_street(street), zip5)
-    return _ADDR_INDEX.get(key)
+    zip5 = (zip5 or "").strip()[:5]
+    if zip5:
+        hit = _ADDR_INDEX.get((street_key, zip5))
+        if hit:
+            return hit
+    return _street_fallback(street_key)
+
+
+def _street_fallback(street_key: str) -> dict | None:
+    """Street-only lookup: unique Austin-area ZIP for this exact NUM+STREET."""
+    global _STREET_FALLBACK
+    if _STREET_FALLBACK is None:
+        fb: dict[str, list[str]] = {}
+        for st, zp in _ADDR_INDEX:
+            if zp.startswith(("786", "787")):
+                fb.setdefault(st, []).append(zp)
+        _STREET_FALLBACK = fb
+    zips = set(_STREET_FALLBACK.get(street_key) or [])
+    if len(zips) != 1:
+        return None
+    return _ADDR_INDEX.get((street_key, zips.pop()))
 
 
 def search_by_parcel(parcel_id: str) -> dict | None:

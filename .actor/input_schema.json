@@ -24,7 +24,7 @@
         "types": {
             "title": "Notice Types",
             "type": "array",
-            "description": "Notice types. Leave empty for the default set (foreclosure, probate, tax_sale, tax_delinquent, lien, lis_pendens). code_violation is excluded from the default and is Travis-only (Austin Code Socrata API) — request it explicitly.",
+            "description": "Notice types. Leave empty for the default set (foreclosure, probate, tax_sale, tax_delinquent, lien, lis_pendens, fire_damage). code_violation is excluded from the default and is Travis-only (Austin Code Socrata API) — request it explicitly. fire_damage is also Travis-only (CTECC Real-Time Fire Socrata feed) but IS in the default set.",
             "items": { "type": "string" },
             "default": [],
             "editor": "stringList"

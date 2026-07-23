@@ -205,3 +205,8 @@ try:
     from scrapers import lis_pendens_tyler  # noqa: F401
 except ImportError as e:
     logger.debug("Could not import lis_pendens_tyler: %s", e)
+
+try:
+    from scrapers import fire_damage_travis  # noqa: F401
+except ImportError as e:
+    logger.debug("Could not import fire_damage_travis: %s", e)

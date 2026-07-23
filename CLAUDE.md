@@ -159,6 +159,7 @@ Configured in `config.py`:
 | Travis | Tax Sale | Travis Tax Office upcoming sales |
 | Travis | Probate | Odyssey portal |
 | Travis | Lien | tccsearch.org OPR (doc-type checkboxes) |
+| Travis | Fire Damage | CTECC Real-Time Fire feed (Socrata `wpu4-x69d`) |
 | Bell | Foreclosure | bellcountytx.com county clerk |
 | Bell | Tax Sale | MVBA Law Firm PDFs |
 | Bell | Probate | Odyssey portal |
@@ -201,6 +202,38 @@ enrichment **Step 3c-lien**.
   (debtor name → in-county property). No match → blank address → dropped
   downstream, which also discards the mostly-business State Tax Liens (the same
   safety property as the sold flow).
+
+## Fire Damage (Travis) — `notice_type = "fire_damage"`
+
+Structure fires are the earliest worst-condition signal (a burned house sits
+1-3 years before any code case). `scrapers/fire_damage_travis.py` pulls the
+CTECC **Real-Time Fire Incidents** Socrata feed (`wpu4-x69d`, 5-min refresh,
+rolling ~12 mo, street addresses included). In `DEFAULT_SCRAPE_TYPES` (unlike
+code_violation); Travis-only. ~2-3 structure fires/day
+(`BOX -Structure Fire` + `BOXL- Structure Fire`; BOXMID/BOXHI mid/hi-rise
+excluded — override via `FIRE_DAMAGE_PROBLEMS`). Do NOT use `v5hh-nyr8`
+("AFD Fire Incidents") — refreshed only ~quarterly, no street address.
+
+Hard-won (2026-07-23):
+- **Owner comes from parcel, not address.** Feed has no city/ZIP/parcel, and
+  `travis_tax_cache` address keys only cover owner-occupants (absentee parcels
+  are keyed by the owner's MAILING address). The scraper resolves each fire's
+  lat/long → TCAD parcel via the Travis County GIS layer
+  (`TCAD_public/MapServer/0`, 386K parcels); its `geo_id` keys straight into
+  the parcel index (covers ALL owners), so enrichment Step 5's parcel-first
+  path resolves owners exactly. Raised owner hits 4/16 → 12/16 live.
+- **GIS quirks:** the server SILENTLY returns zero features for `inSR=4326` —
+  points must be pre-projected to EPSG:2277 (inline pure-python Lambert in the
+  scraper, ±2.5 ft vs the server's GeometryServer). CTECC points are snapped
+  to the STREET CENTERLINE (inside no parcel) — query buffers 200 ft and
+  accepts the candidate whose `situs_num` equals the feed house number.
+- The GIS situs supplies the authoritative ZIP; Nominatim reverse geocoding is
+  fallback-only (its postcodes are often PO-box ZIPs, e.g. 78715 for 78745).
+- `travis_tax_cache._normalize_street` now abbreviates spelled-out
+  suffix/directional words (STREET→ST, EAST→E, symmetric on build+lookup), and
+  `search_by_address` falls back to a street-only match when the ZIP is wrong
+  or missing — accepted only for a unique Austin-area (786xx/787xx) ZIP, which
+  keeps out-of-county mailing keys from matching.
 
 ## Key Domain Rules
 

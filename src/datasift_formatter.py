@@ -134,6 +134,7 @@ _NOTICE_TYPE_LABELS = {
     "divorce": "Divorce",
     "lien": "Lien",
     "lis_pendens": "Lis Pendens",
+    "fire_damage": "Fire Damage",
 }
 
 _OWNER_DECEASED_LABELS = {"yes": "Yes", "no": "No", "suspected": "Suspected"}
@@ -442,6 +443,7 @@ NOTICE_TYPE_TO_LIST = {
     # No built-in DataSift list equivalent — SiftStack-only list (like Tax Sale);
     # DataSift auto-creates it from the CSV on first upload.
     "lis_pendens": "Lis Pendens",
+    "fire_damage": "Fire Damage",
 }
 
 
