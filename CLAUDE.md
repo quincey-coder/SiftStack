@@ -59,6 +59,24 @@ python src/extract_market_finder.py --state "Texas" --county "Bell,Williamson" -
 
 All source files are in `src/` and imports assume `src/` is the working directory. Run from project root with `python src/main.py` or set `PYTHONPATH=src`.
 
+### Local/cloud parity — `input.json` is the schedule mirror
+
+`input.json` (gitignored, holds secrets) is kept in sync with the production
+Apify schedule's runInput. The CLI reads it as its defaults layer, so a bare
+`python src/main.py daily` resolves enrichment toggles (obituary, ancestry,
+Zillow, entity research, Tracerfy/Trestle, split-by-county, Slack) to EXACTLY
+what the scheduled cloud run does. Precedence: **explicit CLI flag >
+input.json > built-in opt-in default**. `--skip-obituary`/`--skip-ancestry`/
+`--skip-zillow`/`--fast` force things OFF over input.json; without an
+input.json everything stays conservative opt-in. If you change the schedule's
+runInput in the Apify Console, re-sync input.json (or ask Claude to). NOTE:
+input.json intentionally carries no `max_notices` cap anymore — pass
+`--max-notices N` for smoke tests. Off-switches that only exist as flags:
+`--no-slack`, `--no-drive` (both are presence-armed from `.env` otherwise).
+Cross-run state is still split-brain by design (cloud=Apify KVS, local=`data/`
++ state file): never upload to DataSift from a local `daily` run — the local
+dedup/sold baselines don't know what the cloud already uploaded.
+
 ## Architecture
 
 **Data flows:**

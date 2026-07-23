@@ -1377,8 +1377,8 @@ def _run_pdf_import(args) -> None:
         skip_zillow=args.skip_zillow,
         skip_tax=args.skip_tax,
         skip_geocode=getattr(args, "skip_geocode", False),
-        skip_obituary=args.skip_obituary,
-        skip_ancestry=getattr(args, "skip_ancestry", False),
+        skip_obituary=not getattr(args, "enable_obituary", False),
+        skip_ancestry=not getattr(args, "enable_ancestry", False),
         skip_entity_research=not getattr(args, "research_entities", False),
         skip_vacant_filter=not getattr(args, "exclude_vacant", False),
         skip_commercial_filter=not getattr(args, "exclude_commercial", False),
@@ -1457,8 +1457,8 @@ def _run_photo_import(args) -> None:
         skip_zillow=args.skip_zillow,
         skip_tax=args.skip_tax,
         skip_geocode=getattr(args, "skip_geocode", False),
-        skip_obituary=args.skip_obituary,
-        skip_ancestry=getattr(args, "skip_ancestry", False),
+        skip_obituary=not getattr(args, "enable_obituary", False),
+        skip_ancestry=not getattr(args, "enable_ancestry", False),
         skip_entity_research=not getattr(args, "research_entities", False),
         skip_heir_verification=args.skip_heir_verification,
         max_heir_depth=args.max_heir_depth,
@@ -1558,8 +1558,8 @@ def _run_csv_import(args) -> None:
         skip_zillow=args.skip_zillow,
         skip_tax=args.skip_tax,
         skip_geocode=getattr(args, "skip_geocode", False),
-        skip_obituary=args.skip_obituary,
-        skip_ancestry=getattr(args, "skip_ancestry", False),
+        skip_obituary=not getattr(args, "enable_obituary", False),
+        skip_ancestry=not getattr(args, "enable_ancestry", False),
         skip_entity_research=not getattr(args, "research_entities", False),
         skip_heir_verification=args.skip_heir_verification,
         max_heir_depth=args.max_heir_depth,
@@ -1986,22 +1986,24 @@ def cli_main() -> None:
     parser.add_argument(
         "--skip-obituary",
         action="store_true",
-        help="[deprecated no-op — obituary is off by default] Skip obituary search",
+        help="Force obituary search OFF (overrides the input.json cloud-parity default)",
     )
     parser.add_argument(
         "--enable-obituary",
         action="store_true",
-        help="Opt into obituary search + deceased owner detection (off by default)",
+        help="Opt into obituary search + deceased owner detection "
+             "(default follows input.json; off without one)",
     )
     parser.add_argument(
         "--skip-ancestry",
         action="store_true",
-        help="[deprecated no-op — ancestry is off by default] Skip Ancestry.com lookup",
+        help="Force Ancestry.com lookup OFF (overrides the input.json cloud-parity default)",
     )
     parser.add_argument(
         "--enable-ancestry",
         action="store_true",
-        help="Opt into Ancestry.com lookup (off by default; requires --enable-obituary)",
+        help="Opt into Ancestry.com lookup (default follows input.json; off without one; "
+             "requires obituary enrichment)",
     )
     parser.add_argument(
         "--skip-geocode",
@@ -2313,10 +2315,43 @@ def cli_main() -> None:
         args.skip_ancestry = True
         args.skip_tracerfy = True
 
-    # Zillow is now opt-in. DataSift's 'Enrich Property Information' step
-    # fills beds/baths/zestimate/sqft/sale-history during upload — running
-    # Zillow upstream just doubles the cost. Pass --enable-zillow to override.
-    args.skip_zillow = not getattr(args, "enable_zillow", False)
+    # ── Local/cloud parity: input.json mirrors the Apify schedule input ──
+    # input.json is kept in sync with the production schedule's runInput
+    # (non-secret keys), so a bare local run resolves to EXACTLY what the
+    # scheduled cloud run does. Precedence: explicit CLI flag > input.json >
+    # built-in opt-in default (no input.json → old conservative behavior).
+    _inp: dict = {}
+    try:
+        with open(Path(__file__).resolve().parent.parent / "input.json") as _f:
+            _inp = json.load(_f)
+    except Exception:
+        pass
+    if _inp:
+        if _inp.get("enable_obituary") and not getattr(args, "skip_obituary", False):
+            args.enable_obituary = True
+        if _inp.get("enable_ancestry") and not getattr(args, "skip_ancestry", False):
+            args.enable_ancestry = True
+        if _inp.get("enable_tracerfy"):
+            args.enable_tracerfy = True
+        if _inp.get("enable_trestle"):
+            args.enable_trestle = True
+        if _inp.get("research_entities"):
+            args.research_entities = True
+        if _inp.get("notify_slack") is False:
+            args.no_slack = True
+        if "datasift_split_by_county" in _inp and "DATASIFT_SPLIT_BY_COUNTY" not in os.environ:
+            config.DATASIFT_SPLIT_BY_COUNTY = bool(_inp["datasift_split_by_county"])
+
+    # Zillow: without input.json it stays opt-in (DataSift's 'Enrich Property
+    # Information' fills the same fields during upload — running Zillow
+    # upstream doubles the cost). With input.json, mirror the cloud config
+    # (the schedule runs Zillow: skip_zillow=false). Explicit flags win.
+    if getattr(args, "enable_zillow", False):
+        args.skip_zillow = False
+    elif getattr(args, "skip_zillow", False):
+        pass  # --fast or explicit --skip-zillow
+    else:
+        args.skip_zillow = bool(_inp.get("skip_zillow", True)) if _inp else True
 
     # Tracerfy is opt-in — but the obituary enricher's inline tier-3 and
     # Phase C batch DM-address lookups fire on key PRESENCE (a .env key),
