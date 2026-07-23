@@ -391,6 +391,15 @@ async def actor_main() -> None:
         enable_ancestry = bool(actor_input.get("enable_ancestry", False))
         enable_tracerfy = bool(actor_input.get("enable_tracerfy", False))
         enable_trestle = bool(actor_input.get("enable_trestle", False))
+        # enable_tracerfy=false must mean NO Tracerfy calls at all — but the
+        # obituary enricher's inline tier-3 + Phase C batch DM-address lookups
+        # gate on key PRESENCE (cfg.TRACERFY_API_KEY), not this toggle. Any
+        # input that carries the key secret would fire them (seen live
+        # 2026-07-22: Phase C 400s on a run with enable_tracerfy off). Blank
+        # the key so every Tracerfy path is dead when the toggle is off.
+        if not enable_tracerfy:
+            config.TRACERFY_API_KEY = ""
+            os.environ.pop("TRACERFY_API_KEY", None)
         research_entities = bool(actor_input.get("research_entities", False))
         keep_government = bool(actor_input.get("keep_government_records", False))
         keep_listed = bool(actor_input.get("keep_listed", False))
@@ -2308,6 +2317,14 @@ def cli_main() -> None:
     # fills beds/baths/zestimate/sqft/sale-history during upload — running
     # Zillow upstream just doubles the cost. Pass --enable-zillow to override.
     args.skip_zillow = not getattr(args, "enable_zillow", False)
+
+    # Tracerfy is opt-in — but the obituary enricher's inline tier-3 and
+    # Phase C batch DM-address lookups fire on key PRESENCE (a .env key),
+    # not the flag. Blank the key so no Tracerfy path runs without opt-in
+    # (mirrors the Actor-input handling).
+    if not getattr(args, "enable_tracerfy", False):
+        config.TRACERFY_API_KEY = ""
+        os.environ.pop("TRACERFY_API_KEY", None)
 
     # Apply LLM backend override from CLI flag
     if hasattr(args, "llm_backend") and args.llm_backend:
