@@ -44,7 +44,7 @@ _NEGLECT_KEYWORDS = (
 # Clearly administrative / not a neglect signal — auto-drop, no LLM call needed.
 _ADMIN_KEYWORDS = (
     "without permit", "no permit", "permit required", "work without",
-    "sign", "banner", "zoning", "setback", "noise", "parking", "license",
+    "sign", "banner", "zoning", "land use", "land-use", "setback", "noise", "parking", "license",
     "alarm", "right of way", "right-of-way", "sidewalk", "tree", "temporary",
     "solicit", "vendor", "home occupation", "garage sale", "smoking",
 )
@@ -81,6 +81,53 @@ def is_closed(status: str) -> bool:
     """True if a case status reads as resolved/closed."""
     s = (status or "").lower()
     return any(m in s for m in _CLOSED_STATUS_MARKERS)
+
+
+# ── Severity ("vexation") tiering ────────────────────────────────────
+# Ordered worst → mildest. Rank is used to sort/label; the tier key is stamped
+# on NoticeData.severity and surfaced as a `code_severity:<tier>` tag. Grounded
+# in the live Austin dataset (6wtj-zbtb), whose OPEN cases carry only ~7 distinct
+# `description` values — the two that survive the neglect filter are exactly the
+# two worst: failing structures, then city-forced abatement of neglect.
+SEVERITY_TIERS = (
+    # (tier_key, rank, human_label, description-substring matchers)
+    ("structure_condition", 1, "Structure Condition (dangerous/substandard)",
+     ("structure condition", "dilapidat", "substandard", "dangerous", "condemn",
+      "unsafe", "collapse", "fire damage", "derelict", "minimum housing", "boarded")),
+    ("abatement", 2, "Property Abatement (junk/debris/overgrowth)",
+     ("abatement", "accumulation", "debris", "rubbish", "junk", "trash",
+      "refuse", "dumping", "overgrow", "weed", "grass", "vegetation", "nuisance",
+      "unsanitary", "vacant", "abandoned")),
+)
+_SEVERITY_RANK = {k: r for (k, r, _lbl, _m) in SEVERITY_TIERS}
+SEVERITY_LABELS = {k: lbl for (k, _r, lbl, _m) in SEVERITY_TIERS}
+
+
+def severity_tier(description: str) -> str:
+    """Classify a code-enforcement description into a vexation tier key.
+
+    Returns "structure_condition" (worst), "abatement" (high), or "other".
+    Structure-condition matchers win over abatement when both hit.
+    """
+    d = (description or "").lower()
+    if not d:
+        return "other"
+    for tier_key, _rank, _lbl, matchers in SEVERITY_TIERS:
+        if any(m in d for m in matchers):
+            return tier_key
+    return "other"
+
+
+def severity_rank(tier_key: str) -> int:
+    """Numeric rank for sorting (1 = worst); unknown/other sorts last."""
+    return _SEVERITY_RANK.get(tier_key, 99)
+
+
+def stamp_severity(notices: list[NoticeData]) -> None:
+    """Set `.severity` on every code_violation notice in place (idempotent)."""
+    for n in notices:
+        if n.notice_type == "code_violation":
+            n.severity = severity_tier(n.violation_description)
 
 
 def _keyword_verdict(desc: str) -> bool | None:
@@ -177,6 +224,9 @@ def filter_code_violations(
         "Neglect filter: %d/%d code_violation kept (dropped %d closed, %d non-neglect)",
         len(kept_cv), len(cv), dropped_closed, dropped_type,
     )
+
+    # Stamp the vexation tier on every kept case for downstream ranking/tagging.
+    stamp_severity(kept_cv)
 
     # Reassemble preserving the non-code_violation notices.
     kept_ids = {id(n) for n in kept_cv}

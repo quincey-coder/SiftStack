@@ -910,6 +910,7 @@ async def actor_main() -> None:
             # ── DataSift CSVs (DMs + Heirs) → KVS + Drive ──
             datasift_csv_urls: list[dict] = []
             drive_links: list[dict] = []
+            _publish_ok = True  # set by the output-validation gate below
             try:
                 from datasift_formatter import write_datasift_by_notice_type
                 csv_infos = write_datasift_by_notice_type(
@@ -917,8 +918,23 @@ async def actor_main() -> None:
                     split_by_county=config.DATASIFT_SPLIT_BY_COUNTY,
                 )
 
+                # ── Output validation gate (before KVS/Drive/Slack publish) ──
+                from list_validator import gate_outputs
+                _publish_ok, _val_report = gate_outputs(
+                    [info["path"] for info in csv_infos],
+                    slack=do_notify_slack,
+                    webhook_url=config.SLACK_WEBHOOK_URL,
+                    out_dir=config.OUTPUT_DIR,
+                )
+                if not _publish_ok:
+                    Actor.log.error(
+                        "Output validation BLOCKED publishing (%d error(s)) — skipping "
+                        "KVS + Drive push of DataSift CSVs and the Slack summary.",
+                        _val_report.total_errors,
+                    )
+
                 kvs_id = kvs._id if hasattr(kvs, "_id") else ""
-                for info in csv_infos:
+                for info in (csv_infos if _publish_ok else []):
                     key = f"datasift_{info['label'].lower().replace(' ', '_')}.csv"
                     with open(info["path"], "rb") as f:
                         await kvs.set_value(key, f.read(), content_type="text/csv")
@@ -930,8 +946,8 @@ async def actor_main() -> None:
                     })
                     Actor.log.info("DataSift CSV (%s) → KVS: %s", info["label"], key)
 
-                # Google Drive upload (if creds set)
-                if config.GOOGLE_DRIVE_FOLDER_ID and config.GOOGLE_SERVICE_ACCOUNT_KEY:
+                # Google Drive upload (if creds set + validation passed)
+                if _publish_ok and config.GOOGLE_DRIVE_FOLDER_ID and config.GOOGLE_SERVICE_ACCOUNT_KEY:
                     try:
                         from drive_uploader import upload_file
                         from datetime import datetime as _dt
@@ -1173,7 +1189,7 @@ async def actor_main() -> None:
             if zillow_count > 100:
                 cost_breakdown["Zillow"] = round((zillow_count - 100) * 0.01, 2)
 
-            if do_notify_slack and config.SLACK_WEBHOOK_URL:
+            if _publish_ok and do_notify_slack and config.SLACK_WEBHOOK_URL:
                 try:
                     from slack_notifier import (
                         send_slack_notification, _send_webhook,
@@ -2987,10 +3003,29 @@ def _run_scrape_pipeline(args, targets) -> None:
     for info in csv_infos:
         logging.info("DataSift CSV (%s): %s", info["label"], info["path"])
 
+    # ── Output validation gate ──────────────────────────────────────────
+    # Loop over every file created this run and check structure/format/names/
+    # addresses BEFORE anything is published. Hard ERRORs (bad header, empty
+    # file, misaligned columns) block Drive + Slack + CRM upload and fire a
+    # Slack alert instead; data-quality WARNings are reported but don't block.
+    from list_validator import gate_outputs
+    _publish_ok, _val_report = gate_outputs(
+        [info["path"] for info in csv_infos],
+        slack=not getattr(args, "no_slack", False),
+        webhook_url=config.SLACK_WEBHOOK_URL,
+        out_dir=config.OUTPUT_DIR,
+    )
+    if not _publish_ok:
+        logging.error(
+            "Output validation BLOCKED publishing (%d error(s)) — skipping Drive, "
+            "Slack summary and CRM upload. See the Slack alert + validation report.",
+            _val_report.total_errors,
+        )
+
     # Always upload to Google Drive unless suppressed — permanent audit trail
     # + one-click manual upload from Drive UI.
     drive_links: list[dict] = []
-    if not getattr(args, "no_drive", False) and config.GOOGLE_DRIVE_FOLDER_ID and config.GOOGLE_SERVICE_ACCOUNT_KEY:
+    if _publish_ok and not getattr(args, "no_drive", False) and config.GOOGLE_DRIVE_FOLDER_ID and config.GOOGLE_SERVICE_ACCOUNT_KEY:
         from drive_uploader import upload_file
         from datetime import datetime as _dt
         _csv_now = _dt.now()
@@ -3039,10 +3074,12 @@ def _run_scrape_pipeline(args, targets) -> None:
             cleanup_info["count"], cleanup_info["sold"], cleanup_info["resolved"],
             cleanup_info["path"],
         )
-        clink = _upload_cleanup_csv_to_drive(cleanup_info, no_drive=getattr(args, "no_drive", False))
+        clink = _upload_cleanup_csv_to_drive(
+            cleanup_info, no_drive=getattr(args, "no_drive", False) or not _publish_ok)
         if clink:
             logging.info("  Cleanup CSV → Drive (03_Sold-Cleanup): %s", clink)
-    _forensics_n = _upload_forensics_reports_to_drive(no_drive=getattr(args, "no_drive", False))
+    _forensics_n = _upload_forensics_reports_to_drive(
+        no_drive=getattr(args, "no_drive", False) or not _publish_ok)
     if _forensics_n:
         logging.info("  %d diff report(s) → Drive (04_Forensics-&-Audit)", _forensics_n)
 
@@ -3058,7 +3095,7 @@ def _run_scrape_pipeline(args, targets) -> None:
     # RAWPIPE — direct API upload (no browser). Preferred over Playwright when
     # --upload-datasift-api is set. Falls through to the Playwright path on
     # failure so the existing manual-fallback logic still kicks in.
-    if getattr(args, "upload_datasift_api", False):
+    if _publish_ok and getattr(args, "upload_datasift_api", False):
         from datetime import datetime as _dt
         from datasift_api_client import DataSiftAPIClient, DataSiftAPIError
 
@@ -3235,8 +3272,10 @@ def _run_scrape_pipeline(args, targets) -> None:
                     except Exception as e:
                         logging.warning("Failed to open %s: %s", info["path"], e)
 
-    # Slack/Discord notification (default ON; suppress with --no-slack)
-    if not getattr(args, "no_slack", False) and config.SLACK_WEBHOOK_URL:
+    # Slack/Discord notification (default ON; suppress with --no-slack).
+    # Skipped when validation blocked publishing — gate_outputs already fired a
+    # Slack failure alert, so we don't also send a success summary.
+    if _publish_ok and not getattr(args, "no_slack", False) and config.SLACK_WEBHOOK_URL:
         from slack_notifier import (
             send_slack_notification, _send_webhook,
             build_rawpipe_block,

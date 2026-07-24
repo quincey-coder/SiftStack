@@ -69,6 +69,29 @@ def _clean_zip(raw) -> str:
     return s[:5] if s.isdigit() else ""
 
 
+def _addr_key(address: str, zip_code: str) -> str:
+    """Normalized (address, zip) match key for cross-referencing open vs resolved.
+
+    Mirrors how the CRM matches records (by property address). Lower/stripped
+    address + 5-digit zip so a resolved record can be checked against the set of
+    still-open addresses regardless of case.
+    """
+    a = (address or "").strip().lower()
+    z = _clean_zip(zip_code)
+    return f"{a}|{z}" if a else ""
+
+
+def _open_address_key(row: dict) -> str:
+    """Build the same address key from a raw Socrata row as `_row_to_notice`."""
+    house = (row.get("house_number") or "").strip()
+    street = (row.get("street_name") or "").strip()
+    if house or street:
+        address = f"{house} {street}".strip().title()
+    else:
+        address = (row.get("address") or "").split(" Unit ")[0].strip().title()
+    return _addr_key(address, row.get("zip_code"))
+
+
 def _row_to_notice(row: dict) -> NoticeData | None:
     """Map one Socrata row to a NoticeData, or None if it has no usable address."""
     house = (row.get("house_number") or "").strip()
@@ -230,28 +253,45 @@ class TravisCodeEnforcementScraper:
         return kept
 
     # ── Resolution tracking (full open-set diff) ─────────────────────
-    def _fetch_all_open_case_ids(self) -> set[str]:
-        """Full snapshot of every currently-open case_id (no opened_date floor).
+    def _fetch_all_open_cases(self) -> tuple[set[str], set[str]]:
+        """Full snapshot of the currently-open set (no opened_date floor).
 
         The daily scrape query is windowed to recently-opened cases, so it can't
         be diffed for resolution. This pulls the complete Active/Pending set
-        (~3.6K cases, case_id only) to compare run-over-run.
+        (~3.6K cases) and returns BOTH:
+          - every open `case_id` (for the run-over-run resolution diff), and
+          - a set of normalized property-address keys currently open.
+
+        The address set guards the resolved/"Code Violation Resolved" tagging:
+        a property can churn MULTIPLE code cases over time, so an OLD case can
+        close (dropping its case_id) while a DIFFERENT case at the same address
+        is still open. Since the CRM cleanup matches by ADDRESS, tagging that
+        property "Resolved" would wrongly scope an actively-violating property
+        out of marketing — so `_run_resolution_diff` suppresses any resolved
+        record whose address is still in this set.
         """
         where = f"status in({_quote_list(OPEN_STATUSES)})"
         ids: set[str] = set()
+        open_addr_keys: set[str] = set()
         offset = 0
         while True:
-            batch = self._fetch_page(where, offset, select="case_id")
+            batch = self._fetch_page(
+                where, offset,
+                select="case_id,house_number,street_name,address,zip_code",
+            )
             if not batch:
                 break
             for row in batch:
                 cid = (row.get("case_id") or "").strip()
                 if cid:
                     ids.add(cid)
+                key = _open_address_key(row)
+                if key:
+                    open_addr_keys.add(key)
             if len(batch) < PAGE_SIZE:
                 break
             offset += PAGE_SIZE
-        return ids
+        return ids, open_addr_keys
 
     def _confirm_resolutions(self, case_ids: list[str]) -> dict[str, str]:
         """Re-query dropped case_ids to confirm status + capture a resolution note.
@@ -293,8 +333,25 @@ class TravisCodeEnforcementScraper:
         prev_ids = set(state.get("last_run_case_ids") or [])
         prev_records = state.get("last_run_records") or {}
 
-        current_ids = self._fetch_all_open_case_ids()
+        current_ids, open_addr_keys = self._fetch_all_open_cases()
         diff = ce_state.compute_diff(current_ids, prev_ids, prev_records)
+
+        # Guard: a property can carry several code cases over time. Drop any
+        # resolved record whose address STILL has an open case — tagging it
+        # "Resolved" would wrongly scope an actively-violating property out of
+        # CRM marketing (the cleanup matches by address, not case_id).
+        if diff.dropped_records and open_addr_keys:
+            before = len(diff.dropped_records)
+            diff.dropped_records = [
+                r for r in diff.dropped_records
+                if _addr_key(r.get("address", ""), r.get("zip", "")) not in open_addr_keys
+            ]
+            suppressed = before - len(diff.dropped_records)
+            if suppressed:
+                logger.info(
+                    "Code-enforcement resolution: suppressed %d resolved record(s) whose "
+                    "address still has an open case", suppressed,
+                )
 
         # Status-confirm the subset we'll actually emit, and attach the note.
         if diff.dropped_records:

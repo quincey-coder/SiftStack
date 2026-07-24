@@ -7,11 +7,14 @@ Archived CSVs written before that carry the old 74-col headers — run them
 through this before uploading or merging into a master.
 
 Changes applied:
-  renames   Decision Maker → Decision Maker (Name), DM Confidence →
-            Decision-Maker Confidence, DM 1 Status → Decision-Maker Status,
-            DM 1 Source → DM Source, Signing Chain Count → Signatures to Close
+  renames   Business Name → FULL NAME/COMPANY/TRUST, Decision Maker →
+            Decision Maker (Name), DM 1 Source → DM Source, Signing Chain Count
+            → Signatures to Close
+  normalize DM Confidence → Decision-Maker Confidence, DM 1 Status →
+            Decision-Maker Status (values → exact option labels)
   merges    DM 2/3 Name + Relationship → "DM 2/3 Name / Relationship"
-            ("Name (relationship)"), Entity Contact + Role → "Entity Contact + Role"
+            ("Name (relationship)"), Entity Contact + Entity Contact Role
+            → "Entity Contact + Role"
   derived   Title Flag (from Data Flags: cad_life_estate/cad_et_al)
   values    select columns normalized to option labels (yes→Yes,
             verified_living→Verified Living, code_violation→Code Violation, …)
@@ -36,7 +39,11 @@ from datasift_formatter import (
 
 logger = logging.getLogger(__name__)
 
+# Converts old DataSift-export names → our formatter's column names. The only
+# entity/owner change is Business Name → FULL NAME/COMPANY/TRUST; the DM /
+# deep-prospecting columns keep their DataSift custom-field labels.
 _RENAMES = {
+    "Business Name": "FULL NAME/COMPANY/TRUST",
     "Decision Maker": "Decision Maker (Name)",
     "DM 1 Source": "DM Source",
     "Signing Chain Count": "Signatures to Close",

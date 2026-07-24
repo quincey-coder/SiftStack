@@ -30,7 +30,7 @@ DATASIFT_COLUMNS = [
     "Property City",
     "Property State",
     "Property ZIP Code",
-    "Business Name",
+    "FULL NAME/COMPANY/TRUST",
     "Owner First Name",
     "Owner Last Name",
     "Mailing Street Address",
@@ -508,6 +508,10 @@ def _build_tags(notice: NoticeData) -> str:
     # Specific lien type (e.g. "abstract_of_judgment") for finer filter presets
     if notice.lien_type:
         tags.append(notice.lien_type.lower().replace("'", "").replace(" ", "_"))
+
+    # Code-enforcement vexation tier (worst = structure_condition) for targeting
+    if notice.notice_type == "code_violation" and getattr(notice, "severity", ""):
+        tags.append(f"code_severity_{notice.severity}")
 
     # County
     if notice.county:
@@ -1114,7 +1118,7 @@ def _validate_row(row: dict) -> tuple[bool, list[str]]:
     issues = []
     # A Business Name satisfies the owner-identity requirement (entity-owned
     # property mailed to the company); otherwise we need a person first+last.
-    if not row.get("Business Name"):
+    if not row.get("FULL NAME/COMPANY/TRUST"):
         if not row.get("Owner First Name"):
             issues.append("no_first_name")
         if not row.get("Owner Last Name"):
@@ -1239,7 +1243,7 @@ def _build_row(notice: NoticeData, notes_override: str | None = None) -> dict:
         "Property City": notice.city,
         "Property State": notice.state or "TX",
         "Property ZIP Code": _zip5(notice.zip),
-        "Business Name": contact.get("business", ""),
+        "FULL NAME/COMPANY/TRUST": contact.get("business", ""),
         "Owner First Name": contact["first"],
         "Owner Last Name": contact["last"],
         "Mailing Street Address": contact["street"],

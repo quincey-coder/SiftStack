@@ -214,6 +214,7 @@ class NoticeData:
     tax_delinquent_years: str = ""     # Number of years delinquent
     # Code enforcement / violation fields (Austin Code dataset + photo LLM parse)
     violation_description: str = ""    # e.g. "Structure Condition Violation(s)"
+    severity: str = ""                 # code_violation vexation tier: "structure_condition"/"abatement"/"other" (violation_filter.severity_tier)
     compliance_deadline: str = ""      # Date owner must comply by (YYYY-MM-DD), if stated
     case_status: str = ""              # e.g. "Active"/"Open"/"Closed"/"In Compliance" — drives closed-case filter
     case_id: str = ""                  # Source case number (Austin Code case_id) — cross-run key for resolution tracking

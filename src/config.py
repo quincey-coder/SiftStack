@@ -70,6 +70,15 @@ OPEN_RECORDS_FEE_CAP = os.getenv("OPEN_RECORDS_FEE_CAP", "25")  # $ threshold to
 CODE_VIOLATION_NEGLECT_FILTER = os.getenv(
     "CODE_VIOLATION_NEGLECT_FILTER", "true").lower() in ("1", "true", "yes")
 
+# Post-generation output validator (list_validator.py) — the gate that runs over
+# every CSV created this run BEFORE Drive upload / Slack / CRM upload. ENABLED
+# master switch; STRICT makes data-quality WARNings blocking too (default: only
+# hard structural/format ERRORs block).
+LIST_VALIDATOR_ENABLED = os.getenv(
+    "LIST_VALIDATOR_ENABLED", "true").lower() in ("1", "true", "yes")
+LIST_VALIDATOR_STRICT = os.getenv(
+    "LIST_VALIDATOR_STRICT", "false").lower() in ("1", "true", "yes")
+
 # ── LLM Backend ──────────────────────────────────────────────────────
 LLM_BACKEND = os.getenv("LLM_BACKEND", "anthropic")           # "anthropic", "ollama", or "openrouter"
 LLM_MODEL = os.getenv("LLM_MODEL", "claude-haiku-4-5-20251001")  # Anthropic model name (default for all LLM calls)
