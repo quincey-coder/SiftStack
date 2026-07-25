@@ -27,6 +27,8 @@ TARGET_ZIPS: set[str] = {
     "78749", "78727", "78748", "78738", "78753", "78702", "78664", "78739",
     "78758", "78728", "78641", "78733", "78732", "78645", "78705", "78747",
     "78754", "78734", "78724", "78751",
+    # added 2026-07-24 — active Travis gaps vs the DataSift filter
+    "78744", "78653", "78725", "78701",
 }
 
 # Condo property-type code filtered out per skill spec
