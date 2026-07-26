@@ -72,6 +72,13 @@ autoresearch/
 # Local scratch / backups (do not commit or deploy)
 state_backups/
 probe_datasift_routes.py
+
+# Local transcript/playbook working folders (large, never deployed/committed)
+*Transcripts/
+*Transcripts.log
+*Playbook/
+Curative Title Playbook/
+youtube_transcripts.py
 # Timestamped lead-data backups (PII) + purge/poll logs — never commit
 *_backup_*.csv
 owner_purge_poll.log
