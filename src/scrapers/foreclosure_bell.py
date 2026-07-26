@@ -64,6 +64,48 @@ _SALE_DATE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Month token (full or 3-letter abbreviation) for deriving the sale month from a
+# PDF filename/label — the Bell PDFs are named for the sale month ("Aug 5.pdf",
+# link text "August ... Foreclosure").
+_MONTH_TOKEN_RE = re.compile(
+    r"\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|"
+    r"aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b",
+    re.IGNORECASE,
+)
+_MON3_TO_NUM = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+
+def _first_tuesday(year: int, month: int) -> datetime:
+    """First Tuesday of the month — the statutory TX foreclosure sale day."""
+    d = datetime(year, month, 1)
+    # weekday(): Monday=0 ... Tuesday=1 — advance to the first Tuesday.
+    return d + timedelta(days=(1 - d.weekday()) % 7)
+
+
+def _sale_date_from_pdf_month(label: str, href: str, now: datetime) -> str | None:
+    """Derive the sale date from the PDF's month name (filename or link text).
+
+    TX foreclosure sales are always the first Tuesday of the month, and Bell's
+    PDFs are named for the sale month. Scanned notices often can't yield a clean
+    date via OCR, so this is the reliable fallback. Prefers the href (the
+    filename month is deterministic) over the link label. Returns YYYY-MM-DD, or
+    None if no month token is found.
+    """
+    for source in (href, label):
+        m = _MONTH_TOKEN_RE.search(source or "")
+        if not m:
+            continue
+        num = _MON3_TO_NUM[m.group(1)[:3].lower()]
+        # A month earlier than the current one means next year's sale; the
+        # current month itself may already have passed its first Tuesday (that
+        # sale is over) but the date is still the correct one to record.
+        year = now.year + (1 if num < now.month else 0)
+        return _first_tuesday(year, num).strftime("%Y-%m-%d")
+    return None
+
 
 def _ocr_pdf_bytes(pdf_bytes: bytes) -> str:
     """Render PDF pages to images and OCR them.
@@ -283,15 +325,28 @@ class BellForeclosureScraper:
                             flags=re.IGNORECASE,
                         )
 
+                        # Sale date derived from the PDF's month (first Tuesday)
+                        # — used whenever the notice text didn't yield a date.
+                        month_sale_date = _sale_date_from_pdf_month(label, href, now)
+
+                        filled_from_month = 0
                         for nt in notice_texts:
                             if len(nt) < 100:
                                 continue
                             notice = _parse_notice_text(nt)
                             if notice:
                                 notice.source_url = href
+                                if not notice.auction_date and month_sale_date:
+                                    notice.auction_date = month_sale_date
+                                    filled_from_month += 1
                                 all_notices.append(notice)
 
-                        logger.info("  Extracted %d notices from %s", len(notice_texts) - 1, label)
+                        logger.info(
+                            "  Extracted %d notices from %s (sale date %s; "
+                            "%d dated from PDF month)",
+                            len(notice_texts) - 1, label,
+                            month_sale_date or "unknown", filled_from_month,
+                        )
 
                     except Exception as e:
                         logger.warning("  Error processing %s: %s", label, e)
