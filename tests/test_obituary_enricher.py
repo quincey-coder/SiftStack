@@ -10,7 +10,7 @@ from obituary_enricher import (
     rank_decision_makers, _extract_structured_text, _is_listing_url,
     _extract_personal_from_trust_estate, _get_name_variants,
     _parse_notice_owner_name, _middle_name_conflict, _validate_obituary_match,
-    _norm_state, _dod_sanity_check,
+    _norm_state, _dod_sanity_check, _estate_display_name,
 )
 from notice_parser import NoticeData
 
@@ -674,6 +674,44 @@ def test_dod_recent_past_allowed():
 def test_dod_too_old_rejected():
     n = NoticeData(owner_name="X", date_added="2025-06-01")
     assert _dod_sanity_check("2018-01-01", n) is False
+
+
+# ── _estate_display_name tests (Estate-of fallback name resolution) ──
+
+
+def test_estate_name_from_tax_owner_when_owner_blank():
+    """code_violation regression: owner_name blank, name lives in tax_owner_name
+    (NAMELF). Must resolve to First-Last, not leave 'Estate of ' nameless.
+    Repro of 912 Romeria Dr (parcel 0229071232)."""
+    n = NoticeData(notice_type="code_violation", county="Travis",
+                   address="912 Romeria Dr", owner_name="",
+                   tax_owner_name="ROSE TABITHA JILL BLEVINS")
+    assert _estate_display_name(n) == "Tabitha Rose"
+
+
+def test_estate_name_prefers_owner_name():
+    """owner_name (already First-Last) wins — no regression for probate/foreclosure."""
+    n = NoticeData(owner_name="Jane Doe", tax_owner_name="SMITH JOHN")
+    assert _estate_display_name(n) == "Jane Doe"
+
+
+def test_estate_name_decedent_before_tax_owner():
+    """decedent_name used when owner_name blank, before tax_owner_name."""
+    n = NoticeData(owner_name="", decedent_name="Mary Alice Rowe",
+                   tax_owner_name="SMITH JOHN")
+    assert _estate_display_name(n) == "Mary Alice Rowe"
+
+
+def test_estate_name_empty_when_nothing_usable():
+    """No usable name anywhere → '' so caller keeps prior 'Estate of ' (no fabrication)."""
+    n = NoticeData(owner_name="", decedent_name="", tax_owner_name="")
+    assert _estate_display_name(n) == ""
+
+
+def test_estate_name_business_tax_owner_returns_empty():
+    """Unparseable/business NAMELF must NOT be routed in as a person name."""
+    n = NoticeData(owner_name="", tax_owner_name="EASTSIDE REAL ESTATE LLC")
+    assert _estate_display_name(n) == ""
 
 
 if __name__ == "__main__":

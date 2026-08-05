@@ -737,6 +737,31 @@ def parse_tax_owner_name(raw: str) -> list[str]:
     return results
 
 
+def _estate_display_name(notice) -> str:
+    """Best available FIRST-LAST person name for an 'Estate of …' fallback.
+
+    code_violation (and other CAD-sourced-owner) records leave ``owner_name``
+    blank by design — the deceased's real name lives in ``tax_owner_name``
+    (raw LAST FIRST MIDDLE / NAMELF). Resolving only from ``owner_name`` there
+    yields a nameless "Estate of ". Order: owner_name (already FIRST LAST) →
+    decedent_name → tax_owner_name converted via ``parse_tax_owner_name``.
+
+    Returns "" when no usable person name exists (business/unparseable). The
+    caller keeps prior behavior in that case rather than fabricating a name —
+    per NAMELF rules we never route an unparseable NAMELF string in as a person.
+    """
+    person = (getattr(notice, "owner_name", "") or "").strip()
+    if not person:
+        person = (getattr(notice, "decedent_name", "") or "").strip()
+    if not person:
+        raw = (getattr(notice, "tax_owner_name", "") or "").strip()
+        if raw:
+            parsed = parse_tax_owner_name(raw)
+            if parsed:
+                person = parsed[0]
+    return person
+
+
 def _parse_notice_owner_name(raw: str) -> list[str]:
     """Parse owner_name from notice text (already in FIRST [MIDDLE] LAST order).
 
@@ -3567,7 +3592,11 @@ def enrich_obituary_data(
 
         # Path 5: Estate-of fallback — no survivors, mail to property address
         if not has_survivors and not ranked_dms:
-            estate_name = f"Estate of {notice.owner_name}"
+            # Resolve the decedent's name from the best source. code_violation
+            # records leave owner_name blank (the real name is in tax_owner_name,
+            # NAMELF) — without this the estate comes out nameless "Estate of ".
+            _estate_person = _estate_display_name(notice)
+            estate_name = f"Estate of {_estate_person}" if _estate_person else "Estate of "
             ranked_dms = [{
                 "name": estate_name,
                 "relationship": "estate",
