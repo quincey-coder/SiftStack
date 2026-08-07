@@ -1,13 +1,14 @@
 {
   "description": "Investor-active zip codes (10+ transactions/month). Edit to add/remove zips.",
-  "generated_from": "Travis + Bell + Williamson: manual override 2026-06-29; added Travis 78744/78653/78725/78701 (active gaps vs DataSift filter) 2026-07-24",
+  "generated_from": "Travis + Bell + Williamson: manual override 2026-06-29; added Travis 78744/78653/78725/78701 (active gaps vs DataSift filter) 2026-07-24; restored Travis 78703/78721/78735/78741/78752 (dropped by the 06-29 refresh, still on the county-data target list and carrying real delinquent volume) 2026-08-06",
   "threshold": "10+ investor transactions per month",
   "Travis": [
     "78745", "78660", "78723", "78746", "78704", "78757", "78759", "78731",
     "78749", "78727", "78748", "78738", "78753", "78702", "78664", "78739",
     "78758", "78728", "78641", "78733", "78732", "78645", "78705", "78747",
     "78754", "78734", "78724", "78751",
-    "78744", "78653", "78725", "78701"
+    "78744", "78653", "78725", "78701",
+    "78703", "78721", "78735", "78741", "78752"
   ],
   "Bell": [
     "76543", "76548", "76549", "76504", "76513",

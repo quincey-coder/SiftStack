@@ -199,6 +199,28 @@ broke Travis tax-delinquent AND the whole Travis CAD cache for two days
   keys** with it. `sanitize_csv_lines()` strips quotes from just the physical
   lines whose quote count is odd (1 line in 492,803; the 9 legitimately-quoted
   rows like `"DEDEDO, GUAM 96929"` are untouched). Applied to both files.
+- **The same export also stopped QUOTING fields that contain a comma** (fixed
+  2026-08-06). Such a row splits into >31 fields and everything after the
+  offending column slides right; 167 of 8,986 rows on the 2026-08-06 roll, and
+  **zero** in any archived pre-flip file. 130 are harmless (comma inside the
+  trailing `LEGAL`, which `_repair_shifted_row` rejoins); 15 slid far enough to
+  scramble the situs block, leaving `PROPZIP` holding a street name and `LEGAL`
+  holding the ZIP (`PROPZIP='SPRINGDALE RD', LEGAL='78721'`). Those are
+  re-anchored on the first **bare 5-digit** 786xx/787xx value at or after the
+  `STR#` slot — bare because `Property Zip` is 5-digit while the mailing
+  `Zip Code` is 9, and on a shifted row that 9-digit value can land in the situs
+  block and yield `('AUSTIN','TX')` as the address. 22 rows carry no ZIP at all
+  and are left alone. Counts are logged by `log_row_repair_stats()`.
+- **`1st Year Delinquent = 0000` is NOT missing data** — it pairs perfectly with
+  `Sequence # = 0` (all 5,221 such rows) and means *delinquent on the current
+  roll only*; those rows owe ~half a year of tax by `DELQTOT/APPVAL` vs ~4 years
+  for the 7+ year bucket. Excluding them under the 2+ year rule is correct, so
+  they get their own `removed["current_roll_only"]` bucket. `no_year` now means
+  "has a delinquent sequence but no parseable year" — **0 in normal operation**,
+  and `NO_YEAR_ALARM_SHARE` (2%) raises an ERROR above that. Before the split,
+  this bucket was ~58% of the file in *healthy* runs, so a genuine SINCE parse
+  break would have looked exactly like a normal day — the same silent-failure
+  shape as the Aug-5 incident.
 - **Blast radius when this cache dies is everything Travis, not just tax-del** —
   fire-damage parcel→owner, lien address backfill, code-violation owners,
   probate property lookup. The symptom in the log is
@@ -371,7 +393,14 @@ All three tax-delinquent scrapers (Travis CSV, Bell/Williamson XLSX) diff each p
   straight through. Use `travis_texdel_cleaner.city_for_zip()` (58 ZIPs, derived
   from the roll's own owner-occupant rows); `travis_tax_cache._load_delq` uses it
   too, instead of the blanket `"AUSTIN"` that mislabelled every Del Valle /
-  Pflugerville / Manor / Leander situs.
+  Pflugerville / Manor / Leander situs. The derivation itself now lives in
+  `build_zip_city_lookup()` and runs on every scrape (`learn_zip_cities()`), so
+  a ZIP absent from the static table resolves from the current roll instead of
+  silently defaulting to Austin — and any true fallback is logged once per ZIP.
+  It reproduces all 58 static entries **exactly** from both a post-flip and a
+  pre-flip roll, which is the table's regression test. Boundary ZIPs seen only
+  once or twice (78619/78626/78628/78633/78642/78665/78681/78712/78717) can
+  never reach the 3-vote floor, so they are pinned to their USPS city by hand.
 - **DataSift normalises addresses on ingest** — it stored `Austin / 78723-4705`
   for the row we uploaded as `Wilmington`, and reorders directionals
   (`303 Pheasant Dr E` → `303 E Pheasant Dr`). So the CRM's copy can differ from

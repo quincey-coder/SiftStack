@@ -19,6 +19,9 @@ the run still exited 0. A hard failure is the point.
 `sanitize_csv_lines()` guards the other half of the same incident: the Tax
 Office also began emitting rows with an unbalanced quote, which makes the csv
 module swallow the rest of the file into one field.
+
+`normalize_delq_row()` additionally repairs rows the same export broke by no
+longer **quoting** fields that contain a comma — see `_repair_shifted_row`.
 """
 
 import logging
@@ -83,6 +86,19 @@ _WS_RE = re.compile(r"\s+")
 # Cap the per-file log spam from sanitize_csv_lines; a summary line follows.
 _MAX_LOGGED_BAD_LINES = 5
 
+# ── Situs (property-address) block ───────────────────────────────────
+# These four sit at the tail of the export, in this order. A row whose
+# unquoted comma pushed values rightward is re-anchored on the ZIP.
+_SITUS_NUM = "Street Number"
+_SITUS_STREET = "Street Name"
+_SITUS_ZIP = "Property Zip"
+_SITUS_LEGAL = "Legal Description"
+
+# Every Travis situs ZIP is 786xx/787xx. Used to find the true PROPZIP inside
+# a row whose columns drifted.
+_TRAVIS_ZIP5_RE = re.compile(r"78[67]\d{2}")
+_VALID_ZIP_RE = re.compile(r"\d{5}(\d{4})?")
+
 
 class TravisSchemaError(ValueError):
     """A Travis Tax Office CSV header matched no layout we know about."""
@@ -118,22 +134,115 @@ def assert_delq_schema(fieldnames, source: str = "TaxDelqOpenData.csv") -> None:
         )
 
 
-def normalize_delq_row(row: dict) -> dict:
+def _looks_like_situs_zip(value) -> bool:
+    """True for a value that could be a Travis property ZIP (5- or 9-digit)."""
+    s = str(value or "").strip()
+    return bool(_VALID_ZIP_RE.fullmatch(s)) and bool(_TRAVIS_ZIP5_RE.fullmatch(s[:5]))
+
+
+def _bump(stats: dict | None, key: str) -> None:
+    if stats is not None:
+        stats[key] = stats.get(key, 0) + 1
+
+
+def _repair_shifted_row(out: dict, extras: list, stats: dict | None) -> None:
+    """Re-anchor a row the county emitted with an unquoted comma.
+
+    The post-2026-08-05 export stopped **quoting** fields containing a comma,
+    so such a row splits into more than 31 fields and every column after the
+    offending one slides right. Pre-flip exports quoted correctly — all three
+    archived pre-flip files contain zero of these.
+
+    Most overflows are harmless: the comma sits in the trailing
+    `Legal Description`, so only that field splits. Those are rejoined.
+
+    When the slide starts earlier, it reaches the situs block and
+    `Property Zip` ends up holding a street name while `Legal Description`
+    holds the ZIP (`PROPZIP='SPRINGDALE RD', LEGAL='78721'`). The address is
+    then unusable and the record drops out silently at the target-ZIP filter —
+    we lose the record rather than ship a wrong address. Re-anchoring on the
+    first Travis-plausible ZIP at or after the `Street Number` slot recovers
+    the situs block; rows with no ZIP anywhere are left alone and counted.
+    """
+    _bump(stats, "overflow_rows")
+    tail = [str(e).strip() for e in extras if str(e).strip()]
+
+    if _looks_like_situs_zip(out.get(_SITUS_ZIP)):
+        # Situs intact — the comma was inside the trailing legal description.
+        out[_SITUS_LEGAL] = ", ".join(
+            p for p in [str(out.get(_SITUS_LEGAL) or "").strip(), *tail] if p
+        )
+        _bump(stats, "overflow_legal_only")
+        return
+
+    keys = list(out.keys())
+    if _SITUS_NUM not in keys:
+        _bump(stats, "shift_unrecoverable")
+        return
+
+    flat = [str(out[k] or "").strip() for k in keys] + tail
+    for j in range(max(keys.index(_SITUS_NUM), 2), len(flat)):
+        # Anchor on a BARE 5-digit Travis ZIP. `Property Zip` is always 5-digit
+        # in this export while the mailing `Zip Code` is 9 — and on a shifted
+        # row that 9-digit mailing ZIP can land in the situs block, where a
+        # laxer test latches onto it and yields ('AUSTIN', 'TX') as the address.
+        if not _TRAVIS_ZIP5_RE.fullmatch(flat[j]):
+            continue
+        out[_SITUS_NUM] = flat[j - 2]
+        out[_SITUS_STREET] = flat[j - 1]
+        out[_SITUS_ZIP] = flat[j]
+        out[_SITUS_LEGAL] = ", ".join(p for p in flat[j + 1:] if p)
+        _bump(stats, "shift_repaired")
+        return
+
+    _bump(stats, "shift_unrecoverable")
+
+
+def normalize_delq_row(row: dict, stats: dict | None = None) -> dict:
     """Rename a raw CSV row's keys to canonical labels and clean its values.
 
     Values get interior whitespace collapsed as well as trimmed — the post-
     2026-08-05 export pads `Street Name` to fixed width, so an uncollapsed
     value ships as `'1012 MILTON<29 spaces>ST   W'` in the property address.
+
+    Rows carrying more fields than the header are repaired in place by
+    `_repair_shifted_row`. Pass `stats` (a plain dict) to collect per-file
+    counts of what was found and fixed.
     """
     out: dict = {}
+    extras: list = []
     for key, value in row.items():
         canon = canonical_delq_key(key)
         if canon is None:
-            continue  # csv.DictReader restkey — surplus columns, not ours
+            # csv.DictReader restkey — this row had MORE fields than the
+            # header, i.e. an unquoted comma split one of them.
+            if isinstance(value, list):
+                extras = value
+            continue
         if isinstance(value, str):
             value = _WS_RE.sub(" ", value).strip()
         out[canon] = value
+    if extras:
+        _repair_shifted_row(out, extras, stats)
     return out
+
+
+def log_row_repair_stats(
+    stats: dict, total_rows: int, source: str = "TaxDelqOpenData.csv"
+) -> None:
+    """Summarize what `normalize_delq_row` had to repair in one file."""
+    if not stats.get("overflow_rows"):
+        return
+    logger.warning(
+        "%s: %d/%d rows had more fields than the header (county stopped "
+        "quoting commas) — %d were legal-description-only and were rejoined, "
+        "%d had a shifted situs block and were re-anchored, %d could not be "
+        "recovered (no ZIP in the row)",
+        source, stats.get("overflow_rows", 0), total_rows,
+        stats.get("overflow_legal_only", 0),
+        stats.get("shift_repaired", 0),
+        stats.get("shift_unrecoverable", 0),
+    )
 
 
 def sanitize_csv_lines(lines, source: str = "CSV"):

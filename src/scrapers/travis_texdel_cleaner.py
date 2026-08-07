@@ -13,8 +13,11 @@ Public surface used by `tax_delinquent_travis.py`:
 
 from __future__ import annotations
 
+import logging
 import re
 from collections import Counter
+
+logger = logging.getLogger(__name__)
 
 
 # ── Configuration ─────────────────────────────────────────────────────
@@ -29,6 +32,11 @@ TARGET_ZIPS: set[str] = {
     "78754", "78734", "78724", "78751",
     # added 2026-07-24 — active Travis gaps vs the DataSift filter
     "78744", "78653", "78725", "78701",
+    # restored 2026-08-06 — core east/central Austin ZIPs that the 2026-06-29
+    # market refresh dropped. They are on the original county-data target list
+    # and still carry real delinquent volume (78721 n=224, 78741 n=214,
+    # 78752 n=90, 78703 n=57, 78735 n=54 on the 2026-08-06 roll).
+    "78703", "78721", "78735", "78741", "78752",
 }
 
 # Condo property-type code filtered out per skill spec
@@ -46,9 +54,11 @@ EXCLUDED_PROP_TYPES: set[str] = {"A4"}
 #
 # Derived from the roll itself: for each PROPZIP, the modal mailing city among
 # OWNER-OCCUPANT rows (mailing street contains the property street), where the
-# mailing city *is* the property city by definition. 58 ZIPs, min n=3 and >=50%
-# purity; most are 95-100%. Regenerate with
-# scratchpad/derive_all_zips.py if the roll's geography shifts.
+# mailing city *is* the property city by definition. min n=3 and >=50% purity;
+# most are 95-100%. That derivation now lives in build_zip_city_lookup() below
+# and runs on every scrape, so the table can be re-verified (and unknown ZIPs
+# resolved) without a separate script — it reproduces these 58 entries exactly
+# from both a post-flip and a pre-flip roll, verified 2026-08-06.
 #
 # Multi-city ZIPs (78734 Lakeway, 78738 Bee Cave, 78746 West Lake Hills) map to
 # the USPS default city name, which is the deliverable one for direct mail.
@@ -75,12 +85,115 @@ ZIP_CITY: dict[str, str] = {
     "78750": "Austin", "78751": "Austin", "78752": "Austin",
     "78753": "Austin", "78754": "Austin", "78756": "Austin",
     "78757": "Austin", "78758": "Austin", "78759": "Austin",
+    # Boundary ZIPs (Williamson/Hays edge parcels + the UT campus ZIP). These
+    # appear only once or twice per roll, so they can never reach
+    # MIN_ZIP_CITY_VOTES and are not derivable — without them 78681/78628/
+    # 78642/78619 would each fall back to "Austin", which is simply wrong.
+    # Values are the USPS default city, added 2026-08-06.
+    "78619": "Driftwood",       "78626": "Georgetown",
+    "78628": "Georgetown",      "78633": "Georgetown",
+    "78642": "Liberty Hill",    "78665": "Round Rock",
+    "78681": "Round Rock",      "78712": "Austin",
+    "78717": "Austin",
 }
 
 
+# Thresholds for accepting a ZIP→city pair derived from a roll at runtime.
+# Same bar the static table above was built to: at least 3 owner-occupant
+# votes and a simple majority for the winning city.
+MIN_ZIP_CITY_VOTES = 3
+MIN_ZIP_CITY_PURITY = 0.5
+
+# Populated per run by learn_zip_cities(); consulted only for ZIPs the static
+# table has never seen. Cleared and rebuilt on every call.
+_LEARNED_ZIP_CITY: dict[str, str] = {}
+# ZIPs already logged this run, so an unknown ZIP warns once, not 400 times.
+_ZIP_CITY_LOGGED: set[str] = set()
+
+
+def build_zip_city_lookup(rows) -> dict[str, str]:
+    """Derive property-ZIP → property-city from the roll's own owner-occupant rows.
+
+    The roll has no property-city column at all — only `Property Zip`. Its
+    `City` column is the OWNER'S MAILING city, which equals the property city
+    for an owner-occupant and is wrong for every absentee (Houston, Dallas,
+    Miami Beach … on a Travis-only list).
+
+    So: keep only rows whose mailing address contains the situs street name —
+    those are owner-occupied, and their mailing city IS the property city —
+    then take the modal city per ZIP. This is exactly how the static ZIP_CITY
+    table was derived; running it per roll lets a ZIP the table has never seen
+    resolve to a real city instead of silently defaulting to Austin.
+    """
+    votes: dict[str, Counter] = {}
+    for row in rows:
+        zip5 = (row.get("Property Zip") or "").strip()[:5]
+        if len(zip5) != 5 or not zip5.isdigit():
+            continue
+        state = (row.get("State") or "").strip().upper()
+        if state not in ("", "TX"):
+            continue  # out-of-state mailing address is never the property city
+        city = (row.get("City") or "").strip().upper()
+        street = (row.get("Street Name") or "").strip().upper()
+        if not city or len(street) < 4:
+            continue
+        mailing = " ".join(
+            (row.get(k) or "").strip().upper()
+            for k in ("Address 1", "Address 2", "Address 3")
+        )
+        if street not in mailing:
+            continue  # absentee — mailing city is NOT the property city
+        votes.setdefault(zip5, Counter())[city] += 1
+
+    derived: dict[str, str] = {}
+    for zip5, counter in votes.items():
+        city, n = counter.most_common(1)[0]
+        if n >= MIN_ZIP_CITY_VOTES and n / sum(counter.values()) >= MIN_ZIP_CITY_PURITY:
+            derived[zip5] = title_case(city)
+    return derived
+
+
+def learn_zip_cities(rows) -> dict[str, str]:
+    """Rebuild the per-run ZIP→city fallback from `rows`. Returns what it learned."""
+    _LEARNED_ZIP_CITY.clear()
+    _LEARNED_ZIP_CITY.update(build_zip_city_lookup(rows))
+    _ZIP_CITY_LOGGED.clear()
+    return dict(_LEARNED_ZIP_CITY)
+
+
 def city_for_zip(zip5: str, default: str = "Austin") -> str:
-    """Property city for a Travis property ZIP. NEVER use the mailing city."""
-    return ZIP_CITY.get((zip5 or "").strip()[:5], default)
+    """Property city for a Travis property ZIP. NEVER use the mailing city.
+
+    Static table first, then anything `learn_zip_cities()` derived from the
+    current roll, then `default`. Falling through to `default` is logged once
+    per ZIP: a silent "Austin" on a Del Valle or Pflugerville property is the
+    exact failure this lookup exists to prevent.
+    """
+    key = (zip5 or "").strip()[:5]
+    city = ZIP_CITY.get(key)
+    if city:
+        return city
+
+    city = _LEARNED_ZIP_CITY.get(key)
+    if city:
+        if key not in _ZIP_CITY_LOGGED:
+            _ZIP_CITY_LOGGED.add(key)
+            logger.info(
+                "ZIP %s is not in ZIP_CITY; derived %r from this roll's "
+                "owner-occupant rows. Add it to travis_texdel_cleaner.ZIP_CITY.",
+                key, city,
+            )
+        return city
+
+    # "00000" is the roll's sentinel for "no property ZIP", not an unknown one —
+    # resolve_blank_zip already handles those, so don't warn about them.
+    if key and key != "00000" and key not in _ZIP_CITY_LOGGED:
+        _ZIP_CITY_LOGGED.add(key)
+        logger.warning(
+            "ZIP %r has no property-city mapping and could not be derived from "
+            "the roll — falling back to %r, which may be wrong.", key, default,
+        )
+    return default
 
 
 # ── Street suffix dictionary ──────────────────────────────────────────

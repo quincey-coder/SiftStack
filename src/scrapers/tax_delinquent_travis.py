@@ -115,6 +115,12 @@ def _build_tax_raw_meta(row: dict) -> str:
 DEFAULT_MIN_DELINQUENT_YEARS = 2
 DEFAULT_MIN_DELINQUENT_AMOUNT = 3000.0
 
+# Share of rows in the `no_year` bucket above which we treat the "1st Year
+# Delinquent" column as broken rather than merely sparse. That bucket now
+# holds only rows with a delinquent sequence but no parseable year, which is
+# empty in normal operation — see the Step 3 comment.
+NO_YEAR_ALARM_SHARE = 0.02
+
 
 @register("Travis", "tax_delinquent")
 class TravisTaxDelinquentScraper:
@@ -206,11 +212,28 @@ class TravisTaxDelinquentScraper:
             )
         )
         schema.assert_delq_schema(reader.fieldnames)
-        rows = [schema.normalize_delq_row(r) for r in reader]
+        # repair_stats collects the county's unquoted-comma damage (rows split
+        # into >31 fields). normalize_delq_row re-anchors the situs block where
+        # it can; the summary below says how much needed fixing.
+        repair_stats: dict = {}
+        rows = [schema.normalize_delq_row(r, repair_stats) for r in reader]
+        schema.log_row_repair_stats(repair_stats, len(rows))
 
         subdiv_zips, street_zips = (
             cleaner.build_zip_lookup(rows) if not self.skip_cleaner else ({}, {})
         )
+        # Property city is derived from the property ZIP (the roll has no
+        # property-city column). Prime the runtime fallback from this roll so a
+        # ZIP missing from the static table resolves to a real city instead of
+        # silently defaulting to Austin.
+        learned = cleaner.learn_zip_cities(rows)
+        new_zips = sorted(set(learned) - set(cleaner.ZIP_CITY))
+        if new_zips:
+            logger.info(
+                "Derived property-city mappings for %d ZIP(s) absent from "
+                "ZIP_CITY: %s", len(new_zips),
+                ", ".join(f"{z}={learned[z]}" for z in new_zips[:10]),
+            )
 
         notices: list[NoticeData] = []
         today = datetime.now().strftime("%Y-%m-%d")
@@ -221,9 +244,9 @@ class TravisTaxDelinquentScraper:
         # just below threshold now. Use the full source set for diffing.
         source_apns: set[str] = set()
         removed = {
-            "no_year": 0, "under_years": 0, "muni": 0, "hoa": 0,
-            "prop_type": 0, "under_amt": 0, "zip": 0, "zero_delq": 0,
-            "no_owner": 0, "no_apn": 0, "validation_blank": 0,
+            "current_roll_only": 0, "no_year": 0, "under_years": 0,
+            "muni": 0, "hoa": 0, "prop_type": 0, "under_amt": 0, "zip": 0,
+            "zero_delq": 0, "no_owner": 0, "no_apn": 0, "validation_blank": 0,
         }
 
         for row in rows:
@@ -284,6 +307,7 @@ class TravisTaxDelinquentScraper:
 
             # ── Step 3 — Filter: years delinquent ────────────────
             first_year_raw = (row.get("1st Year Delinquent") or "").strip()
+            sequence_raw = (row.get("Sequence #") or "").strip().lstrip("0")
             if first_year_raw in ("0", "00", "000", "0000"):
                 first_year_raw = ""
             years_delinquent: int | None = None
@@ -296,7 +320,21 @@ class TravisTaxDelinquentScraper:
                     years_delinquent = None
 
             if years_delinquent is None:
-                removed["no_year"] += 1
+                # `1st Year Delinquent = 0000` paired with `Sequence # = 0` is
+                # the county's encoding for "delinquent on the CURRENT roll
+                # only" — not missing data. It correlates perfectly (all 5,221
+                # such rows on the 2026-08-06 roll) and those rows owe about
+                # half a year of tax by DELQTOT/APPVAL, versus ~4 years for the
+                # 7+ year bucket. They are correctly excluded by a 2+ year rule.
+                #
+                # They get their own bucket so a genuine SINCE parse break
+                # stands out instead of hiding inside a number that is ~58% of
+                # the file in normal operation — the same silent-failure shape
+                # that cost two days on 2026-08-05.
+                if not first_year_raw and not sequence_raw:
+                    removed["current_roll_only"] += 1
+                else:
+                    removed["no_year"] += 1
                 continue
             if self.min_years > 0 and years_delinquent < self.min_years:
                 removed["under_years"] += 1
@@ -445,6 +483,20 @@ class TravisTaxDelinquentScraper:
             )
 
             notices.append(notice)
+
+        # ── Year-parse health check ───────────────────────────────
+        # `no_year` now means "carries a delinquent sequence but has no
+        # parseable 1st Year Delinquent" — schema drift, not ordinary data.
+        # It is 0 in normal operation, so any real volume here is a signal.
+        if rows and removed["no_year"] / len(rows) > NO_YEAR_ALARM_SHARE:
+            logger.error(
+                "Travis tax delinquent: %d/%d rows (%.1f%%) carry a delinquent "
+                "sequence but no parseable '1st Year Delinquent' — expected ~0%%. "
+                "The SINCE column may have changed format; check "
+                "travis_tax_schema.DELQ_ALIASES and the raw archive.",
+                removed["no_year"], len(rows),
+                100 * removed["no_year"] / len(rows),
+            )
 
         # ── Cross-run diff + state commit ─────────────────────────
         try:
