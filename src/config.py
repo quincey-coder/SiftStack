@@ -42,6 +42,13 @@ SERPER_API_KEY = os.getenv("SERPER_API_KEY", "")              # Serper.dev Googl
 FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY", "")        # Firecrawl JS-rendered scraping
 TRACERFY_API_KEY = os.getenv("TRACERFY_API_KEY", "")          # Tracerfy skip tracing
 TRESTLE_API_KEY = os.getenv("TRESTLE_API_KEY", "")            # Trestle phone validation
+# Litigator risk check runs on EVERY Trestle query by default (operator preference).
+# Set TRESTLE_ADD_LITIGATOR=0 to disable globally; --no-litigator disables per-run.
+TRESTLE_ADD_LITIGATOR = os.getenv("TRESTLE_ADD_LITIGATOR", "1").strip().lower() not in ("0", "false", "no", "")
+# Trestle bills add-ons on top of the base query but does not publish the rate in
+# the API docs. Set TRESTLE_LITIGATOR_COST to your contracted per-add-on price so
+# cost estimates stay honest; left unset, estimates flag it as unpriced.
+TRESTLE_LITIGATOR_COST = float(os.getenv("TRESTLE_LITIGATOR_COST", "0") or 0) or None
 DATASIFT_EMAIL = os.getenv("DATASIFT_EMAIL", "")              # DataSift.ai login
 DATASIFT_PASSWORD = os.getenv("DATASIFT_PASSWORD", "")
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")        # Slack/Discord webhook

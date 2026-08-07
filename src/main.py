@@ -1662,12 +1662,18 @@ def _run_phone_validate(args) -> None:
             logging.error("Invalid --custom-tiers JSON: %s", e)
             sys.exit(1)
 
+    # Litigator risk check is on by default; --no-litigator (or
+    # TRESTLE_ADD_LITIGATOR=0) is the only way to turn it off.
+    from phone_validator import DEFAULT_ADD_LITIGATOR
+
+    add_litigator = DEFAULT_ADD_LITIGATOR and not getattr(args, "no_litigator", False)
+
     # Estimate-only mode
     if getattr(args, "estimate", False):
         from phone_validator import estimate_cost, print_estimate
 
         if csv_path:
-            est = estimate_cost(csv_path)
+            est = estimate_cost(csv_path, add_litigator=add_litigator)
             print_estimate(est)
         else:
             logging.error("--estimate requires --csv-path (export from DataSift first, then estimate)")
@@ -1685,7 +1691,7 @@ def _run_phone_validate(args) -> None:
         upload_tags=not getattr(args, "no_upload", False),
         api_key=config.TRESTLE_API_KEY or None,
         tiers=tiers,
-        add_litigator=getattr(args, "add_litigator", False),
+        add_litigator=add_litigator,
         batch_size=getattr(args, "batch_size", 10),
     ))
 
@@ -2194,7 +2200,13 @@ def cli_main() -> None:
     parser.add_argument(
         "--add-litigator",
         action="store_true",
-        help="Include litigator risk check in phone validation (phone-validate mode)",
+        help="(Deprecated — now the default) Include litigator risk check in phone validation",
+    )
+    parser.add_argument(
+        "--no-litigator",
+        action="store_true",
+        help="Skip the litigator risk check, which is ON by default (phone-validate mode). "
+             "Also settable globally with TRESTLE_ADD_LITIGATOR=0",
     )
 
     # Manage sold arguments

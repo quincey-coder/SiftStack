@@ -1874,7 +1874,7 @@ async def run_phone_validation_workflow(
     headless: bool = False,
     api_key: str | None = None,
     tiers: dict | None = None,
-    add_litigator: bool = False,
+    add_litigator: bool | None = None,
     batch_size: int = 10,
 ) -> dict:
     """Full phone validation workflow: export → validate → upload tags.
@@ -1958,13 +1958,18 @@ async def run_phone_validation_workflow(
         logger.error(result["message"])
         return result
 
-    validation_result = run_phone_validation(
-        csv_path=phone_csv_path,
-        api_key=api_key,
-        tiers=tiers,
-        add_litigator=add_litigator,
-        batch_size=batch_size,
-    )
+    # add_litigator=None means "caller expressed no preference" — let
+    # phone_validator apply DEFAULT_ADD_LITIGATOR (on unless opted out).
+    validation_kwargs = {
+        "csv_path": phone_csv_path,
+        "api_key": api_key,
+        "tiers": tiers,
+        "batch_size": batch_size,
+    }
+    if add_litigator is not None:
+        validation_kwargs["add_litigator"] = add_litigator
+
+    validation_result = run_phone_validation(**validation_kwargs)
     result["validation_result"] = validation_result
 
     if not validation_result.get("success"):

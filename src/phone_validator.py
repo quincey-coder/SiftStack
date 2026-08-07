@@ -47,6 +47,16 @@ DEFAULT_TIERS = {
 
 COST_PER_PHONE = 0.015  # Trestle phone_intel pricing
 
+# Litigator risk check is ON by default — every Trestle query carries the
+# `litigator_checks` add-on unless a caller passes add_litigator=False (CLI:
+# --no-litigator) or TRESTLE_ADD_LITIGATOR=0 is set in the environment.
+DEFAULT_ADD_LITIGATOR = getattr(config, "TRESTLE_ADD_LITIGATOR", True)
+
+# Trestle bills add-ons separately from the base query and does not publish the
+# rate. None = unpriced: estimates show the base cost and flag the add-on as an
+# unknown extra rather than silently under-reporting the bill.
+LITIGATOR_ADDON_COST = getattr(config, "TRESTLE_LITIGATOR_COST", None)
+
 # ── Trestle API Config ────────────────────────────────────────────────────
 
 TRESTLE_ENDPOINT = "https://api.trestleiq.com/3.0/phone_intel"
@@ -74,7 +84,7 @@ def clean_phone(raw: str) -> str:
 # ── Trestle API Caller ────────────────────────────────────────────────────
 
 
-def call_trestle(phone: str, api_key: str, add_litigator: bool = False) -> dict:
+def call_trestle(phone: str, api_key: str, add_litigator: bool = DEFAULT_ADD_LITIGATOR) -> dict:
     """Call Trestle phone_intel API for a single phone number.
 
     Returns the parsed JSON response or an error dict.
@@ -215,14 +225,26 @@ def read_phones_from_csv(filepath: str | Path) -> tuple[list[tuple[str, str]], i
 # ── Cost Estimation ──────────────────────────────────────────────────────
 
 
-def estimate_cost(filepath: str | Path) -> dict:
+def estimate_cost(
+    filepath: str | Path,
+    add_litigator: bool = DEFAULT_ADD_LITIGATOR,
+) -> dict:
     """Parse CSV to count unique phones and estimate Trestle API cost.
+
+    The litigator_checks add-on is billed on top of the base query, so an
+    estimate that ignores it under-reports the bill the operator is approving.
+    When the add-on is on but its rate is unpriced (LITIGATOR_ADDON_COST is
+    None), the estimate reports the base cost and flags the add-on rather than
+    guessing a number.
 
     Returns dict with stats for display or JSON output.
     """
     phones, unique_count, total_entries = read_phones_from_csv(filepath)
 
-    cost = unique_count * COST_PER_PHONE
+    base_cost = unique_count * COST_PER_PHONE
+    addon_cost = 0.0
+    if add_litigator and LITIGATOR_ADDON_COST:
+        addon_cost = unique_count * LITIGATOR_ADDON_COST
 
     return {
         "input_file": Path(filepath).name,
@@ -230,7 +252,12 @@ def estimate_cost(filepath: str | Path) -> dict:
         "unique_phones": unique_count,
         "duplicates_saved": total_entries - unique_count,
         "cost_per_phone": COST_PER_PHONE,
-        "estimated_cost": round(cost, 2),
+        "litigator_enabled": bool(add_litigator),
+        "litigator_cost_per_phone": LITIGATOR_ADDON_COST if add_litigator else None,
+        "litigator_cost": round(addon_cost, 2),
+        "litigator_unpriced": bool(add_litigator and not LITIGATOR_ADDON_COST),
+        "base_cost": round(base_cost, 2),
+        "estimated_cost": round(base_cost + addon_cost, 2),
     }
 
 
@@ -245,8 +272,19 @@ def print_estimate(est: dict) -> None:
     print(f"  Unique phones:       {est['unique_phones']:,}")
     print(f"  Duplicates saved:    {est['duplicates_saved']:,}")
     print(f"  Cost per phone:      ${est['cost_per_phone']:.3f}")
+    if est.get("litigator_enabled"):
+        if est.get("litigator_unpriced"):
+            print(f"  Litigator add-on:    ON (rate unknown — billed on top)")
+        else:
+            print(f"  Litigator add-on:    ON  ${est['litigator_cost_per_phone']:.3f}/phone"
+                  f"  = ${est['litigator_cost']:.2f}")
+    else:
+        print(f"  Litigator add-on:    off")
     print(f"  -----------------------------------------")
     print(f"  ESTIMATED COST:      ${est['estimated_cost']:.2f}")
+    if est.get("litigator_unpriced"):
+        print(f"  NOTE: excludes litigator add-on charges. Set")
+        print(f"        TRESTLE_LITIGATOR_COST=<rate> to include them.")
     print("=" * 50)
     print()
 
@@ -258,7 +296,7 @@ def process_phones(
     phones: list[tuple[str, str]],
     api_key: str,
     tiers: dict | None = None,
-    add_litigator: bool = False,
+    add_litigator: bool = DEFAULT_ADD_LITIGATOR,
     batch_size: int = 10,
     delay: float = 0.1,
 ) -> tuple[list[dict], list[dict]]:
@@ -385,7 +423,7 @@ def score_record_phones(
     notices: list,
     api_key: str | None = None,
     tiers: dict | None = None,
-    add_litigator: bool = False,
+    add_litigator: bool = DEFAULT_ADD_LITIGATOR,
     batch_size: int = 10,
     delay: float = 0.1,
 ) -> dict[str, dict]:
@@ -621,7 +659,7 @@ def run_phone_validation(
     api_key: str | None = None,
     output_dir: str | Path | None = None,
     tiers: dict | None = None,
-    add_litigator: bool = False,
+    add_litigator: bool = DEFAULT_ADD_LITIGATOR,
     batch_size: int = 10,
 ) -> dict:
     """Run full phone validation pipeline on a CSV file.
