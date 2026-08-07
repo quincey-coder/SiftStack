@@ -32,6 +32,7 @@ from pathlib import Path
 import requests
 
 import config
+import travis_tax_schema as schema
 
 logger = logging.getLogger(__name__)
 
@@ -201,11 +202,26 @@ def _load_delq(
     """Parse TaxDelqOpenData.csv — has true situs address columns and the
     Delinquent Total + 1st Year Delinquent fields used by CAD-LIFT."""
     from datetime import datetime as _dt
+
+    from scrapers.travis_texdel_cleaner import city_for_zip as _city_for_zip
+
     count = 0
     this_year = _dt.now().year
     with open(path, encoding="utf-8-sig", errors="replace", newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
+        reader = csv.DictReader(
+            schema.sanitize_csv_lines(f, source="TaxDelqOpenData.csv")
+        )
+        # Header changed to raw mainframe codes on 2026-08-05; rows are renamed
+        # back to canonical labels. Unlike the scraper we log-and-continue —
+        # the Cur file below still carries ~98% of the index, and losing the
+        # situs overlay beats losing all 471K records.
+        try:
+            schema.assert_delq_schema(reader.fieldnames)
+        except schema.TravisSchemaError as e:
+            logger.error("%s — skipping delinquent-situs overlay", e)
+            return 0
+        for raw_row in reader:
+            row = schema.normalize_delq_row(raw_row)
             owner = (row.get("Owner Name") or "").strip()
             if not owner:
                 continue
@@ -231,9 +247,10 @@ def _load_delq(
             record = {
                 "fullname": owner,
                 "situsaddress": situs,
-                # Property city is not in the delinquent CSV; Travis Tax Office
-                # situs defaults to Austin for the overwhelming majority.
-                "scity": "AUSTIN",
+                # Property city is not in the delinquent CSV — resolve it from
+                # the property ZIP. Blanket "AUSTIN" mislabelled every Del
+                # Valle / Pflugerville / Manor / Leander situs in the index.
+                "scity": _city_for_zip(zip5).upper(),
                 "sstate": "TX",
                 "szip": zip5,
                 "quickrefid": (row.get("Account #") or "").strip(),
@@ -276,7 +293,12 @@ def _load_cur(
     # The Cur file has very long legal descriptions; bump csv field size limit.
     csv.field_size_limit(_FIELD_LIMIT)
     with open(path, encoding="utf-8-sig", errors="replace", newline="") as f:
-        reader = csv.DictReader(f)
+        # sanitize_csv_lines is what keeps a single malformed county row from
+        # zeroing the whole index — an unbalanced quote here makes csv swallow
+        # the rest of a 200 MB file into one field and blow _FIELD_LIMIT.
+        reader = csv.DictReader(
+            schema.sanitize_csv_lines(f, source="TaxCurOpenData.csv")
+        )
         for row in reader:
             owner = (row.get("NAMELF") or "").strip()
             if not owner:
