@@ -166,6 +166,46 @@ learned running it down on Apify (the block had killed every Travis pull since
   escalated to an embedded Turnstile widget needing a solved cf-clearance token
   (2captcha, already a dependency), `False` means it's still the IP/pool.
 
+### Travis Tax Office CSVs — schema flip + corrupt rows — hard-won 2026-08-06
+
+Both Tax Office bulk CSVs (`TaxDelqOpenData.csv`, `TaxCurOpenData.csv`) are
+mainframe exports, and on **2026-08-05** the export changed underneath us. It
+broke Travis tax-delinquent AND the whole Travis CAD cache for two days
+*while the Actor kept exiting 0*. All shims live in **`src/travis_tax_schema.py`**.
+
+- **`TaxDelqOpenData.csv` headers became raw field codes.** Same 31 columns,
+  same order, new names: `Account #`→`ACCOUNT#`, `Owner Name`→`OWNERSNAME`,
+  `1st Year Delinquent`→`SINCE`, `Property Zip`→`PROPZIP`, `Cause #`→`"00016"`,
+  … Full table in `DELQ_ALIASES`. Rows are renamed back to the **friendly
+  labels**, which stay the canonical vocabulary everywhere else
+  (`tax_delinquent_travis`, `travis_texdel_cleaner`, `travis_tax_cache._load_delq`).
+  Both layouts parse. **If the county renames again, extend `DELQ_ALIASES` —
+  do not rewrite consumers.**
+- **The failure was silent, which is the real lesson.** Every row fell through
+  the scraper's `no_apn` guard, so the run logged `0 records kept
+  (filtered: no_apn=9009)` and succeeded. `assert_delq_schema()` now **raises**
+  when a header resolves none of `DELQ_REQUIRED`; the per-target handler in
+  `scrapers/__init__.py` turns that into a loud `scraper failed` ERROR. Prefer a
+  raised exception to a zero-record return for any schema drift.
+- **The same export pads values to fixed width** — `STREETNAME` arrives as
+  `'MILTON<29 spaces>ST   W'` (96% of surviving rows), and money gained decimals
+  with a bare leading dot (`.00`). `normalize_delq_row()` collapses interior
+  whitespace on every value; `_parse_address` collapses again for direct callers.
+- **`TaxCurOpenData.csv` headers did NOT change** (`PARCEL`, `NAMELF`,
+  `MAILINGADDRESS`, …) — but the county began emitting rows with an
+  **unbalanced quote** (a `ZIPCODE` of literal `"""78`). That opens a quoted
+  field that never closes, so `csv` swallows the remaining ~170 MB into one
+  field and dies on `_FIELD_LIMIT`, taking all **471K records / 427K parcel
+  keys** with it. `sanitize_csv_lines()` strips quotes from just the physical
+  lines whose quote count is odd (1 line in 492,803; the 9 legitimately-quoted
+  rows like `"DEDEDO, GUAM 96929"` are untouched). Applied to both files.
+- **Blast radius when this cache dies is everything Travis, not just tax-del** —
+  fire-damage parcel→owner, lien address backfill, code-violation owners,
+  probate property lookup. The symptom in the log is
+  `cad_lookup: ... lookup failed: field larger than field limit` plus
+  `0 delinquent-situs records indexed`, and the build is retried (and re-fails)
+  on *every* lookup, so runtime inflates too.
+
 ## Data Sources
 
 Configured in `config.py`:
@@ -296,6 +336,23 @@ wrong ships reversed contacts to marketing. Rules, learned the hard way (2026-07
   scrapers set `owner_name=""` by design. **Probate** owner must stay the PR/executor
   and **lien** owner must stay the grantee/debtor — overwriting those from CAD violates
   the domain rules above.
+- **Classify business-vs-person on the PRISTINE name, never on the stripped one**
+  (fixed 2026-08-06 in all three tax-delinquent scrapers). `strip_etux_etal()`
+  cuts at the first ` & `, so classifying afterwards decapitated every entity
+  whose own name contains one: `"S & B UNLIMITED LLC"` → `"S"`, `"M & JAD LP"` →
+  `"M"`, `"BECHTOL ROY & LYNN FAMILY TRUST"` → `"Bechtol Roy"`. The `LLC`/`TRUST`
+  went with the tail, so `is_business()` then read the remainder as a person —
+  **59 Travis records** shipped fabricated owners like "Lamb", "Gold", "Rosa".
+  Callers now pass `strip_spousal_tail=False` once a name is known to be an
+  entity (entities have no spouse). Note the ALL-CAPS audit signal does NOT
+  catch this — `title_case()` makes the stub look like a plausible person.
+- **Bare `HOA` is not an HOA marker mid-name.** It's the Vietnamese given name
+  Hoa, and `\bHOA\b` was silently dropping real leads as homeowners
+  associations (`"HUYNH ANH HOA THI"`, `"NGUYEN HOA V & OANH K"`,
+  `"ESTATE OF CHANG HENRY HOA"` — an estate, i.e. a probate lead). `HOA` now
+  counts only as the first/last token or before a corporate suffix
+  (`_HOA_ABBREV`, mirrored in all three scrapers); `ESTATE_PAT` outranks it.
+  Real HOAs in the roll are uniformly `"<PLACE> HOA [INC]"`.
 - Audit with a name oracle (`pip install names-dataset`), scoring current vs flipped
   orientation — but treat it as a *hint only*: ambiguous names (`Shay Dori`,
   `Marshall Hussain`) score "backwards" while being correct. CAD is the only truth.
@@ -304,6 +361,30 @@ wrong ships reversed contacts to marketing. Rules, learned the hard way (2026-07
 
 All three tax-delinquent scrapers (Travis CSV, Bell/Williamson XLSX) diff each pull against the prior run's parcel-ID set and persist state across runs (`data/{county}_tax_state/` locally; Apify KVS keys `travis_texdel_state` / `bell_texdel_state` / `williamson_texdel_state`). State modules: `travis_texdel_state.py` (Travis) and the county-parameterized `tax_delinquent_state.py` (Bell + Williamson). Per-run diff JSON + raw-file archive are written for forensics; the diff is surfaced to Slack via `--notify-slack`.
 
+- **Property city comes from the property ZIP, never the roll's `City` column.**
+  The Travis delinquent roll has no property-city field — `City` is the OWNER'S
+  MAILING city. Seeding Property City from it was right for owner-occupants and
+  wrong for every absentee: `"5505 Manor Rd / Wilmington / TX 78723"`, plus
+  Houston/San Angelo/Dallas scattered through a Travis-only list (~10% of rows).
+  Smarty does NOT repair it downstream — it runs `MatchType.STRICT` and returns
+  no candidate at all when city and ZIP disagree, so the bad value passes
+  straight through. Use `travis_texdel_cleaner.city_for_zip()` (58 ZIPs, derived
+  from the roll's own owner-occupant rows); `travis_tax_cache._load_delq` uses it
+  too, instead of the blanket `"AUSTIN"` that mislabelled every Del Valle /
+  Pflugerville / Manor / Leander situs.
+- **DataSift normalises addresses on ingest** — it stored `Austin / 78723-4705`
+  for the row we uploaded as `Wilmington`, and reorders directionals
+  (`303 Pheasant Dr E` → `303 E Pheasant Dr`). So the CRM's copy can differ from
+  both our CSV and the state snapshot. When re-uploading to match an existing
+  record (Sold tagging), verify against the live record via
+  `DataSiftAPIClient.search_records` rather than trusting the snapshot. Records
+  with no house number (`Summer Lake Dr`) fail DataSift's validator and keep
+  whatever we sent — those keep the old city.
+- **The `last_run_records` snapshot is captured PRE-enrichment** —
+  `snapshot_records()` runs inside `scrape()`, before Smarty/obituary/DM steps.
+  Anything rehydrated from it (Sold rows) therefore carries raw scrape values,
+  not what was uploaded. Fixing the city at scrape time (above) keeps the
+  snapshot honest; don't assume snapshot == CRM.
 - **Diff terms:** `NEW` = current − previous, `REPEAT` = current ∩ previous, `DROPPED` = previous − current (off the roll = paid off / sold).
 - **Guardrails** (`check_guardrails`) suppress false "sold" claims: empty file, APN-format drift (<85–90% match), or >50% volume shrinkage trips the guardrail — the prior baseline + snapshot are preserved and no drop/sold claims are reported.
 - **`last_run_records` snapshot:** each successful run stores `parcel_id → {address, city, state, zip, owner_name}` for the records it actually **uploaded** (post-filter). This lets the next run rehydrate any dropped parcel into a full record (not just an APN).

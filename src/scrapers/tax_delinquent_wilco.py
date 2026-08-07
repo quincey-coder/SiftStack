@@ -54,9 +54,15 @@ DEFAULT_MIN_DELINQUENT_YEARS = 2
 DEFAULT_MIN_DELINQUENT_AMOUNT = 3000.0
 
 
+# Bare `HOA` only counts as an association marker where an entity name puts it
+# (first/last token, or before a corporate suffix). Mid-name it is usually the
+# Vietnamese given name Hoa, and matching it drops real leads. Mirrors
+# travis_texdel_cleaner._HOA_ABBREV.
+_HOA_ABBREV = r"(?:^\s*HOA\b|\bHOA\s*$|\bHOA\s+(?:INC|LLC|LTD|CORP|ASSOC\w*|ASSN)\b)"
 _HOA_PAT = re.compile(
-    r"\b(HOA|HOMEOWNERS|HOMEOWNER'S|OWNERS ASSOC|ASSOCIATION|CONDO ASSN?|"
-    r"MANAGEMENT|PROPERTY OWNERS|PROP OWNERS)\b",
+    r"\b(HOMEOWNERS|HOMEOWNER'S|OWNERS ASSOC|ASSOCIATION|CONDO ASSN?|"
+    r"MANAGEMENT|PROPERTY OWNERS|PROP OWNERS)\b"
+    rf"|{_HOA_ABBREV}",
     re.IGNORECASE,
 )
 _BUSINESS_PAT = re.compile(
@@ -92,16 +98,21 @@ def _title_case(name: str) -> str:
     return _UPPERCASE_SUFFIX_PAT.sub(lambda m: m.group(0).upper(), out)
 
 
-def _strip_etux_etal(name: str) -> str:
+def _strip_etux_etal(name: str, *, strip_spousal_tail: bool = True) -> str:
     """Strip trailing ETUX/ETVIR/ETAL clauses + spousal `& <name>` tails.
 
     Applied to BOTH the individual-name path AND the business-name path —
     Wilco mirrors Bell where the source appends ETAL to either kind of name.
+
+    Callers must pass `strip_spousal_tail=False` for names already classified
+    as entities: the `&` branch cuts at the first ` & ` and drops the rest, so
+    "Smith & Jones LLC" → "Smith", which then reads as a person.
     """
     if not name:
         return ""
+    tail = r"(?:(?:ETUX|ETVIR|ETAL)\b|&\s)" if strip_spousal_tail else r"(?:ETUX|ETVIR|ETAL)\b"
     return re.sub(
-        r"\s+(?:(?:ETUX|ETVIR|ETAL)\b|&\s).*$",
+        rf"\s+{tail}.*$",
         "",
         name,
         flags=re.IGNORECASE,
@@ -158,8 +169,11 @@ def _wilco_normalize_name(raw: str) -> tuple[str, str]:
         return "", ""
     cleaned = re.sub(r"\s*\([^)]*\)\s*", " ", raw).strip()
     cleaned = re.sub(r"\s+", " ", cleaned)
-    cleaned = _strip_etux_etal(cleaned)
-    if _is_business(cleaned):
+    # Classify on the pristine name — the spousal-tail strip would otherwise
+    # decapitate an entity whose own name contains an `&` (see _strip_etux_etal).
+    is_biz = _is_business(cleaned)
+    cleaned = _strip_etux_etal(cleaned, strip_spousal_tail=not is_biz)
+    if is_biz:
         out = _title_case(cleaned)
         return out, out
     flipped = normalize_court_name(cleaned)

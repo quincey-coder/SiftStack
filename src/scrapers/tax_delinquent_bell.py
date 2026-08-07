@@ -75,9 +75,15 @@ _STATE_CD_LABELS = {
 EXCLUDED_STATE_CD = {"A4", "C1", "D1", "E1", "L1", "M1"}
 
 # HOA / management entity owners — same regex spirit as travis_texdel_cleaner.
+# Bare `HOA` only counts as an association marker where an entity name puts it
+# (first/last token, or before a corporate suffix). Mid-name it is usually the
+# Vietnamese given name Hoa, and matching it drops real leads. Mirrors
+# travis_texdel_cleaner._HOA_ABBREV.
+_HOA_ABBREV = r"(?:^\s*HOA\b|\bHOA\s*$|\bHOA\s+(?:INC|LLC|LTD|CORP|ASSOC\w*|ASSN)\b)"
 _HOA_PAT = re.compile(
-    r"\b(HOA|HOMEOWNERS|HOMEOWNER'S|OWNERS ASSOC|ASSOCIATION|CONDO ASSN?|"
-    r"MANAGEMENT|PROPERTY OWNERS|PROP OWNERS)\b",
+    r"\b(HOMEOWNERS|HOMEOWNER'S|OWNERS ASSOC|ASSOCIATION|CONDO ASSN?|"
+    r"MANAGEMENT|PROPERTY OWNERS|PROP OWNERS)\b"
+    rf"|{_HOA_ABBREV}",
     re.IGNORECASE,
 )
 # Business entity heuristic — surfaces LLC/INC/CORP/TRUST names so we
@@ -121,21 +127,27 @@ def _title_case(name: str) -> str:
     return _UPPERCASE_SUFFIX_PAT.sub(lambda m: m.group(0).upper(), out)
 
 
-def _strip_etux_etal(name: str) -> str:
+def _strip_etux_etal(name: str, *, strip_spousal_tail: bool = True) -> str:
     """Strip trailing ETUX/ETVIR/ETAL clauses + spousal `& <name>` tails.
 
     Applied to both the individual-name path AND the business-name path
-    (e.g., "Lopez Estate Etal" → "Lopez Estate"). The `&` branch is kept
-    only for natural names — businesses with `&` in the entity name
-    (e.g., "Smith & Jones LLC") preserve the `&` because the regex anchors
-    to a tail clause, not a mid-name `&`.
+    (e.g., "Lopez Estate Etal" → "Lopez Estate").
+
+    The `&` branch is for natural names ONLY, and callers must disable it via
+    `strip_spousal_tail=False` once they've classified the name as an entity.
+    It anchors to the first ` & ` and drops the rest, so "Smith & Jones LLC"
+    becomes "Smith" — losing the `LLC` that made it a business, after which
+    `_is_business()` reads the remainder as a person and ships a fabricated
+    one-word owner. (This docstring previously claimed the opposite; the
+    regex never behaved that way.)
     """
     if not name:
         return ""
     # Drop trailing "<space>(ETUX|ETVIR|ETAL)<word-boundary><anything>"
     # `&` is non-word so handle it as a separate alternation branch.
+    tail = r"(?:(?:ETUX|ETVIR|ETAL)\b|&\s)" if strip_spousal_tail else r"(?:ETUX|ETVIR|ETAL)\b"
     return re.sub(
-        r"\s+(?:(?:ETUX|ETVIR|ETAL)\b|&\s).*$",
+        rf"\s+{tail}.*$",
         "",
         name,
         flags=re.IGNORECASE,
@@ -403,13 +415,16 @@ class BellTaxDelinquentScraper:
                 continue
 
             # Owner classification — business vs person.
-            # Both paths get ETUX/ETAL/ETVIR stripped first because the source
-            # appends the marker to the END of either kind of name (e.g.
-            # "Lopez, Antonio O Estate Etal" or "My Simple Land Llc Etal").
-            owner_clean = _strip_etux_etal(owner_raw)
+            # Both paths get ETUX/ETAL/ETVIR stripped because the source appends
+            # the marker to the END of either kind of name (e.g. "Lopez,
+            # Antonio O Estate Etal" or "My Simple Land Llc Etal"). Classify on
+            # the PRISTINE name though — the spousal-tail strip would cut an
+            # entity like "Smith & Jones LLC" down to "Smith" first.
+            is_biz = _is_business(owner_raw)
+            owner_clean = _strip_etux_etal(owner_raw, strip_spousal_tail=not is_biz)
             business_name = ""
             person_name = ""
-            if _is_business(owner_clean):
+            if is_biz:
                 if _HOA_PAT.search(owner_clean):
                     removed["hoa"] += 1
                     continue

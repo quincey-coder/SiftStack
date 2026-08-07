@@ -35,6 +35,54 @@ TARGET_ZIPS: set[str] = {
 EXCLUDED_PROP_TYPES: set[str] = {"A4"}
 
 
+# ── Property ZIP → city ───────────────────────────────────────────────
+# The delinquent roll has NO property-city column — only PROPZIP. The scraper
+# used to seed Property City from the owner's MAILING city, which is right for
+# owner-occupants and badly wrong for absentees: "5505 Manor Rd / Wilmington /
+# TX 78723" for an Austin property, plus Houston/San Angelo/Dallas scattered
+# through a Travis-only list. Smarty can't rescue it either — it runs
+# MatchType.STRICT and simply returns no candidate when the city contradicts
+# the ZIP, so the bad value passes straight through to DataSift.
+#
+# Derived from the roll itself: for each PROPZIP, the modal mailing city among
+# OWNER-OCCUPANT rows (mailing street contains the property street), where the
+# mailing city *is* the property city by definition. 58 ZIPs, min n=3 and >=50%
+# purity; most are 95-100%. Regenerate with
+# scratchpad/derive_all_zips.py if the roll's geography shifts.
+#
+# Multi-city ZIPs (78734 Lakeway, 78738 Bee Cave, 78746 West Lake Hills) map to
+# the USPS default city name, which is the deliverable one for direct mail.
+ZIP_CITY: dict[str, str] = {
+    "78610": "Buda",            "78612": "Cedar Creek",
+    "78613": "Cedar Park",      "78615": "Coupland",
+    "78617": "Del Valle",       "78620": "Dripping Springs",
+    "78621": "Elgin",           "78634": "Hutto",
+    "78641": "Leander",         "78645": "Lago Vista",
+    "78652": "Manchaca",        "78653": "Manor",
+    "78654": "Marble Falls",    "78660": "Pflugerville",
+    "78664": "Round Rock",      "78669": "Spicewood",
+    "78701": "Austin", "78702": "Austin", "78703": "Austin",
+    "78704": "Austin", "78705": "Austin", "78719": "Austin",
+    "78721": "Austin", "78722": "Austin", "78723": "Austin",
+    "78724": "Austin", "78725": "Austin", "78726": "Austin",
+    "78727": "Austin", "78728": "Austin", "78729": "Austin",
+    "78730": "Austin", "78731": "Austin", "78732": "Austin",
+    "78733": "Austin", "78734": "Austin", "78735": "Austin",
+    "78736": "Austin", "78737": "Austin", "78738": "Austin",
+    "78739": "Austin", "78741": "Austin", "78742": "Austin",
+    "78744": "Austin", "78745": "Austin", "78746": "Austin",
+    "78747": "Austin", "78748": "Austin", "78749": "Austin",
+    "78750": "Austin", "78751": "Austin", "78752": "Austin",
+    "78753": "Austin", "78754": "Austin", "78756": "Austin",
+    "78757": "Austin", "78758": "Austin", "78759": "Austin",
+}
+
+
+def city_for_zip(zip5: str, default: str = "Austin") -> str:
+    """Property city for a Travis property ZIP. NEVER use the mailing city."""
+    return ZIP_CITY.get((zip5 or "").strip()[:5], default)
+
+
 # ── Street suffix dictionary ──────────────────────────────────────────
 STREET_SUFFIXES: set[str] = {
     "ST", "AVE", "BLVD", "DR", "RD", "LN", "CT", "WAY", "HWY", "PKWY",
@@ -64,16 +112,40 @@ BIZ_KW = re.compile(
     re.I,
 )
 
+# `HOA` is an association marker only where an entity name puts it: as the
+# first or last token, or immediately before a corporate suffix. Mid-name it is
+# far more often the Vietnamese given name Hoa — Travis carries several
+# ("HUYNH ANH HOA THI", "NGUYEN HOA V & OANH K", "HUYNH VAN NGO & THI HOA HO")
+# and a bare \bHOA\b silently dropped every one of them as a homeowners
+# association. Real HOAs in the roll are uniformly "<PLACE> HOA [INC]".
+_HOA_ABBREV = r"(?:^\s*HOA\b|\bHOA\s*$|\bHOA\s+(?:INC|LLC|LTD|CORP|ASSOC\w*|ASSN)\b)"
+
 BIZ_EXTRA = re.compile(
-    r"\b(HOMEOWNERS|HOA|MUD\s*NO|UTILITY|REIT|SERIES|REVOCABLE|"
-    r"IRREVOCABLE|LIVING\sTRUST|FAMILY\sTRUST|GST|EXEMPT)\b",
+    r"\b(HOMEOWNERS|MUD\s*NO|UTILITY|REIT|SERIES|REVOCABLE|"
+    r"IRREVOCABLE|LIVING\sTRUST|FAMILY\sTRUST|GST|EXEMPT)\b"
+    rf"|{_HOA_ABBREV}",
     re.I,
 )
 
 HOA_PAT = re.compile(
-    r"\b(HOMEOWNERS|HOA\b|HOME\s+OWNERS|OWNERS\s+ASSOC|PROPERTY\s+OWNERS)\b",
+    r"\b(HOMEOWNERS|HOME\s+OWNERS|OWNERS\s+ASSOC|PROPERTY\s+OWNERS)\b"
+    rf"|{_HOA_ABBREV}",
     re.I,
 )
+
+# An estate is a probate lead — the highest-value kind — so it outranks any
+# association marker. "ESTATE OF CHANG HENRY HOA" is a person, not an HOA.
+ESTATE_PAT = re.compile(r"\b(ESTATE|EST)\s+OF\b|\bESTATE\s*$", re.I)
+
+
+def is_hoa(name: str) -> bool:
+    """True when the owner is a homeowners/property-owners association.
+
+    Estate names win — see ESTATE_PAT.
+    """
+    if not name or ESTATE_PAT.search(name):
+        return False
+    return bool(HOA_PAT.search(name))
 
 
 # ── Subdivision patterns used by blank-zip resolver ───────────────────
@@ -228,7 +300,7 @@ def is_business(name: str) -> bool:
     return bool(name and (BIZ_KW.search(name) or BIZ_EXTRA.search(name)))
 
 
-def strip_etux_etal(name: str) -> str:
+def strip_etux_etal(name: str, *, strip_spousal_tail: bool = True) -> str:
     """Strip trailing ETUX/ETVIR/ETAL clauses + spousal `& <name>` tails.
 
     Mirrors Bell + Wilco behavior so Travis names also lose their tail
@@ -240,11 +312,19 @@ def strip_etux_etal(name: str) -> str:
       "ROSENDO GOMEZ JR ETAL"           → "ROSENDO GOMEZ JR"
       "SMITH JOHN ETUX MARY"            → "SMITH JOHN"
       "DOE JANE & JOHN K"               → "DOE JANE"
+
+    Pass `strip_spousal_tail=False` for names already classified as entities.
+    The `&` branch cuts at the FIRST ` & `, which decapitates an entity whose
+    own name contains one — "U & US HOMES LLC" → "U", and since the `LLC` went
+    with it, `is_business()` then reads the remainder as a person and ships a
+    fabricated one-letter owner. Entities have no spouse, so callers must
+    classify on the PRISTINE name and disable this branch for businesses.
     """
     if not name:
         return ""
+    tail = r"(?:(?:ETUX|ETVIR|ETAL)\b|&\s)" if strip_spousal_tail else r"(?:ETUX|ETVIR|ETAL)\b"
     return re.sub(
-        r"\s+(?:(?:ETUX|ETVIR|ETAL)\b|&\s).*$",
+        rf"\s+{tail}.*$",
         "",
         name,
         flags=re.IGNORECASE,

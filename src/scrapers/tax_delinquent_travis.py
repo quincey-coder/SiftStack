@@ -29,6 +29,7 @@ from pathlib import Path
 
 import requests
 
+import travis_tax_schema as schema
 from notice_parser import NoticeData, normalize_court_name
 from scrapers import register
 from scrapers import travis_texdel_cleaner as cleaner
@@ -57,9 +58,13 @@ LAST_RUN_SOLD: list | None = None
 
 
 def _parse_address(street_num: str, street_name: str) -> str:
-    """Combine street number and name into a single address string."""
-    num = street_num.strip()
-    name = street_name.strip()
+    """Combine street number and name into a single address string.
+
+    Interior whitespace is collapsed: the post-2026-08-05 export pads
+    `Street Name` to fixed width, so the raw value is `'MILTON<29 sp>ST   W'`.
+    """
+    num = " ".join(street_num.split())
+    name = " ".join(street_name.split())
     if not num and not name:
         return ""
     if not num:
@@ -191,8 +196,17 @@ class TravisTaxDelinquentScraper:
 
         # First pass: parse every row into a dict so we can build the
         # blank-zip lookup before the second pass runs transforms.
-        reader = csv.DictReader(io.StringIO(raw_text))
-        rows = list(reader)
+        # Rows are renamed to canonical column labels first — the Tax Office
+        # swapped the header to raw mainframe codes on 2026-08-05 (see
+        # travis_tax_schema). assert_delq_schema raises rather than let an
+        # unknown header drain through the no_apn guard as a silent zero.
+        reader = csv.DictReader(
+            schema.sanitize_csv_lines(
+                io.StringIO(raw_text), source="TaxDelqOpenData.csv"
+            )
+        )
+        schema.assert_delq_schema(reader.fieldnames)
+        rows = [schema.normalize_delq_row(r) for r in reader]
 
         subdiv_zips, street_zips = (
             cleaner.build_zip_lookup(rows) if not self.skip_cleaner else ({}, {})
@@ -240,17 +254,21 @@ class TravisTaxDelinquentScraper:
                 addr1_for_mail = addr1
 
             # ── Step 2 — Business vs person ──────────────────────
-            # Strip ETUX/ETVIR/ETAL/spousal-tails before classification —
-            # mirrors Bell + Wilco. Pristine raw owner is preserved on
-            # `notice.tax_owner_name` below for the legal-owner Notes line.
+            # Classify on the PRISTINE owner, then strip. Doing it the other
+            # way round loses entities whose name contains an `&`: the tail
+            # strip cuts "U & US HOMES LLC" down to "U", taking the `LLC` that
+            # identifies it, and the remainder ships as a one-letter person.
+            # Pristine raw owner is preserved on `notice.tax_owner_name` below
+            # for the legal-owner Notes line.
+            is_biz = not self.skip_cleaner and cleaner.is_business(full_owner)
             owner_clean = (
-                cleaner.strip_etux_etal(full_owner)
+                cleaner.strip_etux_etal(full_owner, strip_spousal_tail=not is_biz)
                 if not self.skip_cleaner
                 else full_owner
             )
             business_name = ""
             person_name = ""
-            if not self.skip_cleaner and cleaner.is_business(owner_clean):
+            if is_biz:
                 business_name = cleaner.title_case(owner_clean)
             else:
                 # Hybrid: SiftStack's normalize_court_name handles TX
@@ -285,7 +303,7 @@ class TravisTaxDelinquentScraper:
                 continue
 
             # ── Step 3b — HOA filter (skill-only) ────────────────
-            if not self.skip_cleaner and business_name and cleaner.HOA_PAT.search(business_name):
+            if not self.skip_cleaner and business_name and cleaner.is_hoa(business_name):
                 removed["hoa"] += 1
                 continue
 
@@ -367,7 +385,13 @@ class TravisTaxDelinquentScraper:
                 state="TX",
                 date_added=today,
                 address=prop_addr,
-                city=(row.get("City") or "").strip().title() or "Austin",
+                # Property city comes from the property ZIP, never from the
+                # roll's `City` column — that is the OWNER'S MAILING city, and
+                # for absentee owners it stamped things like "5505 Manor Rd /
+                # Wilmington" onto Travis properties. Smarty can't repair it
+                # downstream (STRICT match returns nothing when city and ZIP
+                # disagree), so it has to be right here.
+                city=cleaner.city_for_zip(pzip5),
                 zip=pzip5,
                 owner_name=owner_name_out,
                 parcel_id=account,
