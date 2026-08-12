@@ -641,6 +641,16 @@ def run_enrichment_pipeline(
                 logger.info(
                     "  Zillow-enriched: %d/%d", enriched, len(notices)
                 )
+                # County assessed value: the CAD roll is authoritative and
+                # OVERWRITES the Zillow taxAssessedValue fallback set above.
+                # This is the one valuation DataSift's own enrichment cannot
+                # supply, so it has to travel with the record.
+                try:
+                    from assessed_value import populate_assessed_values
+
+                    populate_assessed_values(notices)
+                except Exception as exc:
+                    logger.warning("  assessed-value pass failed: %s", exc)
             except ImportError:
                 logger.warning(
                     "  property_enricher not available — skipping"

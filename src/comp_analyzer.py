@@ -4,8 +4,14 @@ Generates appraiser-grade property valuations for real estate investment
 analysis. Fetches comparable sales from the Zillow API, applies property-
 specific adjustments, and produces a 7-tab Excel workbook.
 
-Texas is a disclosure state — actual sale prices are in public deed
-records. MLS/Zillow data supplements with DOM, listing history, etc.
+Texas is a NON-DISCLOSURE state: sale prices are NOT recorded in public deed
+records, and the MLS does not publish them onward, so Zillow returns Travis /
+Bell / Williamson sold listings with NO sale price (verified live 2026-08-11:
+0 of 41 priced in 78723, 76541 and 78664, against 41 of 41 in TN, GA and AZ).
+``fetch_comparable_sales`` therefore returns nothing usable in our markets and
+says why. Value has to be triangulated from the CAD card plus Zestimate /
+tax-assessed value — the framework in the real-estate-comping skill's
+``non-disclosure-prompt.md``, which correctly lists TX as non-disclosure.
 
 Usage:
   python src/main.py comp --address "123 Main St, Austin, TX 78701"
@@ -30,7 +36,8 @@ logger = logging.getLogger(__name__)
 # ── API Configuration ─────────────────────────────────────────────────
 API_BASE = "https://api.openwebninja.com/realtime-zillow-data"
 PROPERTY_ENDPOINT = f"{API_BASE}/property-details-address"
-COMPS_ENDPOINT = f"{API_BASE}/similar-sale-homes"
+# similar-sale-homes was RETIRED by OpenWeb Ninja (hard 404) — comps now come
+# from /search via zillow_market_api. See fetch_comparable_sales.
 REQUEST_DELAY_MIN = 1.0
 REQUEST_DELAY_MAX = 2.0
 REQUEST_TIMEOUT = 30
@@ -223,93 +230,92 @@ def fetch_subject_property(address: str, city: str = "", state: str = "TX",
 def fetch_comparable_sales(subject: SubjectProperty, radius_miles: float = DEFAULT_RADIUS_MILES,
                            months_back: int = DEFAULT_MONTHS_BACK,
                            api_key: str = "") -> list[CompProperty]:
-    """Fetch comparable sold properties near the subject property."""
+    """Fetch comparable sold properties near the subject property.
+
+    The original ``similar-sale-homes`` endpoint was RETIRED by OpenWeb Ninja and
+    now hard-404s, which this function used to swallow into an empty list — a
+    silent zero that made every comp run and every deal-analyzer ARV read
+    "0 comparable sales" as if the market were empty. Comps now come from
+    ``/search`` RECENTLY_SOLD via ``zillow_market_api``, which beats the 41-row
+    cap with adaptive price-band partitioning, then get clipped to the requested
+    radius here.
+    """
+    from zillow_market_api import ZillowMarketAPI
+
     api_key = api_key or config.OPENWEBNINJA_API_KEY
     if not api_key:
         return []
 
-    full_address = f"{subject.address} {subject.city} {subject.state} {subject.zip_code}"
-    data = _api_get(COMPS_ENDPOINT, {"address": full_address}, api_key)
-
-    time.sleep(random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX))
+    location = f"{subject.city}, {subject.state} {subject.zip_code}".strip(", ")
+    listings = ZillowMarketAPI(api_key).pull_sold(location, months_back=months_back)
 
     comps = []
-    items = data if isinstance(data, list) else (data.get("comps") or data.get("results") or []) if data else []
-
-    cutoff_date = (datetime.now() - timedelta(days=months_back * 30)).strftime("%Y-%m-%d")
-
-    for item in items:
-        if isinstance(item, str):
+    unpriced = 0
+    for listing in listings:
+        if not listing.price or listing.price < 10000:
+            unpriced += 1
             continue
 
-        # Parse sold info
-        sold_price = float(item.get("lastSoldPrice") or item.get("price") or 0)
-        sold_date = str(item.get("lastSoldDate") or item.get("dateSold") or "")[:10]
-
-        if not sold_price or sold_price < 10000:
-            continue
-
-        # Filter by date
-        if sold_date and sold_date < cutoff_date:
-            continue
-
-        lat = float(item.get("latitude") or 0)
-        lon = float(item.get("longitude") or 0)
-
-        # Filter by distance
+        # Filter by distance when both ends carry coordinates
         dist = 0.0
-        if subject.latitude and subject.longitude and lat and lon:
-            dist = _haversine_miles(subject.latitude, subject.longitude, lat, lon)
+        if subject.latitude and subject.longitude and listing.latitude and listing.longitude:
+            dist = _haversine_miles(subject.latitude, subject.longitude,
+                                    listing.latitude, listing.longitude)
             if dist > radius_miles:
                 continue
 
-        lot_sqft = 0
-        lot_val = item.get("lotAreaValue") or item.get("lotSize")
-        lot_units = (item.get("lotAreaUnits") or "").lower()
-        if lot_val:
-            try:
-                lot_sqft = int(float(lot_val) * 43560) if "acre" in lot_units else int(float(lot_val))
-            except (ValueError, TypeError):
-                pass
-
         comp = CompProperty(
-            address=item.get("streetAddress") or item.get("address") or "",
-            city=item.get("city") or "",
-            state=item.get("state") or "TX",
-            zip_code=str(item.get("zipcode") or item.get("zip") or ""),
-            latitude=lat,
-            longitude=lon,
+            address=listing.address,
+            city=listing.city,
+            state=listing.state or "TX",
+            zip_code=listing.zip_code,
+            latitude=listing.latitude,
+            longitude=listing.longitude,
             distance_miles=round(dist, 2),
-            sqft=int(item.get("livingArea") or item.get("sqft") or 0),
-            bedrooms=int(item.get("bedrooms") or 0),
-            bathrooms=float(item.get("bathrooms") or 0),
-            year_built=int(item.get("yearBuilt") or 0),
-            lot_sqft=lot_sqft,
-            property_type=item.get("homeType") or item.get("propertyType") or "",
-            sold_price=sold_price,
-            sold_date=sold_date,
-            days_on_market=int(item.get("daysOnZillow") or 0),
-            garage_spaces=int(item.get("garageSpaces") or 0),
+            sqft=listing.sqft,
+            bedrooms=listing.beds,
+            bathrooms=listing.baths,
+            year_built=int(_num_or_zero(listing.raw.get("yearBuilt"))),
+            lot_sqft=int(listing.lot_acres * 43560),
+            property_type=listing.home_type,
+            sold_price=listing.price,
+            sold_date=listing.sold_date,
+            days_on_market=listing.days_on_zillow,
         )
         comp.ppsf = round(comp.sold_price / comp.sqft, 2) if comp.sqft else 0.0
         comps.append(comp)
 
-    logger.info("Fetched %d comparable sales within %.1f mi (last %d months)", len(comps), radius_miles, months_back)
+    logger.info("Fetched %d comparable sales within %.1f mi (last %d months)",
+                len(comps), radius_miles, months_back)
 
-    # If we don't have enough comps, try expanding radius and time window
+    # A zero here has two very different causes and they must not look alike:
+    # no sales nearby, versus sales that exist but carry no public price.
+    if not comps and unpriced:
+        logger.error(
+            "0 comps from %d sold listing(s) near %s — every one lacked a sale price. "
+            "Texas is a NON-DISCLOSURE state: sale prices are not public record, so "
+            "sold-price comping cannot work here. Use the CAD + Zestimate triangulation "
+            "path (see the real-estate-comping skill) instead of this function.",
+            unpriced, location)
+        return comps
+
+    # Not enough nearby comps — widen the radius and the window once, together.
     if len(comps) < MIN_COMPS and (radius_miles < MAX_RADIUS_MILES or months_back < MAX_MONTHS_BACK):
         new_radius = min(radius_miles * 1.5, MAX_RADIUS_MILES)
         new_months = min(months_back + 3, MAX_MONTHS_BACK)
         if new_radius > radius_miles or new_months > months_back:
             logger.info("Only %d comps — expanding search to %.1f mi / %d months",
                         len(comps), new_radius, new_months)
-            # Re-filter with expanded params (comps already fetched, just relax filters)
-            expanded_cutoff = (datetime.now() - timedelta(days=new_months * 30)).strftime("%Y-%m-%d")
-            # Re-process original items with relaxed filters
-            # For now, the API returns what it returns — we just note the expansion
-            pass
+            return fetch_comparable_sales(subject, new_radius, new_months, api_key)
 
     return comps
+
+
+def _num_or_zero(value) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 # ── Similarity scoring ────────────────────────────────────────────────
@@ -849,7 +855,8 @@ def generate_comp_report(subject: SubjectProperty, comps: list[CompProperty],
 
     notes = [
         "Data Source: OpenWeb Ninja Real-Time Zillow Data API",
-        "Comparable sales sourced from Zillow's similar-sale-homes endpoint",
+        "Comparable sales sourced from Zillow's /search RECENTLY_SOLD endpoint "
+        "(price-band partitioned), clipped to the search radius",
         "",
         "Adjustment Methodology:",
         f"  Square Footage: ${ADJ_PER_SQFT:,.0f} per sqft difference",

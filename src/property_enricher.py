@@ -266,6 +266,20 @@ def _apply_property_data(notice: NoticeData, data: dict) -> bool:
     if zestimate:
         notice.estimated_value = str(int(zestimate))
 
+    # County assessed value — FALLBACK ONLY. The CAD roll is authoritative and
+    # `assessed_value.populate_assessed_values` fills it first; this covers the
+    # gap where the county produced nothing (notably Travis, whose roll carries
+    # a market value on the delinquent subset but on none of the current roll).
+    # Guarded on emptiness so the two passes are order-independent.
+    if not getattr(notice, "assessed_value", ""):
+        tax_assessed = data.get("taxAssessedValue")
+        if tax_assessed:
+            try:
+                notice.assessed_value = str(int(float(tax_assessed)))
+                notice.assessed_source = "zillow"
+            except (TypeError, ValueError):
+                pass
+
     # Property characteristics
     home_type = data.get("homeType") or ""
     notice.property_type = _TYPE_MAP.get(home_type.upper(), home_type.replace("_", " ").title())
