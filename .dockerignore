@@ -39,6 +39,7 @@ last_run.json.bak
 dropbox_state.json
 photo_state.json
 datasift_cookies.json
+smrtphone_state.json
 *.bak
 
 # Secrets — triple-belt-and-suspenders (already listed in .gitignore too)
