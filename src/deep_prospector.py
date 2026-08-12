@@ -139,14 +139,24 @@ async def _run_level_1(notice: NoticeData, result: ProspectResult) -> None:
     if phones > 0 or emails > 0:
         result.phones_found = phones
         result.emails_found = emails
-        result.skip_trace_provider = "existing"
+        # Attribute the source rather than calling everything "existing": a
+        # SmartSkip-sourced heir graph means the expensive step already ran.
+        result.skip_trace_provider = "smartskip" if notice.heir_map_json and \
+            '"source": "smartskip"' in notice.heir_map_json else "existing"
         result.notes += "Skip trace data already present. "
     else:
-        # Would call tracerfy here in production
         result.notes += "Needs skip trace — no phone/email on file. "
 
     result.depth_completed = 1
-    result.recommended_action = "Run Tracerfy batch skip trace" if phones == 0 else "Score phones via Trestle"
+    if phones == 0:
+        # SmartSkip is the primary engine: it returns relatives WITH phones in one
+        # batch row, which is what an ownerless/phoneless record actually needs.
+        # Tracerfy is the gap-fill for relatives SmartSkip named but left phoneless.
+        result.recommended_action = (
+            "Run SmartSkip bulk trace (src/smartskip.py submit), then Tracerfy gap-fill"
+        )
+    else:
+        result.recommended_action = "Score phones via Trestle"
 
 
 async def _run_level_2(notice: NoticeData, result: ProspectResult) -> None:
@@ -200,10 +210,20 @@ async def _run_level_3(notice: NoticeData, result: ProspectResult) -> None:
             result.recommended_action = "Contact decision maker — begin marketing sequence"
         else:
             result.notes += "Owner deceased but no DM identified. "
-            result.recommended_action = "Run ancestry research for heir identification"
+            result.recommended_action = "Run SmartSkip to pull the relative graph, then verify heirs"
     else:
         result.notes += "Owner not confirmed deceased. "
-        result.recommended_action = "Run obituary search to confirm status"
+        # THE SPOUSE-OBITUARY TRAP: an obituary attached to a record does NOT mean
+        # the OWNER died. A record was worked as an heir case off the husband's
+        # obituary while the owner herself was alive and owned the property — a
+        # caller would have opened by asking for a dead man. Always match the
+        # decedent against the owner of record before doing any heir work.
+        if notice.smartskip_deceased_flag == "yes":
+            result.notes += ("SmartSkip flagged the owner deceased (no DOD, unreliable) — "
+                             "confirm via obituary and check WHOSE obituary it is. ")
+        result.recommended_action = (
+            "Run obituary search to confirm status — verify the decedent IS the owner of record"
+        )
 
     result.depth_completed = 3
 

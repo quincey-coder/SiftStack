@@ -193,6 +193,15 @@ class NoticeData:
     mls_last_sold_date: str = ""   # Most recent sale date (YYYY-MM-DD)
     mls_last_sold_price: str = ""  # Most recent sale price
     estimated_value: str = ""      # Zestimate
+    # The COUNTY's own valuation — a different number from the Zestimate above,
+    # and one DataSift's enrichment cannot supply (it knows Zillow, not the CAD).
+    # Holds the CAD TOTAL MARKET value, which all three counties publish.
+    # (WCAD also exposes a capped `totalassessedvalue` that diverges on
+    # homesteads — 23,269 mkt vs 18,782 assessed on a live row — if a taxable
+    # basis is ever needed as well.)
+    assessed_value: str = ""       # CAD total market value ($)
+    assessed_year: str = ""        # tax roll year the value came from
+    assessed_source: str = ""      # "travis_cad" | "bell_cad" | "wcad" | "zillow"
     estimated_equity: str = ""     # zestimate - estimated remaining mortgage
     equity_percent: str = ""       # (equity / zestimate) * 100
     property_type: str = ""        # "Single Family", "Condo", etc.
@@ -229,6 +238,10 @@ class NoticeData:
     owner_deceased: str = ""                # "yes" or "" — confirmed via obituary search
     date_of_death: str = ""                 # YYYY-MM-DD from obituary
     obituary_url: str = ""                  # URL of confirmed obituary
+    # SmartSkip's own Deceased flag — an OBSERVATION, never a verdict. It carries
+    # no date of death and has returned false for a man with a published obituary,
+    # so it must never set owner_deceased; the obituary/web pass decides that.
+    smartskip_deceased_flag: str = ""       # "yes" or ""
     decision_maker_name: str = ""           # Heir/executor full name
     decision_maker_relationship: str = ""   # "spouse", "son", "daughter", "executor", etc.
     # Deep prospecting — ranked decision-makers (flat columns)

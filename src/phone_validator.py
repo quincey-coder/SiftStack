@@ -393,8 +393,25 @@ DM_PHONE_FIELDS = [
 ]
 
 
-def _collect_phones_from_notice(notice) -> list[str]:
-    """Return all cleaned phones on a notice — DM #1 flat fields + heir_map_json."""
+# Trestle bills per unique number. An obituary heir map holds a handful of
+# survivors, but a SmartSkip relative graph holds up to 50 relatives with up to 5
+# phones each (~6.8 relatives / ~16.6 numbers per record in practice), so scoring
+# EVERY relative's phone is a real cost leak: ~$0.25/record instead of ~$0.08.
+# Only people who can actually sign are scored by default.
+SCORE_SIGNERS_ONLY = getattr(config, "TRESTLE_SCORE_SIGNERS_ONLY", True)
+
+
+def _collect_phones_from_notice(notice, signers_only: bool | None = None) -> list[str]:
+    """Return cleaned phones on a notice — DM #1 flat fields + heir_map_json.
+
+    ``signers_only`` (default True) restricts heir phones to heirs who hold
+    signing authority and are not deceased. Non-signing relatives stay in
+    ``heir_map_json`` and still render in Notes; they are simply not paid for at
+    Trestle until someone decides to work them. Pass False to score everyone.
+    """
+    if signers_only is None:
+        signers_only = SCORE_SIGNERS_ONLY
+
     out: list[str] = []
     for field in DM_PHONE_FIELDS:
         val = getattr(notice, field, "") or ""
@@ -409,13 +426,22 @@ def _collect_phones_from_notice(notice) -> list[str]:
         except (ValueError, TypeError):
             heirs = []
         if isinstance(heirs, list):
+            skipped = 0
             for h in heirs:
                 if not isinstance(h, dict):
+                    continue
+                if signers_only and not (
+                    h.get("signing_authority") and h.get("status") != "deceased"
+                ):
+                    skipped += len(h.get("phones", []) or [])
                     continue
                 for ph in h.get("phones", []) or []:
                     cleaned = clean_phone(ph)
                     if cleaned:
                         out.append(cleaned)
+            if skipped:
+                logger.debug("Skipped %d non-signer heir phone(s) on %s (signers_only)",
+                             skipped, getattr(notice, "address", "?"))
     return out
 
 

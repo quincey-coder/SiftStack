@@ -12,6 +12,7 @@ import csv
 import io
 import json
 import logging
+import re
 import time
 
 import requests
@@ -30,6 +31,15 @@ EMAIL_FIELDS = ["email_1", "email_2", "email_3", "email_4", "email_5"]
 
 TRACERFY_TRACE_URL = "https://tracerfy.com/v1/api/trace/"
 TRACERFY_QUEUE_URL = "https://tracerfy.com/v1/api/queue/"
+
+# A LIST response from the queue endpoint is a partial, growing result set.
+# Require it to hold steady this many consecutive polls (5s each) before
+# treating it as final, so a slow record is not silently dropped.
+STABLE_POLLS_REQUIRED = 4
+
+
+# A situs street with no leading house number means vacant land.
+_HAS_HOUSE_NUMBER = re.compile(r"^\s*\d")
 
 
 def _get_contacts_for_trace(
@@ -101,13 +111,25 @@ def _get_contacts_for_trace(
         if name:
             first, last, _et = _split_name(name)
             if first and last:
-                contacts.append((
-                    first, last,
-                    notice.address or "",
-                    notice.city or "",
-                    notice.zip or "",
-                    name,
-                ))
+                # VACANT LAND: a situs with no house number ("Veldt Dr",
+                # "Eggleston St") is almost always raw land — nobody lives
+                # there, so anchoring the trace on it finds nothing. The owner
+                # is reachable at their MAILING address, which these records do
+                # carry (verified on the Travis delinquent roll: all 9
+                # house-numberless rows had a full owner mailing address).
+                # Chase the mailing address instead; fall back to the property
+                # address when there is no mailing address to use.
+                street = notice.address or ""
+                city_val = notice.city or ""
+                zip_code = notice.zip or ""
+                mailing = (getattr(notice, "mailing_address", "") or "").strip()
+                if mailing and not _HAS_HOUSE_NUMBER.match(street):
+                    street = mailing
+                    city_val = getattr(notice, "owner_city", "") or city_val
+                    zip_code = getattr(notice, "owner_zip", "") or zip_code
+                    logger.debug("Anchoring trace on the MAILING address for %s "
+                                 "(property %r has no house number)", name, notice.address)
+                contacts.append((first, last, street, city_val, zip_code, name))
 
     return contacts
 
@@ -356,6 +378,8 @@ def batch_skip_trace(
         logger.info("  Tracerfy batch job %s submitted (est. %ss)", queue_id, est_wait)
 
         # Poll for results (up to 5 minutes)
+        last_count = -1
+        stable_polls = 0
         for attempt in range(60):
             time.sleep(5)
             result_resp = requests.get(
@@ -368,7 +392,29 @@ def batch_skip_trace(
 
             # Handle both response formats
             if isinstance(result_data, list):
+                # A LIST response is a PARTIAL result set while the batch is
+                # still running — it grows as records finish. Accepting the
+                # first one seen discarded most of a fully-billed batch: a live
+                # 23-contact run took the 5-second poll, matched 2, and returned
+                # "2/23 matched" while the completed job actually held 16
+                # records with phones. Wait for the count to reach the submitted
+                # total, or to stop growing across two consecutive polls.
                 records = result_data
+                if len(records) < stats["submitted"] and len(records) != last_count:
+                    last_count = len(records)
+                    stable_polls = 0
+                    if attempt % 6 == 5:
+                        logger.info("  Tracerfy batch filling in: %d/%d records (%ds)...",
+                                    len(records), stats["submitted"], (attempt + 1) * 5)
+                    continue
+                if len(records) < stats["submitted"]:
+                    stable_polls += 1
+                    if stable_polls < STABLE_POLLS_REQUIRED:
+                        continue
+                    logger.info("  Tracerfy batch settled at %d/%d records "
+                                "(unchanged for %ds) — accepting as final",
+                                len(records), stats["submitted"],
+                                STABLE_POLLS_REQUIRED * 5)
             elif isinstance(result_data, dict):
                 status = result_data.get("status", "")
                 if status == "failed":

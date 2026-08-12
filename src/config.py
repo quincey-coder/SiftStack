@@ -49,6 +49,19 @@ TRESTLE_ADD_LITIGATOR = os.getenv("TRESTLE_ADD_LITIGATOR", "1").strip().lower() 
 # the API docs. Set TRESTLE_LITIGATOR_COST to your contracted per-add-on price so
 # cost estimates stay honest; left unset, estimates flag it as unpriced.
 TRESTLE_LITIGATOR_COST = float(os.getenv("TRESTLE_LITIGATOR_COST", "0") or 0) or None
+# Trestle bills per unique number. Score only heirs who can actually sign;
+# non-signing relatives stay in heir_map_json and still render in Notes.
+# Set TRESTLE_SCORE_SIGNERS_ONLY=0 to score every relative phone.
+TRESTLE_SCORE_SIGNERS_ONLY = os.getenv("TRESTLE_SCORE_SIGNERS_ONLY", "1").strip().lower() not in ("0", "false", "no", "")
+# SmartSkip bulk skip trace — the deep-prospecting heir engine (relatives WITH
+# phones in one batch row). Replaces the Enformion Person Search. Bulk skip bills
+# the saved CARD, not the wallet, so payment is always an explicit call.
+SMARTSKIP_EMAIL = os.getenv("SMARTSKIP_EMAIL", "")
+SMARTSKIP_PASSWORD = os.getenv("SMARTSKIP_PASSWORD", "")
+# Enformion is retained for ENTITY owners only (BusinessV2). Its Person Search is
+# retired — see src/smartskip.py.
+ENFORMION_AP_NAME = os.getenv("ENFORMION_AP_NAME", "")
+ENFORMION_AP_PASSWORD = os.getenv("ENFORMION_AP_PASSWORD", "")
 DATASIFT_EMAIL = os.getenv("DATASIFT_EMAIL", "")              # DataSift.ai login
 DATASIFT_PASSWORD = os.getenv("DATASIFT_PASSWORD", "")
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")        # Slack/Discord webhook
@@ -98,6 +111,13 @@ OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1/")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")       # OpenRouter API key
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "qwen/qwen-2.5-72b-instruct")
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+# Call coaching: transcription needs an AUDIO-capable model, which Anthropic
+# does not provide — so this one path routes through OpenRouter (already
+# configured above). ~$0.002 per audio minute on Gemini Flash.
+CALL_AUDIO_MODEL = os.getenv("CALL_AUDIO_MODEL", "google/gemini-2.5-flash")
+# SmrtPhone dialer (call log + recordings + MMS). Session is cookie-based:
+# `python src/smrtphone.py login` saves smrtphone_state.json.
+SMRTPHONE_EMAIL = os.getenv("SMRTPHONE_EMAIL", "")
 
 # Per-call token-usage DEBUG logging (the accumulator always runs; this only
 # gates the noisy per-call log line). Set LLM_USAGE_LOG=0 to silence.

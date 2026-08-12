@@ -13,6 +13,8 @@ datasift_cookies.json
 datasift_api_tokens.json
 dropbox_state.json
 photo_state.json
+# SmrtPhone dialer session cookies (minted by `python src/smrtphone.py login`)
+smrtphone_state.json
 *.tmp
 *.bak
 

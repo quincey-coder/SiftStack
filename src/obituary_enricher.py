@@ -2224,13 +2224,17 @@ def rank_decision_makers(
         elif any(t in rel for t in stepchild_terms):
             entry["signing_authority"] = False
 
-        # Executors/PR: always signing authority
+        # Executors/PR: signing authority unless they are themselves deceased
+        # (a dead executor cannot sign; the estate needs a successor PR).
         elif "executor" in rel or "personal representative" in rel:
-            entry["signing_authority"] = True
+            entry["signing_authority"] = entry["status"] != "deceased"
 
-        # Spouse: always signing authority
+        # Spouse: signing authority unless deceased. Obituary survivors are
+        # living by construction, so this only bites on sources that report
+        # relatives with a death flag (e.g. SmartSkip) — where a predeceased
+        # spouse is common and must never enter the signing chain.
         elif any(t in rel for t in spouse_terms):
-            entry["signing_authority"] = True
+            entry["signing_authority"] = entry["status"] != "deceased"
 
         # Grandchildren: only if their parent (a child of deceased) is also deceased
         # Since we can't always trace parent→grandchild, we use a heuristic:
