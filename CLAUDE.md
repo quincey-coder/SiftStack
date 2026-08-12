@@ -315,13 +315,87 @@ Hard-won (2026-07-23):
   or missing — accepted only for a unique Austin-area (786xx/787xx) ZIP, which
   keeps out-of-county mailing keys from matching.
 
+## Deep Prospecting v5 — SmartSkip heir engine (`src/smartskip.py`, 2026-08-11)
+
+**The heir engine is SmartSkip.** Until now the heir set was extracted from
+obituary prose by an LLM — the job that hallucinated a family in the Norman
+Willis incident and forced the grounding guard in `obituary_enricher`. SmartSkip
+returns an owner's RELATIVES **with their phone numbers** in one batch row, so
+the research layer only has to *confirm* relationships and supply the date of
+death. Upstream measured it against the Enformion Person Search on 12 identical
+owners: Enformion returned zero relatives on **6 of 12**, SmartSkip hit 12/12;
+100 owners / 682 relatives cost **$15.90 vs $78.20** (4.9x).
+
+Stack: SmartSkip ($0.15/hit) → Tracerfy ($0.02, gap-fill the ~7% of relatives
+left phoneless) → obituary/web research (**mandatory**, free) → Trestle
+($0.015/number). About $0.24 per record.
+
+- **Enformion's Person Search is retired; BusinessV2 is RETAINED** for entity
+  owners only (`src/enformion_business.py`) — SmartSkip needs a first and last
+  name, and Tracerfy is consumer-only, so LLCs/trusts/estates have no other path.
+  BusinessV2 returns actual SOS corp filings, so it is *grounded*, unlike
+  `entity_researcher`'s DuckDuckGo+LLM inference — prefer it, keep the LLM path
+  as fallback. Registered agents are **flagged, not dropped** (`is_registered_agent`):
+  on a small family LLC the agent is usually the owner, on a large one a paid
+  front (ZenBusiness is Austin-based and very common on TX LLCs).
+- **SmartSkip is WRONG ABOUT DEATH.** No date-of-death column at all, and its
+  `Deceased` flag returned false for a man with a published funeral-home
+  obituary. It therefore NEVER sets `owner_deceased`/`date_of_death` — the flag
+  is recorded as an observation in `smartskip_deceased_flag` and the research
+  layer decides. `_status_for` never returns `verified_living`; a positive
+  Deceased flag IS honoured (the flag under-reports death, so a "true" is
+  credible, and either way the conservative direction keeps them out of the
+  signing chain).
+- **THE SPOUSE-OBITUARY TRAP.** An obituary on a record does NOT mean the OWNER
+  died. A live record was worked as an heir case off the *husband's* obituary
+  while the owner was alive and owned the property — a caller would have opened
+  by asking for a dead man. Always match the decedent against the owner of
+  record first; a living owner with a recent household death is a different and
+  often better record. Surfaced in `deep_prospector._run_level_3`.
+- **Relationship labels are coarse** ("Possible Type"; ~63% generic). They map to
+  `relative`, which carries NO signing authority, and the entry is marked
+  `relationship_unconfirmed`. `canon_relationship` is deliberately
+  **gender-neutral** — SmartSkip supplies no gender and guessing one from a first
+  name puts a fabricated attribute on a real person; the neutral terms
+  (child/parent/sibling/spouse) are already understood by the TX intestacy
+  classifier, so nothing is lost.
+- **Signing authority comes from the ONE implementation.** `build_heir_map`
+  reuses `obituary_enricher.rank_decision_makers` (Texas Estates Code) rather
+  than a second copy that could drift; SmartSkip-only contact details are merged
+  onto the ranked entries afterwards.
+- **Money safety.** `submit`/`status`/`download` are FREE; `pay` is the only
+  billing call, is never invoked by any pipeline path, and refuses unless
+  `confirm_rows` matches SmartSkip's calculated count AND the order was submitted
+  by this client. The **wallet does NOT fund bulk skip** — it bills the saved
+  card. An UNPAID order is invisible in `GET /bulk-skip`, so the `bulkSkipId` is
+  persisted to `data/smartskip/orders.json` before payment is possible.
+- **Entities are filtered OUT of the batch up front** (`build_trace_csv`), not
+  discovered per record — they would bill as misses.
+- Owner phones land in the flat dial slots; **relatives' phones stay inside
+  `heir_map_json`** so a relative's number is never dialled as the owner's.
+
+**Status: the HTTP lifecycle is UNVERIFIED against a live account** (no
+`SMARTSKIP_EMAIL`/`SMARTSKIP_PASSWORD` configured yet). Parsing, the heir-map
+bridge, `apply_export`, and the payment guards are all verified offline against
+both export layouts.
+
 ## Key Domain Rules
 
 - **Probate owner_name** should be the Personal Representative/Executor/Administrator — not the deceased.
 - **Address dedup:** Same property can appear in multiple notices; `data_formatter.deduplicate()` keeps the most recent.
 - **ZIP code filtering:** Only notices in investor-active ZIPs (from `target_zips.json`) pass through. Threshold: 10+ investor transactions/month per ZIP.
 - **Rate limiting:** 2-3 second random delays between requests, 3 retries per page. Travis CSV download needs no rate limiting.
-- **Texas is a disclosure state** — actual sale prices are available in public records (unlike non-disclosure states).
+- **Texas is a NON-DISCLOSURE state** — sale prices are NOT in public records. (This
+  file previously claimed the opposite; the `real-estate-comping` skill always had it
+  right: *"Texas | TX | Largest non-disclosure market... CAD is primary data source"*.)
+  Consequence, verified live 2026-08-11 against OpenWeb Ninja `/search RECENTLY_SOLD`:
+  Zillow returns TX sold listings with **no sale price** — 0/41 priced in 78723, 76541
+  and 78664, versus **41/41** in Knoxville TN, Atlanta GA and Phoenix AZ. TX *list*
+  prices come back fine (41/41), so this is disclosure, not an API or key problem.
+  **Sold-price comping cannot work in our markets**; value must be triangulated from
+  the CAD card + Zestimate / tax-assessed value (see the skill's
+  `non-disclosure-prompt.md`). `comp_analyzer.fetch_comparable_sales` now logs this
+  cause explicitly instead of returning a bare empty list.
 - **Texas has no state transfer tax** — closing cost calculations should not include transfer tax.
 
 ## Owner-Name Orientation (NAMELF) — the #1 silent data corruptor
@@ -550,24 +624,52 @@ DataSift.ai (formerly REISift) is the CRM where scraped records land for niche s
 **Domain:** `app.reisift.io` (NOT `app.datasift.ai`). API at `apiv2.reisift.io`.
 
 ### Key Files
-- `src/datasift_formatter.py` — Transforms `NoticeData` → DataSift CSV (41 columns)
+- `src/datasift_formatter.py` — Transforms `NoticeData` → DataSift CSV (64 columns)
 - `src/datasift_uploader.py` — Playwright login + upload wizard + enrich + skip trace + preset management + sequence builder + SiftMap sold workflow
 - `test_datasift_upload.py` — Headed browser test (upload + enrich + skip trace)
 - `test_manage_presets.py` — Headed browser test (preset discovery + sold exclusion + sequence creation)
 - `test_manage_sold.py` — Headed browser test (SiftMap sold property tagging)
 
-### CSV Column Structure (41 columns)
+### CSV Column Structure (64 columns)
 - **Core auto-mapped (11):** Property Street/City/State/ZIP, Owner First/Last Name, Mailing Street/City/State/ZIP, Tags
 - **Lists + Notes (2):** Lists (for niche sequential), Notes (contextual per notice type)
-- **Built-in fields (13):** Estimated Value, MSL Status, Last Sale Date/Price, Equity Percentage, Tax Deliquent Value, Tax Delinquent Year, Tax Auction Date, Foreclosure Date, Probate Open Date, Personal Representative, Parcel ID, Structure Type, Year Built, Living SqFt, Bedrooms, Bathrooms, Lot (Acres)
-- **Custom fields (15):** Notice Type, County, Date Added, Owner Deceased, Date of Death, Decedent Name, Decision Maker, DM Relationship, DM Confidence, DM 2/3 Name/Relationship, Obituary URL, Source URL
+- **Uploadable fields:** MSL Status, Assessed Value (County), Assessed Value Year, Back Taxes Amount, Years Delinquent, Tax Auction Date, Foreclosure Date, Probate Open Date, Personal Representative, APN
+- **Custom fields:** Notice Type, County, Date Added, Owner Deceased, Date of Death, Decedent Name, Decision Maker, DM Relationship, DM Confidence, DM 2/3 Name/Relationship, Obituary URL, Source URL
+
+**The wizard has only 253 drop targets, and columns without one are DISCARDED
+SILENTLY — the upload still succeeds** (dumped live 2026-08-11 by
+`src/wizard_discover.py`, which is read-only and never clicks "Finish Upload").
+Nine columns we had documented as "built-in, auto-mapped" had **no target at
+all** and were thrown away on every upload: `Estimated Value`, `Last Sale
+Date`, `Last Sale Price`, `Equity Percentage`, `Structure Type`, `Year Built`,
+`Living SqFt`, `Bedrooms`, `Bathrooms`, `Lot (Acres)`. They are **removed, not
+remapped** — DataSift fills all of them itself from SiftMap during "Enrich
+Property Information", so we were duplicating work that was being deleted.
+Three more were renamed to the real target names: `Parcel ID`→**`APN`**,
+`Tax Deliquent Value`→**`Back Taxes Amount`**, `Tax Delinquent Year`→
+**`Years Delinquent`** (it always held a *count* of years, never a calendar
+year). `list_validator._HEADER_ALIASES` carries the old→new mapping so the
+pre-upload gate keeps passing. **Before adding any column, dump the targets —
+do not assume a plausible-sounding field exists.**
+
+- **`Assessed Value (County)` is ours to carry.** DataSift's enrichment knows a
+  Zestimate, not the CAD. The value stored is `totalpropmktvalue` (CAD TOTAL
+  MARKET value — all three counties publish it, and it is the like-for-like
+  comparison against a Zestimate); `src/assessed_value.py` fills it from the CAD
+  roll and OVERWRITES the Zillow `taxAssessedValue` fallback in
+  `property_enricher`. A wide Zestimate-over-CAD gap is real signal
+  (under-assessed equity); the reverse suggests an over-appraisal the owner may
+  be protesting.
 
 ### Niche Sequential Marketing
 DataSift's niche sequential system uses filter presets to guide records through SMS → Call → Mail → Deep Prospecting phases. Two preset folders: "00 Niche Sequential Marketing" (12 presets, courthouse data) and "01. Bulk Sequential Marketing" (9 presets, bulk data). All 21 presets exclude Sold status (build 1.0.23). A "Sold Property Cleanup" sequence in the Transactions folder auto-fires on "Sold" tag to change status, remove from lists, clear tasks, and clear assignee.
 
-- **"Courthouse Data" tag:** Every record gets this tag — signals first-to-market county data (prioritized over bulk data in filter presets)
+- **"Courthouse Data" + "FTM" tags:** Every record gets both — first-to-market
+  county data, pulled before any bulk vendor sees it (prioritized over bulk data
+  in filter presets). Sold/Resolved cleanup rows return earlier with their own
+  minimal tag sets and never pick these up — they are not new-to-market.
 - **Lists column:** Maps `notice_type` → DataSift list name. Names match the account's existing built-in lists so the Sold/cleanup sequences (which act on list titles) fire: `foreclosure` → "Foreclosure", `probate` → "Probate", `tax_sale` → "Tax Sale", `tax_delinquent` → "Tax Delinquent", `eviction` → "Eviction", `code_violation` → "Code Enforcement", `divorce` → "Divorce", `lien` → "Liens". (`code_violation`/`lien` use the account's built-in list titles, not SiftStack's internal concept names; "Tax Sale" has no built-in equivalent and is a SiftStack-only list.) DataSift auto-creates any missing list from the CSV.
-- **Tags:** Courthouse Data, notice_type, county, YYYY-MM date, deceased/living, DM confidence level, has_auction, tax_delinquent, photo_import (for photo-sourced records)
+- **Tags:** Courthouse Data, FTM, notice_type, county, YYYY-MM date, deceased/living, DM confidence level, has_auction, tax_delinquent, photo_import (for photo-sourced records)
 
 ### Upload Wizard (5 Steps)
 1. **Setup:** Click "Upload File" sidebar → "Add Data" → dropdown "Uploading a new list not in DataSift yet" → enter list name → organization questions
