@@ -546,9 +546,18 @@ def score_record_phones(
 
 
 def write_datasift_tags_csv(results: list[dict], output_dir: str | Path) -> Path:
-    """Write the DataSift-ready phone tags CSV (Phone Number + Phone Tag).
+    """Write the DataSift-ready phone tags CSV (Phone Number + Phone Tags).
 
-    This is the file uploaded to DataSift via "Update Data → Tag phones by phone number".
+    Uploaded via "Update Data -> Tagging phones by phone numbers".
+
+    The header must be "Phone Tags" (PLURAL) — that is the exact drop-target
+    name the wizard offers in that mode, confirmed by a live DOM dump:
+    ['Phone Number', 'Phone Tags', 'Phone Type', 'Phone Status'].
+    This wrote "Phone Tag" (singular), which DataSift SILENTLY DISCARDED: a
+    non-matching column is not listed as unmapped, it is simply dropped, so the
+    upload reported "0 unmapped" and applied no tags at all. Never treat
+    "0 unmapped" as proof that a column was accepted — only a name that matches
+    a real target is.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -556,7 +565,7 @@ def write_datasift_tags_csv(results: list[dict], output_dir: str | Path) -> Path
 
     with open(filepath, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["Phone Number", "Phone Tag"])
+        writer.writerow(["Phone Number", "Phone Tags"])
         for r in results:
             if r.get("is_valid") is not False:
                 writer.writerow([r["phone_number"], r["assigned_tag"]])
