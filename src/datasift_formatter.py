@@ -55,25 +55,30 @@ DATASIFT_COLUMNS = [
     "Tags",
     "Lists",
     "Notes",
-    # ── Built-in fields (auto-mapped by DataSift) ──
-    "Estimated Value",
+    # ── Fields DataSift actually accepts on upload ──
+    # These were NOT "auto-mapped built-ins". A live dump of the wizard's 253
+    # drop targets (src/wizard_discover.py, 2026-08-11) showed that Estimated
+    # Value, Last Sale Date/Price, Equity Percentage, Structure Type, Year
+    # Built, Living SqFt, Bedrooms, Bathrooms and Lot (Acres) have NO target at
+    # all — they were shipped in every CSV and silently discarded. DataSift
+    # populates those itself from SiftMap during "Enrich Property Information",
+    # so they are removed here rather than mapped.
     "MSL Status",               # DataSift spells it "MSL" not "MLS"
-    "Last Sale Date",
-    "Last Sale Price",
-    "Equity Percentage",
-    "Tax Deliquent Value",      # DataSift typo — "Deliquent" not "Delinquent"
-    "Tax Delinquent Year",
+    # The county's own valuation, which DataSift's enrichment CANNOT supply —
+    # it knows a Zestimate, not what the CAD says. This is the whole point of
+    # carrying it ourselves. Value is the CAD TOTAL MARKET value (available in
+    # all three counties); note WCAD separately exposes a capped
+    # `totalassessedvalue` that differs on homesteads (23,269 vs 18,782 on a
+    # live Williamson row) if a taxable-basis number is ever wanted too.
+    "Assessed Value (County)",
+    "Assessed Value Year",
+    "Back Taxes Amount",        # was "Tax Deliquent Value" (no such target)
+    "Years Delinquent",      # a COUNT (5, 4, 2), not a calendar year
     "Tax Auction Date",
     "Foreclosure Date",
     "Probate Open Date",
     "Personal Representative",
-    "Parcel ID",
-    "Structure Type",
-    "Year Built",
-    "Living SqFt",
-    "Bedrooms",
-    "Bathrooms",
-    "Lot (Acres)",
+    "APN",                      # was "Parcel ID" — DataSift's target is APN
     # ── Custom fields ("Deceased & Heir Intelligence" group) ──
     # Headers MUST match the DataSift custom-field labels 1:1
     # (deceased_heir_fields.json) — upload auto-maps on exact label match.
@@ -491,7 +496,12 @@ def _build_tags(notice: NoticeData) -> str:
                 pass
         return ",".join(res_tags)
 
-    tags = ["Courthouse Data"]
+    # FTM = First To Market. Every record here comes straight off a county
+    # source before it reaches any bulk list vendor, which is the entire edge
+    # this pipeline exists to capture. Applied to all notice types. The Sold and
+    # Resolved cleanup rows return earlier with their own minimal tag sets, so
+    # they never pick this up — they are not new-to-market.
+    tags = ["Courthouse Data", "FTM"]
 
     # Notice type — use the DataSift display name (e.g. "Foreclosure",
     # "Probate", "Code Enforcement") so the tag reads cleanly and matches the
@@ -1268,25 +1278,22 @@ def _build_row(notice: NoticeData, notes_override: str | None = None) -> dict:
         "Tags": tags,
         "Lists": list_name,
         "Notes": notes,
-        # ── Built-in fields ──
-        "Estimated Value": notice.estimated_value,
+        # ── Fields DataSift actually accepts ──
+        # Estimated Value / Last Sale Date+Price / Equity Percentage /
+        # Structure Type / Year Built / Living SqFt / Bedrooms / Bathrooms /
+        # Lot (Acres) are gone: the wizard has no drop target for any of them,
+        # so they were being discarded on every upload. DataSift's own
+        # "Enrich Property Information" step fills those from SiftMap.
         "MSL Status": notice.mls_status,
-        "Last Sale Date": _format_date(notice.mls_last_sold_date),
-        "Last Sale Price": notice.mls_last_sold_price,
-        "Equity Percentage": notice.equity_percent,
-        "Tax Deliquent Value": notice.tax_delinquent_amount,
-        "Tax Delinquent Year": notice.tax_delinquent_years,
+        "Assessed Value (County)": notice.assessed_value,
+        "Assessed Value Year": notice.assessed_year,
+        "Back Taxes Amount": notice.tax_delinquent_amount,
+        "Years Delinquent": notice.tax_delinquent_years,
         "Tax Auction Date": tax_auction,
         "Foreclosure Date": foreclosure_date,
         "Probate Open Date": probate_open,
         "Personal Representative": personal_rep,
-        "Parcel ID": notice.parcel_id,
-        "Structure Type": notice.property_type,
-        "Year Built": notice.year_built,
-        "Living SqFt": notice.sqft,
-        "Bedrooms": notice.bedrooms,
-        "Bathrooms": notice.bathrooms,
-        "Lot (Acres)": notice.lot_size,
+        "APN": notice.parcel_id,
         # ── Custom fields ("Deceased & Heir Intelligence" group) ──
         # Headers match the custom-field labels 1:1; select values must be
         # exact option labels (case-sensitive match on import).

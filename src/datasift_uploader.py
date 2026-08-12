@@ -10,6 +10,7 @@ Requires: DATASIFT_EMAIL and DATASIFT_PASSWORD in .env or environment.
 
 import logging
 import os
+import re
 from pathlib import Path
 
 import config
@@ -89,6 +90,8 @@ async def upload_csv(
     mode: str = "add",
     list_name: str | None = None,
     existing_list: bool = False,
+    do_finish: bool = True,
+    update_option: str = "",
 ) -> dict:
     """Upload a CSV file to DataSift via the 7-step upload wizard.
 
@@ -177,409 +180,366 @@ async def upload_csv(
     except Exception as e:
         logger.debug("Popup dismissal failed: %s", e)
 
-    # ── Wizard Step 1: Setup ──
-    # Part A: Select "Add Data" or "Update Data"
-    logger.info("Wizard Step 1: Selecting '%s' mode...", mode)
-    try:
-        mode_label = "Add Data" if mode == "add" else "Update Data"
-        mode_btn = page.locator(f'text="{mode_label}"')
-        if await mode_btn.count() > 0:
-            await mode_btn.first.click()
-            await page.wait_for_timeout(1500)
-            logger.info("Selected '%s'", mode_label)
-    except Exception as e:
-        logger.warning("Mode selection: %s", e)
+    # ── Wizard: DOM-DETECTED STEP MACHINE ──
+    # DataSift renders SIX steps as of 2026-08-11, verified live by
+    # src/wizard_discover.py: Setup, Enrichment, Add tags, Upload the file,
+    # Map the columns, Review. This code previously assumed FIVE in a fixed
+    # order and tracked position by counting "Next" clicks, so the Enrichment
+    # step shifted everything by one: the tag block ran against Enrichment
+    # (found no tag input, warned, continued) and the file block then ran
+    # against Add tags and died with "Could not find file input element". The
+    # browser upload path was completely non-functional.
+    #
+    # Identify each screen from the controls actually present instead. An
+    # unrecognised screen just gets a Next, so a future inserted step costs one
+    # loop iteration rather than breaking the run.
+    seen_steps: list[str] = []
+    setup_done = enrich_done = tags_done = file_done = map_done = False
 
-    # Part B: Answer "WHAT ARE YOU GOING TO ADD?" dropdown
-    # Opens a styled dropdown with options like:
-    #   - "Uploading a new list not in DataSift yet"
-    #   - "Adding properties to an existing list inside DataSift"
-    #   - "Adding properties to owners (requires m. address)"
-    try:
-        # Click the dropdown to open it
-        dropdown = page.locator('text="Select one option"')
-        if await dropdown.count() > 0:
-            await dropdown.first.click()
-            await page.wait_for_timeout(1500)
-            logger.debug("Opened upload type dropdown")
+    for _iteration in range(MAX_WIZARD_STEPS):
+        await page.wait_for_timeout(1200)
+        await _dismiss_popups(page)
+        step = await _classify_wizard_step(page)
+        seen_steps.append(step)
+        result["steps_seen"] = list(seen_steps)
+        logger.info("Wizard screen %d detected as: %s", len(seen_steps), step)
 
-            await _screenshot(page, "step1_dropdown_opened")
+        if step == "review":
+            await _screenshot(page, "wizard_review")
+            # GATE: never commit an upload whose required columns did not map.
+            # Tags drive the niche-sequential presets, so an untagged upload is
+            # worse than no upload — it lands records no sequence will work.
+            if result.get("unmapped_required"):
+                result["message"] = (
+                    "NOT finished — required column(s) never mapped: "
+                    f"{result['unmapped_required']}. Refusing to commit an untagged upload.")
+                logger.error(result["message"])
+                await _screenshot(page, "wizard_review_blocked")
+                return result
 
-            if existing_list:
-                # Select "Adding properties to an existing list inside DataSift"
-                existing_opt = page.locator('text="Adding properties to an existing list inside DataSift"')
-                if await existing_opt.count() > 0:
-                    await existing_opt.first.click()
-                    await page.wait_for_timeout(1500)
-                    logger.info("Selected 'Adding properties to an existing list inside DataSift'")
-                else:
-                    # Fallback: partial match
-                    existing_opt = page.locator('text="Adding properties to an existing list"')
-                    if await existing_opt.count() > 0:
-                        await existing_opt.first.click()
-                        await page.wait_for_timeout(1500)
-                        logger.info("Selected 'Adding properties to an existing list' (partial match)")
-            else:
-                # Select "Uploading a new list not in DataSift yet"
-                new_list = page.locator('text="Uploading a new list not in DataSift yet"')
-                if await new_list.count() > 0:
-                    await new_list.first.click()
-                    await page.wait_for_timeout(1500)
-                    logger.info("Selected 'Uploading a new list not in DataSift yet'")
-                else:
-                    # Fallback: try partial match
-                    new_list = page.locator('text="Uploading a new list"')
-                    if await new_list.count() > 0:
-                        await new_list.first.click()
-                        await page.wait_for_timeout(1500)
-                        logger.info("Selected 'Uploading a new list' (partial match)")
-    except Exception as e:
-        logger.warning("Dropdown selection: %s", e)
+            finish = page.locator('button:has-text("Finish Upload")')
+            if await finish.count() == 0:
+                result["message"] = "Review reached but no 'Finish Upload' button"
+                logger.error(result["message"])
+                return result
+            if not do_finish:
+                result["success"] = True
+                result["message"] = "Stopped at Review (do_finish=False) — nothing committed"
+                logger.info(result["message"])
+                return result
 
-    await _screenshot(page, "step1_setup_complete")
+            await finish.first.click()
+            await page.wait_for_timeout(8000)
+            await _screenshot(page, "wizard_finished")
+            break
 
-    # Part C: "LET'S STAY ORGANIZED" section + required list name
-    # These fields appear after selecting upload type.
+        if step == "setup" and not setup_done:
+            await _fill_wizard_setup(page, mode, list_name, existing_list, update_option)
+            setup_done = True
+            await _screenshot(page, "wizard_setup")
 
-    # Dismiss notifications popup AGAIN if still there (it blocks interactions)
-    try:
-        no_thanks = page.locator('button:has-text("NO, THANKS")')
-        if await no_thanks.count() > 0:
-            await no_thanks.first.click()
-            await page.wait_for_timeout(500)
-    except Exception as e:
-        logger.debug("Popup dismissal failed: %s", e)
+        elif step == "enrichment" and not enrich_done:
+            # Pass through untouched. "Enrich Owners" / "Swap Owners" must stay
+            # OFF or DataSift overwrites the PR/decision-maker mapping we built.
+            enrich_done = True
+            logger.info("Enrichment step: leaving every option at its default (owners NOT swapped)")
+            await _screenshot(page, "wizard_enrichment")
 
-    # "WHERE DID YOU PURCHASE THIS LIST?" — select "Other" or first option
-    try:
-        purchase_dropdown = page.locator('text="WHERE DID YOU PURCHASE THIS LIST?"').locator(
-            '..').locator('text="Select an option"')
-        if await purchase_dropdown.count() > 0:
-            await purchase_dropdown.first.click()
-            await page.wait_for_timeout(500)
-            # Select "Other" if available, otherwise first option
-            other = page.locator('text="Other"')
-            if await other.count() > 0:
-                await other.first.click()
-            else:
-                opts = page.locator('[class*="option"]')
-                if await opts.count() > 0:
-                    await opts.first.click()
-            await page.wait_for_timeout(500)
-    except Exception as e:
-        logger.debug("Purchase dropdown: %s", e)
+        elif step == "add_tags" and not tags_done:
+            # Per-record tags live in the CSV Tags column and are applied at the
+            # mapping step; nothing uniform to add here.
+            tags_done = True
+            await _screenshot(page, "wizard_add_tags")
 
-    # "DOES DATA CONTAIN PHONE NUMBERS?" — select "No"
-    try:
-        phone_dropdown = page.locator('text="DOES DATA CONTAIN PHONE NUMBERS?"').locator(
-            '..').locator('text="Select an option"')
-        if await phone_dropdown.count() > 0:
-            await phone_dropdown.first.click()
-            await page.wait_for_timeout(500)
-            no_opt = page.locator('text="No"')
-            if await no_opt.count() > 0:
-                await no_opt.first.click()
-            await page.wait_for_timeout(500)
-    except Exception as e:
-        logger.debug("Phone numbers dropdown: %s", e)
-
-    # "ASSOCIATE DATA WITH LIST" — enter or search for list name
-    try:
-        if existing_list:
-            # Existing list mode: styled dropdown showing "Select a list"
-            # Click the dropdown to open it, then select the target list
-            list_dropdown = page.locator('text="Select a list"')
-            if await list_dropdown.count() > 0:
-                await list_dropdown.first.click()
-                await page.wait_for_timeout(2000)
-                logger.debug("Opened existing list dropdown")
-                await _screenshot(page, "step1_list_dropdown_opened")
-
-                # Look for the target list name in the dropdown options
-                match = page.locator(f'text="{list_name}"')
-                if await match.count() > 0:
-                    # Click the last match (dropdown option, not the label)
-                    await match.last.click()
-                    await page.wait_for_timeout(1000)
-                    logger.info("Selected existing list: %s", list_name)
-                else:
-                    logger.warning("List '%s' not found in dropdown", list_name)
-                    await _screenshot(page, "step1_list_not_found")
-            else:
-                # Fallback: try searching for existing list via input
-                list_input = page.locator(
-                    'input[placeholder*="Search"], '
-                    'input[placeholder*="list"]'
-                )
-                if await list_input.count() > 0:
-                    await list_input.first.fill(list_name or "")
-                    await page.wait_for_timeout(2000)
-                    match = page.locator(f'text="{list_name}"')
-                    if await match.count() > 0:
-                        await match.last.click()
-                        await page.wait_for_timeout(1000)
-                        logger.info("Selected existing list via search: %s", list_name)
-        else:
-            # New list mode: type a new list name
-            list_input = page.locator('input[placeholder*="Enter new list name"], input[placeholder*="list name"]')
-            if await list_input.count() > 0:
-                if list_name is None:
-                    from datetime import datetime as _dt
-                    list_name = f"SiftStack {_dt.now().strftime('%Y-%m-%d')}"
-                await list_input.first.fill(list_name)
-                logger.info("Set list name: %s", list_name)
-                await page.wait_for_timeout(500)
-    except Exception as e:
-        logger.debug("List name input: %s", e)
-
-    await _screenshot(page, "step1_form_filled")
-
-    # Click "Next Step" to proceed to step 2
-    if not await _click_next_step(page, timeout=30000):
-        result["message"] = "Wizard Step 1→2 'Next Step' click failed"
-        logger.error(result["message"])
-        await _screenshot(page, "step1_next_failed")
-        return result
-
-    # ── Wizard Step 2: Add tags ──
-    logger.info("Wizard Step 2: Adding 'Courthouse Data' tag...")
-    await page.wait_for_timeout(1000)
-    await _screenshot(page, "step2_tags")
-
-    # Add "Courthouse Data" tag via the Custom Tags input on the right side
-    try:
-        tag_input = page.locator('input[placeholder*="Search or add a new tag"]')
-        if await tag_input.count() > 0:
-            # Click input first, then type to trigger autocomplete dropdown
-            await tag_input.first.click()
-            await page.wait_for_timeout(500)
-            await tag_input.first.fill("")
-            await page.wait_for_timeout(300)
-            await tag_input.first.type("Courthouse Data", delay=50)
-            await page.wait_for_timeout(1500)
-            await _screenshot(page, "step2_tag_typed")
-
-            # Check if "Courthouse Data" appears in autocomplete dropdown — click it
-            tag_option = page.locator('text="Courthouse Data"')
-            tag_count = await tag_option.count()
-            if tag_count > 1:
-                # Multiple matches — click the one in the dropdown (not the input)
-                await tag_option.nth(1).click()
+        elif step == "upload_file" and not file_done:
+            fi = page.locator('input[type="file"]')
+            if await fi.count() == 0:
+                result["message"] = "Upload-file step reached but no file input present"
+                logger.error(result["message"])
+                return result
+            await fi.first.set_input_files(str(csv_path))
+            for _ in range(30):
                 await page.wait_for_timeout(1000)
-                logger.info("Selected 'Courthouse Data' from dropdown")
-            elif tag_count == 1:
-                # Check if it's the input value or a dropdown option
-                tag_box = await tag_option.first.bounding_box()
-                if tag_box and tag_box["y"] > 350:
-                    # It's below the input — it's a dropdown option
-                    await tag_option.first.click()
-                    await page.wait_for_timeout(1000)
-                    logger.info("Selected 'Courthouse Data' from dropdown")
-                else:
-                    # It's the input itself — use JS to click "Add" or press Enter
-                    await tag_input.first.press("Enter")
-                    await page.wait_for_timeout(1000)
-                    logger.info("Added 'Courthouse Data' tag (via Enter)")
-            else:
-                # No dropdown match — click "Add" via JS to create new tag
-                added = await page.evaluate('''() => {
-                    const els = document.querySelectorAll('span, div, a, button, p');
-                    for (const el of els) {
-                        const text = el.textContent.trim();
-                        const rect = el.getBoundingClientRect();
-                        if (text === "Add" && rect.width > 0 && rect.width < 60
-                            && rect.x > 700 && rect.y > 250 && rect.y < 400) {
-                            el.click();
-                            return true;
-                        }
-                    }
-                    return false;
-                }''')
-                if added:
-                    await page.wait_for_timeout(1000)
-                    logger.info("Created 'Courthouse Data' tag via Add button")
-                else:
-                    await tag_input.first.press("Enter")
-                    await page.wait_for_timeout(1000)
-                    logger.info("Added 'Courthouse Data' tag (via Enter fallback)")
+                if (await page.locator('text="File uploaded!"').count() > 0
+                        or await page.locator('text="100%"').count() > 0):
+                    break
+            file_done = True
+            await _screenshot(page, "wizard_file")
 
-            await _screenshot(page, "step2_tag_added")
-        else:
-            logger.warning("Tag input not found — 'Courthouse Data' tag NOT added")
-    except Exception as e:
-        logger.warning("Tag addition failed: %s", e)
+        elif step == "map_columns" and not map_done:
+            mapped, unmapped = await _map_wizard_columns(page)
+            result["columns_mapped"] = mapped
+            result["columns_unmapped"] = unmapped
+            result["unmapped_required"] = [c for c in REQUIRED_MAPPED_COLUMNS if c in unmapped]
+            map_done = True
+            await _screenshot(page, "wizard_mapped")
 
-    if not await _click_next_step(page):
-        result["message"] = "Wizard Step 2→3 'Next Step' click failed"
-        logger.error(result["message"])
-        await _screenshot(page, "step2_next_failed")
-        return result
-
-    # ── Wizard Step 3: Upload the file ──
-    logger.info("Wizard Step 3: Uploading CSV file: %s", csv_path.name)
-    await page.wait_for_timeout(3000)
-    await _screenshot(page, "step3_before_upload")
-
-    try:
-        file_input = page.locator('input[type="file"]')
-        # Retry with increasing waits for slow SPA rendering
-        for wait in [3000, 5000, 8000]:
-            if await file_input.count() > 0:
-                break
-            logger.debug("File input not found, waiting %dms...", wait)
-            await page.wait_for_timeout(wait)
-            file_input = page.locator('input[type="file"]')
-
-        if await file_input.count() > 0:
-            await file_input.first.set_input_files(str(csv_path))
-            logger.info("CSV file selected: %s", csv_path.name)
-            await page.wait_for_timeout(3000)
-        else:
-            await _screenshot(page, "step3_no_file_input")
-            result["message"] = "Could not find file input element"
+        if not await _click_next_step(page):
+            result["message"] = f"No clickable 'Next Step' on the {step} screen"
             logger.error(result["message"])
+            await _screenshot(page, f"wizard_{step}_next_failed")
             return result
-    except Exception as e:
-        result["message"] = f"File upload failed: {e}"
+    else:
+        result["message"] = f"Wizard did not reach Review within {MAX_WIZARD_STEPS} screens"
         logger.error(result["message"])
         return result
 
-    await _screenshot(page, "step3_file_uploaded")
-    if not await _click_next_step(page):
-        result["message"] = "Wizard Step 3→4 'Next Step' click failed"
-        logger.error(result["message"])
-        await _screenshot(page, "step3_next_failed")
-        return result
-
-    # ── Wizard Step 4: Map the columns ──
-    logger.info("Wizard Step 4: Column mapping — mapping Tags and Lists...")
-    await page.wait_for_timeout(3000)
-    await _screenshot(page, "step4_column_mapping")
-
-    # Try to drag unmapped columns (left side) to their targets (right side)
-    # DataSift uses styled-components with draggable="false" — need slow mouse drag
-    async def _drag_column(source_el, target_el):
-        """Drag a CSV column card to a mapping target using slow mouse moves."""
-        src_box = await source_el.bounding_box()
-        dst_box = await target_el.bounding_box()
-        if not src_box or not dst_box:
-            return False
-        sx = src_box["x"] + src_box["width"] / 2
-        sy = src_box["y"] + src_box["height"] / 2
-        dx = dst_box["x"] + dst_box["width"] / 2
-        dy = dst_box["y"] + dst_box["height"] / 2
-        await page.mouse.move(sx, sy)
-        await page.wait_for_timeout(500)
-        await page.mouse.down()
-        await page.wait_for_timeout(500)
-        steps = 20
-        for i in range(1, steps + 1):
-            frac = i / steps
-            await page.mouse.move(
-                sx + (dx - sx) * frac,
-                sy + (dy - sy) * frac,
-            )
-            await page.wait_for_timeout(50)
-        await page.wait_for_timeout(500)
-        await page.mouse.up()
-        await page.wait_for_timeout(1000)
-        return True
-
-    # Map Tags column: find "Tags" card on left, drag to "Tags" target on right
-    for col_name in ["Tags", "Lists"]:
-        try:
-            # Source: unmapped column card on the left (contains column name + sample data)
-            source = page.locator(f'div:has-text("{col_name}") >> visible=true').first
-            # Target: mapping slot on the right side (search for it)
-            # Right-side targets have the field name — search within right panel area
-            target = page.locator(f'text="{col_name}"').last
-            if await source.count() > 0 and await target.count() > 0:
-                src_box = await source.bounding_box()
-                tgt_box = await target.bounding_box()
-                # Ensure source is on left (<600px) and target is on right (>600px)
-                if src_box and tgt_box and src_box["x"] < 600 and tgt_box["x"] > 600:
-                    if await _drag_column(source, target):
-                        logger.info("Mapped column: %s", col_name)
-                        await page.wait_for_timeout(1000)
-                    else:
-                        logger.warning("Drag failed for column: %s", col_name)
-                else:
-                    logger.debug("Column %s: no valid source/target positions", col_name)
-            else:
-                logger.debug("Column %s: source or target not found", col_name)
-        except Exception as e:
-            logger.warning("Column mapping %s failed: %s", col_name, e)
-
-    await _screenshot(page, "step4_after_mapping")
-
-    # Click Next Step to proceed past mapping
-    if not await _click_next_step(page):
-        result["message"] = "Wizard Step 4→5 'Next Step' click failed"
-        logger.error(result["message"])
-        await _screenshot(page, "step4_next_failed")
-        return result
-    await _screenshot(page, "step4_mapping_done")
-
-    # ── Wizard Step 5: Review ──
-    logger.info("Wizard Step 5: Review and finish upload...")
-    await page.wait_for_timeout(2000)
-    await _screenshot(page, "step5_review")
-
-    await _dismiss_popups(page)
+    # Confirm the upload registered.
+    #
+    # DataSift processes the import ASYNCHRONOUSLY, so a success banner is not
+    # guaranteed to appear at all. Treating its absence as failure is actively
+    # harmful: a verified run (list created, record present, all 6 tags applied)
+    # still reported "data likely did not land", and an operator acting on that
+    # would re-upload and duplicate. The reliable signal that Finish was
+    # ACCEPTED is the wizard closing.
+    result["success"] = True
     try:
-        finish_btn = page.locator(
-            'button:has-text("Finish Upload"), '
-            '[role="button"]:has-text("Finish Upload"), '
-            '[class*="Button"]:has-text("Finish Upload"), '
-            'button:has-text("Finish"), '
-            '[role="button"]:has-text("Finish"), '
-            '[class*="Button"]:has-text("Finish"), '
-            'button:has-text("Submit"), '
-            '[role="button"]:has-text("Submit")'
-        )
-        if await finish_btn.count() > 0:
-            try:
-                await finish_btn.first.click(force=True)
-            except Exception as e:
-                logger.debug("Finish force click failed (%s) — JS fallback", e)
-                handle = await finish_btn.first.element_handle()
-                await page.evaluate("el => el.click()", handle)
-            logger.info("Clicked Finish Upload")
-        else:
-            await _screenshot(page, "step5_no_finish_btn")
-            result["message"] = "Finish Upload button not found — upload did not land"
-            logger.error(result["message"])
-            return result
-    except Exception as e:
-        result["message"] = f"Finish step failed: {e}"
-        logger.error(result["message"])
-        await _screenshot(page, "step5_finish_error")
-        return result
-
-    # Wait for processing confirmation — success only if confirmation actually appears
-    try:
-        success_indicator = page.locator(
-            'text="Upload Complete", '
-            'text="successfully", '
-            'text="records imported", '
-            'text="records added", '
-            'text="records uploaded"'
-        )
-        await success_indicator.first.wait_for(timeout=60000)
-        success_text = await success_indicator.first.text_content()
-        result["success"] = True
-        result["message"] = success_text or "Upload completed"
-        logger.info("DataSift upload complete: %s", result["message"])
+        banner = page.get_by_text(
+            re.compile(r"Upload Complete|successfully|records (imported|added|uploaded)",
+                       re.IGNORECASE))
+        await banner.first.wait_for(timeout=20000)
+        result["message"] = (await banner.first.text_content()) or "Upload completed"
+        logger.info("DataSift upload confirmed: %s", result["message"])
     except PwTimeout:
-        await _screenshot(page, "step5_timeout")
-        result["success"] = False
-        result["message"] = "Upload did not confirm success within 60s — data likely did not land"
-        logger.error(result["message"])
-        await _save_cookies(page)
-        return result
+        await page.wait_for_timeout(3000)
+        wizard_open = await page.locator('button:has-text("Finish Upload")').count() > 0
+        if wizard_open:
+            result["success"] = False
+            result["message"] = ("Clicked 'Finish Upload' but the wizard is still open — "
+                                 "the upload was NOT accepted")
+            logger.error(result["message"])
+            await _screenshot(page, "wizard_finish_rejected")
+        else:
+            result["message"] = ("Finish accepted; wizard closed. No banner appeared — DataSift "
+                                 "imports asynchronously, so confirm in the Activity tab. "
+                                 "Do NOT re-upload on the strength of a missing banner.")
+            logger.info(result["message"])
 
     await _save_cookies(page)
     return result
+
+
+# ── Wizard step machine helpers ───────────────────────────────────────
+# Selectors below come from a live DOM capture of the mapping screen
+# (src/wizard_discover.py, 2026-08-11), NOT from guesswork. The previous
+# implementation used `div:has-text("Tags")`, which in Playwright also matches
+# every ANCESTOR div, so `.first` returned a page-level container and the drag
+# began from the middle of the page. Its partner `text="Tags"`.last was equally
+# unsafe: three exact-text "Tags" nodes exist on that screen (sidebar nav at
+# x=54, the source card at x=413, the drop target at x=893).
+MAX_WIZARD_STEPS = 12
+
+# Columns whose mapping is NOT optional. Tags drive the niche-sequential
+# presets; Lists routes the record. Committing without them yields records no
+# sequence can act on, which is worse than a failed upload.
+REQUIRED_MAPPED_COLUMNS = ("Tags", "Lists")
+
+_FOREIGN_NAME = '[class*="UploadModalForeignColumnName"]'   # our CSV's columns
+_OWN_NAME = '[class*="UploadModalOwnColumnName"]'           # DataSift's fields
+
+
+async def _classify_wizard_step(page: Page) -> str:
+    """Identify the current wizard screen from the controls present.
+
+    Precedence matters: every screen renders the step NAV, so the words
+    "Enrichment", "Add tags" and "Map the columns" appear on ALL of them.
+    Match on unique controls and on the screen's own heading first.
+    """
+    if await page.locator('button:has-text("Finish Upload")').count() > 0:
+        return "review"
+    # Detect the mapping screen STRUCTURALLY, by the column cards themselves.
+    # Matching its heading text failed: `text="..."` is an EXACT match in
+    # Playwright and the real heading ("Drag the corresponding column uploaded
+    # in your CSV...") is longer, so the screen came back "unknown" and the
+    # mapping step was silently skipped.
+    # Two signals: the column cards themselves, OR the screen's instruction text.
+    # The structural check alone misses a mapping screen where EVERY column
+    # already auto-mapped (no foreign cards left), which is what happens on the
+    # phone-upload path — that screen came back "unknown" and was skipped.
+    # get_by_text does substring matching, unlike `text="..."` which is exact.
+    if await page.locator(_FOREIGN_NAME).count() > 0:
+        return "map_columns"
+    if await page.get_by_text("Drag the corresponding column").count() > 0:
+        return "map_columns"
+    if await page.locator('input[placeholder*="Search or add a new tag"]').count() > 0:
+        return "add_tags"
+    if await page.locator('input[type="file"]').count() > 0:
+        return "upload_file"
+    if await page.locator('text="Configure data enrichment options"').count() > 0:
+        return "enrichment"
+    if await page.locator('text="Property Enrichment"').count() > 0:
+        return "enrichment"
+    if (await page.locator('input[placeholder*="Enter new list name"]').count() > 0
+            or await page.locator('text="What are you looking to do?"').count() > 0):
+        return "setup"
+    return "unknown"
+
+
+async def _fill_wizard_setup(page: Page, mode: str, list_name: str | None,
+                             existing_list: bool, update_option: str = "") -> None:
+    """Complete the Setup screen.
+
+    Without the Add/Update choice DataSift keeps 'Next Step' DISABLED and
+    reports "You haven't selected one of the upload options" — exactly where a
+    discovery walk stalled.
+
+    The two branches differ in shape (confirmed by a read-only probe):
+      Add Data    -> a "Select one option" dropdown, then a list name.
+      Update Data -> NO dropdown. A flat option list under "What are you going
+                     to update?", e.g. "Upload phone numbers by property
+                     address", "Tagging phones by phone numbers". Pass the exact
+                     option text as ``update_option``.
+    """
+    label = "Update Data" if mode == "update" else "Add Data"
+    btn = page.locator(f'button:has-text("{label}")')
+    if await btn.count() > 0:
+        await btn.first.click()
+        await page.wait_for_timeout(1500)
+
+    if mode == "update":
+        if not update_option:
+            raise ValueError("mode='update' needs update_option (the exact wizard option text)")
+        opt = page.locator(f'text="{update_option}"')
+        if await opt.count() == 0:
+            raise RuntimeError(f"Update option {update_option!r} not offered by the wizard")
+        # The option is a styled CHECKBOX label and Modalstyles__ModalBody
+        # intercepts pointer events, so a normal click retries forever. JS click
+        # on the element itself is the documented workaround for this UI.
+        try:
+            await opt.first.click(timeout=5000)
+        except Exception:
+            await opt.first.evaluate(
+                "e => (e.closest('label') || e.parentElement || e).click()")
+        await page.wait_for_timeout(1500)
+        logger.info("Update mode: %s", update_option)
+        return
+
+    dd = page.locator('text="Select one option"')
+    if await dd.count() > 0:
+        await dd.first.click()
+        await page.wait_for_timeout(900)
+        option = ("Adding properties to an existing list" if existing_list
+                  else "Uploading a new list not in DataSift yet")
+        opt = page.locator(f'text="{option}"')
+        if await opt.count() > 0:
+            await opt.first.click()
+            await page.wait_for_timeout(900)
+
+    for question, answer in (("WHERE DID YOU PURCHASE THIS LIST?", "Other"),
+                             ("DOES DATA CONTAIN PHONE NUMBERS?", "No")):
+        try:
+            sel = page.locator(f'text="{question}"').locator('..').locator('text="Select an option"')
+            if await sel.count() > 0:
+                await sel.first.click()
+                await page.wait_for_timeout(400)
+                ans = page.locator(f'text="{answer}"')
+                if await ans.count() > 0:
+                    await ans.first.click()
+                await page.wait_for_timeout(400)
+        except Exception:
+            pass
+
+    if list_name:
+        li = page.locator(
+            'input[placeholder*="Enter new list name"], input[placeholder*="list name"]')
+        if await li.count() > 0:
+            await li.first.fill(list_name)
+            await page.wait_for_timeout(400)
+
+
+async def _unmapped_column_names(page: Page) -> list[str]:
+    """Names still sitting in the left 'your CSV columns' list."""
+    return await page.evaluate(
+        "(sel) => [...document.querySelectorAll(sel)]"
+        ".map(e => (e.textContent || '').trim()).filter(Boolean)", _FOREIGN_NAME)
+
+
+async def _drag_card(page: Page, source, target) -> bool:
+    """Slow manual mouse drag.
+
+    The cards carry draggable="false" (React DnD), so Playwright's native
+    drag_to() does nothing — verified in the live DOM capture, where all 82
+    elements reported draggable=false.
+    """
+    # These panels scroll internally; scroll_into_view_if_needed does not move
+    # them, so use JS (same pattern as the filter panel).
+    for el in (source, target):
+        try:
+            await el.evaluate("e => e.scrollIntoView({behavior:'instant', block:'center'})")
+            await page.wait_for_timeout(250)
+        except Exception:
+            return False
+
+    src_box = await source.bounding_box()
+    dst_box = await target.bounding_box()
+    if not src_box or not dst_box:
+        return False
+
+    sx = src_box["x"] + src_box["width"] / 2
+    sy = src_box["y"] + src_box["height"] / 2
+    dx = dst_box["x"] + dst_box["width"] / 2
+    dy = dst_box["y"] + dst_box["height"] / 2
+
+    await page.mouse.move(sx, sy)
+    await page.wait_for_timeout(300)
+    await page.mouse.down()
+    await page.wait_for_timeout(400)
+    steps = 20
+    for i in range(1, steps + 1):
+        frac = i / steps
+        await page.mouse.move(sx + (dx - sx) * frac, sy + (dy - sy) * frac)
+        await page.wait_for_timeout(45)
+    await page.wait_for_timeout(400)
+    await page.mouse.up()
+    await page.wait_for_timeout(900)
+    return True
+
+
+async def _map_wizard_columns(page: Page) -> tuple[list[str], list[str]]:
+    """Drag every unmapped CSV column onto the DataSift field of the same name.
+
+    Returns (mapped, still_unmapped).
+
+    Core address fields auto-map and never appear in the left list. Everything
+    else — Tags and Lists in particular — must be dragged manually; they do NOT
+    auto-map even though the header text matches exactly.
+
+    Success is VERIFIED, not assumed: a mapped column is consumed from the left
+    list, so the name disappearing is proof the drop landed. The old code
+    returned True as soon as it obtained a bounding box and logged
+    "Mapped column: Tags" after dragging the wrong element to the wrong place.
+    """
+    mapped: list[str] = []
+    pending = await _unmapped_column_names(page)
+    logger.info("Column mapping: %d unmapped column(s) on the left: %s",
+                len(pending), pending[:12])
+
+    for name in list(pending):
+        source = page.locator(f'{_FOREIGN_NAME}:text-is("{name}")')
+        target = page.locator(f'{_OWN_NAME}:text-is("{name}")')
+        if await source.count() == 0:
+            continue
+        if await target.count() == 0:
+            logger.info("  %s: no DataSift field of that name — leaving unmapped", name)
+            continue
+
+        for attempt in (1, 2):
+            if not await _drag_card(page, source.first, target.first):
+                continue
+            remaining = await _unmapped_column_names(page)
+            if name not in remaining:
+                mapped.append(name)
+                logger.info("  mapped %r (verified: consumed from the CSV column list)", name)
+                break
+            logger.warning("  %s: drop did not register (attempt %d/2)", name, attempt)
+
+    still = await _unmapped_column_names(page)
+    missing_required = [c for c in REQUIRED_MAPPED_COLUMNS if c in still]
+    if missing_required:
+        logger.error("REQUIRED column(s) still unmapped: %s — the upload will be blocked "
+                     "at Review rather than committed untagged", missing_required)
+    logger.info("Column mapping done: %d mapped, %d left unmapped", len(mapped), len(still))
+    return mapped, still
 
 
 DATASIFT_RECORDS_URL = "https://app.reisift.io/records/properties"

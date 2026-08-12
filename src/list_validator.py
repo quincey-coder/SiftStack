@@ -160,6 +160,13 @@ def _canonical_datasift_columns() -> list[str] | None:
 # custom-field labels — no alias needed there.)
 _HEADER_ALIASES = {
     "Business Name": "FULL NAME/COMPANY/TRUST",
+    # 2026-08-11: renamed to the names DataSift actually accepts as drop
+    # targets. "Parcel ID" and "Tax Deliquent Value" had no target at all, so
+    # those columns were silently discarded on every upload.
+    "Parcel ID": "APN",
+    "Tax Deliquent Value": "Back Taxes Amount",
+    # Held a COUNT of years delinquent, never a calendar year.
+    "Tax Delinquent Year": "Years Delinquent",
 }
 
 
