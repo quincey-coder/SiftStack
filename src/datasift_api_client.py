@@ -1,8 +1,26 @@
 """RAWPIPE — direct HTTP client for DataSift's internal API.
 
-Replaces the Playwright wizard at src/datasift_uploader.py for uploads.
-Same input (a CSV path + list name + tags); roughly 100x faster and far
-less fragile because there is no UI in the loop.
+=====================================================================
+READ-ONLY BY OWNER POLICY (2026-08-12).
+
+This API client must NEVER upload, edit, tag, or delete anything in
+DataSift. It exists to READ: search/export records, list lists/tags/
+statuses/sequences, read custom fields, and preview skip-trace cost
+estimates. Every write path below is hard-blocked at runtime (see
+`_enforce_read_only`) and raises DataSiftReadOnlyError.
+
+All CRM mutations go through the DataSift upload wizard (manual or the
+Playwright UI automation in datasift_uploader.py) — never this client.
+The block can only be lifted for a one-off by the owner explicitly
+setting DATASIFT_API_ALLOW_WRITES=1; do not do that on your own.
+
+Context: an unscoped API delete wiped the whole account on 2026-07-14.
+=====================================================================
+
+Historical note: this client originally replaced the Playwright wizard
+for uploads (roughly 100x faster). That upload path is now blocked by
+the policy above; the code is kept for reference and for the one-off
+override, but the supported upload paths are the wizard/Playwright.
 
 Discovered via reverse-engineering on 2026-05-17. Endpoints used:
 
@@ -30,6 +48,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -41,6 +60,18 @@ logger = logging.getLogger(__name__)
 # ── Constants ─────────────────────────────────────────────────────────
 
 API_BASE = "https://apiv2.reisift.io"
+
+# Owner policy: the API is read-only. Writes raise DataSiftReadOnlyError
+# unless the owner explicitly sets DATASIFT_API_ALLOW_WRITES=1 for a
+# one-off. Default is LOCKED.
+READ_ONLY = os.getenv("DATASIFT_API_ALLOW_WRITES", "").strip().lower() not in (
+    "1", "true", "yes"
+)
+
+# POST endpoints that are semantically pure reads (verified: no mutation).
+_POST_READ_ALLOWLIST = frozenset({
+    "/api/internal/upload/usage/",   # returns plan usage / parsed line count
+})
 
 # This UI-version string is sent on every request. Missing it returns 403.
 # It can go stale if DataSift bumps it server-side; if every call starts
@@ -78,6 +109,25 @@ class DataSiftAPIError(Exception):
         self.body = body
         self.url = url
         super().__init__(f"DataSift API {status} on {url}: {body[:300]}")
+
+
+class DataSiftReadOnlyError(RuntimeError):
+    """A write was attempted through the read-only API client.
+
+    Owner policy (2026-08-12): the DataSift API is for READS ONLY —
+    never upload, edit, tag, or delete via the API. CRM writes go
+    through the DataSift upload wizard (manual or Playwright UI), not
+    this client.
+    """
+
+    def __init__(self, method: str, path: str):
+        super().__init__(
+            f"READ-ONLY: blocked {method} {path}. The DataSift API client is "
+            "read-only by owner policy — the API must never upload, edit, or "
+            "delete anything; reads/exports only. Use the DataSift upload "
+            "wizard (UI/Playwright) for any write. A one-off override "
+            "requires the owner explicitly setting DATASIFT_API_ALLOW_WRITES=1."
+        )
 
 
 # ── Client ────────────────────────────────────────────────────────────
@@ -202,9 +252,42 @@ class DataSiftAPIClient:
         except (OSError, json.JSONDecodeError):
             return None
 
+    # ─── Read-only enforcement ───────────────────────────────────
+
+    @staticmethod
+    def _enforce_read_only(method: str, path: str, kw: dict) -> None:
+        """Raise DataSiftReadOnlyError on any mutating request.
+
+        Allowed through the guard:
+          - GET / HEAD / OPTIONS
+          - POSTs tunneled as reads via X-HTTP-Method-Override: GET
+            (the records search endpoint works this way)
+          - the explicit _POST_READ_ALLOWLIST
+          - skip-trace with estimate=1 (a cost PREVIEW: no billing, no
+            mutation — the real run has no estimate flag and is blocked)
+        """
+        if not READ_ONLY:
+            logger.warning(
+                "DATASIFT_API_ALLOW_WRITES is set — read-only guard BYPASSED "
+                "for %s %s", method, path,
+            )
+            return
+        if method.upper() in ("GET", "HEAD", "OPTIONS"):
+            return
+        headers = kw.get("headers") or {}
+        for k, v in headers.items():
+            if str(k).lower() == "x-http-method-override" and str(v).upper() == "GET":
+                return
+        if path in _POST_READ_ALLOWLIST:
+            return
+        if path.rstrip("/").endswith("/skip-trace") and (kw.get("json") or {}).get("estimate"):
+            return
+        raise DataSiftReadOnlyError(method, path)
+
     # ─── Core request wrapper with 401 retry ─────────────────────
 
     def _request(self, method: str, path: str, **kw) -> requests.Response:
+        self._enforce_read_only(method, path, kw)
         url = f"{API_BASE}{path}" if path.startswith("/") else path
         resp = self._session.request(method, url, timeout=30, **kw)
         if resp.status_code == 401 and self._refresh:
@@ -330,6 +413,7 @@ class DataSiftAPIClient:
         `owner_uuids` list. Passing neither raises (the backend rejects an
         empty filter anyway, but we fail louder and earlier).
         """
+        self._enforce_read_only("POST", "/api/internal/owner/delete/", {})
         if not must and not owner_uuids:
             raise ValueError(
                 "delete_owners needs a `must` filter or `owner_uuids`; "
@@ -349,6 +433,7 @@ class DataSiftAPIClient:
         property_uuids: list[str] | None = None,
     ) -> dict:
         """Delete property/seller records. DESTRUCTIVE — no undo. See delete_owners."""
+        self._enforce_read_only("POST", "/api/internal/property/delete/", {})
         if not must and not property_uuids:
             raise ValueError(
                 "delete_properties needs a `must` filter or `property_uuids`; "
@@ -511,6 +596,10 @@ class DataSiftAPIClient:
         Returns:
             {success, storage_key, list_name, suggested_mapping, line_count}
         """
+        # Fail BEFORE touching the network — without this, the presigned-URL
+        # GET and the raw S3 POST would both succeed and only the final
+        # commit would be blocked by the central guard.
+        self._enforce_read_only("POST", "/api/internal/upload/", {})
         csv_path = Path(csv_path)
         if not csv_path.exists():
             raise FileNotFoundError(f"CSV not found: {csv_path}")

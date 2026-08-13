@@ -619,9 +619,31 @@ Courthouse probate records have decedent name + PR/executor name but NO property
 
 ## DataSift.ai (REISift) Integration
 
-DataSift.ai (formerly REISift) is the CRM where scraped records land for niche sequential marketing campaigns. There is **no REST API** — upload is via Playwright browser automation of the web UI.
+DataSift.ai (formerly REISift) is the CRM where scraped records land for niche sequential marketing campaigns. There is no public REST API — the reverse-engineered internal API exists (`src/datasift_api_client.py`, `apiv2.reisift.io`) but is **READ-ONLY by owner policy**; all writes go through the upload wizard (manual CSV or Playwright browser automation of the web UI).
 
 **Domain:** `app.reisift.io` (NOT `app.datasift.ai`). API at `apiv2.reisift.io`.
+
+### ⚠️ The internal API is READ-ONLY — owner policy (2026-08-12)
+
+The `DataSiftAPIClient` must **never upload, edit, tag, or delete anything**.
+It exists to READ: `search_records` (records by filter, for export),
+`list_lists`/`list_tags`/`get_statuses`/`list_sequences`, custom-field reads,
+and the free skip-trace **cost estimate**. Every write path is hard-blocked at
+runtime (`_enforce_read_only` raises `DataSiftReadOnlyError` before any
+network I/O — verified offline 17/17). Context: an unscoped API delete wiped
+the whole account on 2026-07-14.
+
+- Do NOT bypass the guard, hit the endpoints with raw `requests`, or set
+  `DATASIFT_API_ALLOW_WRITES=1` without the owner's explicit instruction for a
+  specific one-off.
+- CRM mutations (uploads, tags, sequences, deletes) go through the DataSift
+  upload wizard / UI — manually or via `datasift_uploader.py` (Playwright).
+- The API-upload path in `main.py` (`--upload-datasift-api` /
+  `upload_datasift_api`) is dormant: `false` in the production schedule, and
+  the client now blocks it anyway (it falls back to the Playwright path).
+- Read-driven workflow this enables: export records matching a filter (e.g.
+  "smart-skipped + direct-skipped" preset) → run SmartSkip/DirectSkip/Trestle
+  outside the CRM → build the upload CSV → upload via the wizard.
 
 ### Key Files
 - `src/datasift_formatter.py` — Transforms `NoticeData` → DataSift CSV (64 columns)
