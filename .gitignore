@@ -47,7 +47,10 @@ storage/
 test_photos/
 
 # Skills distribution ZIPs (large, distributed separately)
-Skills for REI/
+Skills for REI/*
+# ...except the DirectSkip skill SOURCE (SKILL.md + references + scripts),
+# tracked so it syncs across devices; the packaged ZIPs stay out via *.skill
+!Skills for REI/directskip-datasift-clean/
 *.skill
 *.plugin
 
