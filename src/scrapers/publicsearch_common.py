@@ -106,6 +106,25 @@ async def verify_window_applied(
     return True, evidence
 
 
+def build_results_url(
+    base: str, doc_type_codes: str, from_date: datetime, to_date: datetime
+) -> str:
+    """Build the parameterized GovOS results URL directly (no form).
+
+    A FRESH page.goto of this URL runs the query with these exact params
+    (verified live, Bell 2026-08-19: 7 results, all in-window). Only a fresh
+    load works — after a form search the SPA rewrites the URL from its stored
+    session state, which is why URL surgery mid-session failed.
+    """
+    from urllib.parse import quote
+
+    return (
+        f"{base}/results?department=RP&docTypes={quote(doc_type_codes, safe='')}"
+        f"&recordedDateRange={from_date:%Y%m%d}%2C{to_date:%Y%m%d}"
+        f"&searchType=advancedSearch"
+    )
+
+
 def force_window_url(current_url: str, from_date: datetime, to_date: datetime) -> str | None:
     """Rewrite a GovOS results URL to carry the requested recorded-date window.
 

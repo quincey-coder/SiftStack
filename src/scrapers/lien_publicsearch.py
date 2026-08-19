@@ -64,6 +64,11 @@ LIEN_DOC_TYPE_NAMES = [
     "CHILD SUPPORT",
 ]
 
+# URL codes for the SAME doc types, captured live from the form-built results
+# URL (Bell 2026-08-19). Used by the direct results-URL primary path; the form
+# flow remains the fallback that would surface any future code drift.
+LIEN_DOC_TYPE_CODES = "T38,FTL,T580,T8,T114,T156"
+
 _DISMISS_JS = """() => {
   // Beamer / NPS overlays.
   ['#beamerPushModal', '#npsIframeContainer', '.beamer_overlay',
@@ -403,11 +408,42 @@ class _PublicSearchLienScraper:
             page.set_default_timeout(45000)
 
             try:
+                # PRIMARY PATH (2026-08-19): navigate straight to the
+                # parameterized results URL on a FRESH page. The advanced form
+                # silently drops the typed date range from its query in the
+                # cloud (the query ran with the default 16000101..yesterday
+                # range while the inputs displayed ours), and URL surgery
+                # after a form search gets rewritten from the SPA's stored
+                # session state. A fresh load with the params honors them —
+                # verified live (Bell, 7 in-window results). The form flow
+                # below survives as the FALLBACK, e.g. if the county
+                # re-indexes and the doc-type codes drift.
+                from scrapers.publicsearch_common import (
+                    build_results_url, verify_window_applied,
+                )
+                label = f"{self.COUNTY} lien"
+                self.last_meta = {"window_days": (to_date - from_date).days + 1}
+                window_ok = False
+                direct = build_results_url(base, LIEN_DOC_TYPE_CODES, from_date, to_date)
+                await page.goto(direct, wait_until="domcontentloaded")
+                if await _wait_for_results(page):
+                    self.last_meta["results_url"] = page.url
+                    ok, evidence = await verify_window_applied(
+                        page, from_date, to_date, label
+                    )
+                    self.last_meta.update(evidence)
+                    window_ok = ok
+                if not window_ok:
+                    logger.warning(
+                        "%s: direct results URL did not verify — falling back "
+                        "to the advanced-search form flow", label,
+                    )
+
                 # Load the advanced-search form, with a reload retry — the SPA
                 # render time varies by county (Williamson is notably slower than
                 # Bell) and an occasional cold load needs a second attempt.
                 form_ok = False
-                for attempt in range(2):
+                for attempt in range(0 if window_ok else 2):
                     await page.goto(f"{base}/search/advanced", wait_until="domcontentloaded")
                     try:
                         await page.wait_for_selector("#recordedDateRange-start", timeout=40000)
@@ -419,7 +455,7 @@ class _PublicSearchLienScraper:
                             self.COUNTY, attempt + 1,
                         )
                         await page.wait_for_timeout(3000)
-                if not form_ok:
+                if not form_ok and not window_ok:
                     # Distinguish a genuine anti-bot / slow-SPA miss from a
                     # source-side change. As of 2026-06-30 the Williamson portal
                     # migrated vendors ("Powered By neumo") and now offers only a
@@ -465,16 +501,13 @@ class _PublicSearchLienScraper:
                 from scrapers.publicsearch_common import verify_window_applied
                 from scrapers.debug_capture import dump_page
 
-                label = f"{self.COUNTY} lien"
-                self.last_meta = {"window_days": (to_date - from_date).days + 1}
 
                 # Full search flow with ONE retry: doc types → dates → Search →
                 # verify the portal actually APPLIED the date window (on ~10 of
                 # 30 days it silently didn't, pulling the 2500-row junk cap).
                 # Doc types go FIRST — filling the date inputs can open a
                 # calendar overlay that intercepts the doc-type field.
-                window_ok = False
-                for attempt in range(2):
+                for attempt in range(0 if window_ok else 2):
                     if attempt:
                         logger.warning(
                             "%s: re-running the advanced search once "
