@@ -106,6 +106,33 @@ async def verify_window_applied(
     return True, evidence
 
 
+def force_window_url(current_url: str, from_date: datetime, to_date: datetime) -> str | None:
+    """Rewrite a GovOS results URL to carry the requested recorded-date window.
+
+    The results page is a plain GET (verified live, Bell 2026-08-19):
+      /results?department=RP&docTypes=T2&recordedDateRange=20260815%2C20260818
+              &searchType=advancedSearch
+    In the cloud the advanced form silently drops the date range from the
+    submitted query (the inputs HOLD the dates in the DOM — read-back verified
+    — yet the query runs unfiltered), while the doc-type chips DO make it into
+    the URL. So the bulletproof fallback is URL surgery: keep everything the
+    working part of the form encoded, and force recordedDateRange ourselves.
+
+    Returns the corrected URL, or None when current_url is not a results URL.
+    """
+    from urllib.parse import urlsplit, parse_qs, urlencode, urlunsplit
+
+    parts = urlsplit(current_url)
+    if "/results" not in parts.path:
+        return None
+    q = parse_qs(parts.query)
+    q["recordedDateRange"] = [f"{from_date:%Y%m%d},{to_date:%Y%m%d}"]
+    q.setdefault("searchType", ["advancedSearch"])
+    return urlunsplit(
+        (parts.scheme, parts.netloc, parts.path, urlencode(q, doseq=True), "")
+    )
+
+
 async def apply_dates(
     page: Page, from_date: datetime, to_date: datetime, label: str = "publicsearch"
 ) -> bool:

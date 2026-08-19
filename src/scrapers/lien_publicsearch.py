@@ -509,6 +509,7 @@ class _PublicSearchLienScraper:
                             f"{label}: results never rendered (anti-bot or source change)"
                         )
 
+                    self.last_meta["results_url"] = page.url
                     ok, evidence = await verify_window_applied(
                         page, from_date, to_date, label
                     )
@@ -516,6 +517,25 @@ class _PublicSearchLienScraper:
                     if ok:
                         window_ok = True
                         break
+
+                    # Form dropped the dates from the query (cloud failure
+                    # mode) — force the window via URL surgery on the results
+                    # URL, which carries the doc types the form DID apply.
+                    from scrapers.publicsearch_common import force_window_url
+                    fixed = force_window_url(page.url, from_date, to_date)
+                    if fixed:
+                        logger.warning("%s: date filter dropped from query — "
+                                       "forcing window via results URL", label)
+                        await page.goto(fixed, wait_until="domcontentloaded")
+                        if await _wait_for_results(page):
+                            self.last_meta["results_url"] = page.url
+                            ok, evidence = await verify_window_applied(
+                                page, from_date, to_date, label
+                            )
+                            self.last_meta.update(evidence)
+                            if ok:
+                                window_ok = True
+                                break
                     await dump_page(page, f"{self.COUNTY.lower()}_lien_window_not_applied")
 
                 if not window_ok:
