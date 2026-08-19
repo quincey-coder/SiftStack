@@ -125,6 +125,46 @@ def build_results_url(
     )
 
 
+async def goto_results_direct(
+    page: Page,
+    base: str,
+    direct_url: str,
+    label: str,
+    warm_up: bool = False,
+) -> None:
+    """Navigate to the parameterized results URL, optionally warming the
+    anti-bot session on the portal homepage first.
+
+    The cloud failure mode (QA runs 2026-08-19): a COLD deep link to
+    /results?...recordedDateRange=OURS lands on the DEFAULT range
+    (16000101..yesterday) with doc types intact — the same URL honored
+    locally. Suspected anti-bot handling of deep-linked searches from proxy
+    IPs; a homepage visit first gives the session a normal entry point.
+    """
+    if warm_up:
+        try:
+            await page.goto(base, wait_until="domcontentloaded")
+            await page.wait_for_timeout(4000)
+        except Exception as e:
+            logger.warning("%s: homepage warm-up failed: %s", label, e)
+    resp = await page.goto(direct_url, wait_until="domcontentloaded")
+    # Forensics when the server rewrites the deep link: log the redirect
+    # chain and what actually rendered, so a cloud failure explains itself.
+    try:
+        chain = []
+        req = resp.request if resp else None
+        while req is not None:
+            chain.append(req.url)
+            req = req.redirected_from
+        if resp and (len(chain) > 1 or resp.status >= 300):
+            logger.warning(
+                "%s: direct URL response status=%s redirect-chain=%s",
+                label, resp.status, " <- ".join(c[:120] for c in chain),
+            )
+    except Exception:
+        pass
+
+
 def force_window_url(current_url: str, from_date: datetime, to_date: datetime) -> str | None:
     """Rewrite a GovOS results URL to carry the requested recorded-date window.
 

@@ -372,16 +372,32 @@ class _PublicSearchLisPendensScraper:
                 )
                 label = f"{self.COUNTY} lis pendens"
                 self.last_meta = {"window_days": (to_date - from_date).days + 1}
+                from scrapers.publicsearch_common import goto_results_direct
                 window_ok = False
                 direct = build_results_url(base, LIS_PENDENS_DOC_TYPE_CODES, from_date, to_date)
-                await page.goto(direct, wait_until="domcontentloaded")
-                if await _wait_for_results(page):
+                # Two tries: cold deep link, then with a homepage warm-up —
+                # the anti-bot rewrites COLD deep links to the default range
+                # on cloud proxy IPs (QA 2026-08-19) while local sessions and
+                # warmed sessions are expected to honor the params.
+                for warm in (False, True):
+                    await goto_results_direct(page, base, direct, label, warm_up=warm)
+                    if not await _wait_for_results(page):
+                        continue
                     self.last_meta["results_url"] = page.url
                     ok, evidence = await verify_window_applied(
                         page, from_date, to_date, label
                     )
                     self.last_meta.update(evidence)
-                    window_ok = ok
+                    if ok:
+                        window_ok = True
+                        break
+                    try:
+                        body_head = (await page.evaluate(
+                            '() => document.body.innerText'))[:300]
+                        logger.warning("%s: direct URL landed on %s — body head: %r",
+                                       label, page.url[:140], body_head)
+                    except Exception:
+                        pass
                 if not window_ok:
                     logger.warning(
                         "%s: direct results URL did not verify — falling back "
