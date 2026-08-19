@@ -213,6 +213,46 @@ def _collect_sold_records() -> list:
     return cleanup
 
 
+def _collect_health_events(health) -> None:
+    """Poll scraper-module globals for guardrail trips / schema alarms and
+    fold them into the run-health report.
+
+    These used to be log-only (or gated behind the publish block), which is
+    how the Aug-5 Travis schema flip ran silent for two days. Health events
+    alert unconditionally.
+    """
+    from importlib import import_module
+
+    for county, mod_name in (
+        ("Travis", "tax_delinquent_travis"),
+        ("Bell", "tax_delinquent_bell"),
+        ("Williamson", "tax_delinquent_wilco"),
+        ("Travis code-enforcement", "code_enforcement_travis"),
+    ):
+        try:
+            mod = import_module(f"scrapers.{mod_name}")
+        except Exception:
+            continue
+        diff = getattr(mod, "LAST_RUN_DIFF", None)
+        if diff and diff.get("guardrail_tripped"):
+            health.record_event(
+                "error", f"{county} guardrail",
+                diff.get("guardrail_reason") or "tripped",
+            )
+        # Schema/parse alarms (e.g. Travis NO_YEAR share) — modules append
+        # human-readable strings to LAST_ALARMS when something looks like
+        # format drift.
+        for alarm in getattr(mod, "LAST_ALARMS", None) or []:
+            health.record_event("error", f"{county} alarm", alarm)
+
+    # Zillow enrichment failure stats (set by property_enricher per run)
+    try:
+        import property_enricher as _pe
+        health.zillow = dict(getattr(_pe, "LAST_RUN_STATS", None) or {})
+    except Exception:
+        pass
+
+
 def _upload_cleanup_csv_to_drive(cleanup_info: dict, no_drive: bool = False) -> str | None:
     """Route the drop-off cleanup CSV to the Kessair 03_Sold-Cleanup Drive folder.
 
@@ -325,6 +365,14 @@ async def actor_main() -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
+    # ── Run health: count every WARN/ERROR globally + collect per-scraper
+    # outcomes. The health report is sent UNCONDITIONALLY at end of run
+    # (outside the publish gate) — a failed run must never look quiet.
+    import run_health as _rh
+    _wec = _rh.WarnErrorCounter()
+    logging.getLogger().addHandler(_wec)
+    health = _rh.RunHealth()
+
     async with Actor:
         pipeline_start = _time()
         # Isolate this run's token meter (the Actor container is long-lived and
@@ -351,6 +399,13 @@ async def actor_main() -> None:
             if val:
                 setattr(config, key, val)
                 os.environ[key] = val
+
+        # Alert-system drill: makes one named scraper raise intentionally so
+        # the 🚨 health alert path can be verified end-to-end on the platform.
+        _force_fail = (actor_input.get("force_scraper_fail") or "").strip()
+        if _force_fail:
+            os.environ["FORCE_SCRAPER_FAIL"] = _force_fail
+            Actor.log.warning("FORCE_SCRAPER_FAIL drill armed for %s", _force_fail)
 
         # ── Scrape scope ────────────────────────────────────────────
         mode = actor_input.get("mode", "daily")
@@ -602,14 +657,22 @@ async def actor_main() -> None:
                 len(_stored_ce.get("last_run_case_ids") or []),
             )
 
+            # ── Load per-scraper health baselines (rolling 14-day counts) ──
+            _health_baselines = await kvs.get_value(_rh.STATE_KEY) or {}
+
             # ── Scrape ────────────────────────────────────────────
-            from scrapers import scrape_targets
+            from scrapers import scrape_targets, registry_gaps, KNOWN_MISSING
+            health.registry_gaps = [
+                g for g in registry_gaps() if g not in KNOWN_MISSING
+            ]
+            health.known_gaps = list(KNOWN_MISSING)
             notices = await scrape_targets(
                 targets=[(c, t) for c, t in targets],
                 mode=mode,
                 since_date=since_date_override or None,
                 max_notices=max_notices,
                 scraper_kwargs=scraper_kwargs,
+                health=health,
             )
             Actor.log.info("Scraped %d total notices before dedup/enrichment", len(notices))
             if max_notices and len(notices) >= max_notices:
@@ -738,6 +801,26 @@ async def actor_main() -> None:
                         send_slack_notification([])
                     except Exception:
                         Actor.log.exception("Empty-run Slack notification failed")
+                # Health report on the empty path too — an all-scrapers-failed
+                # day lands here and must NOT look like a quiet day.
+                try:
+                    _collect_health_events(health)
+                    health.log_counts = _wec.snapshot()
+                    health.elapsed_min = (_time() - pipeline_start) / 60
+                    _health_report = _rh.analyze(health, _health_baselines)
+                    _health_sent = _rh.send_health_report(_health_report)
+                    await kvs.set_value(
+                        _rh.STATE_KEY,
+                        _rh.update_baselines(_health_baselines, health),
+                    )
+                    _status = _rh.format_status_message(_health_report)
+                    if not _health_sent:
+                        _status = ("SLACK DEAD — check SLACK_WEBHOOK_URL · " + _status)[:130]
+                    await Actor.set_status_message(_status)
+                    if _health_report.all_failed:
+                        await Actor.fail(status_message=_status)
+                except Exception:
+                    Actor.log.exception("Run-health reporting failed (empty-run path)")
                 return
 
             total = len(notices)
@@ -931,6 +1014,18 @@ async def actor_main() -> None:
                         "Output validation BLOCKED publishing (%d error(s)) — skipping "
                         "KVS + Drive push of DataSift CSVs and the Slack summary.",
                         _val_report.total_errors,
+                    )
+                    health.record_event(
+                        "error", "list_validator",
+                        f"BLOCKED publishing: {_val_report.total_errors} error(s)",
+                    )
+                elif getattr(_val_report, "total_warnings", 0):
+                    # WARNs never blocked publishing but were previously
+                    # invisible — surface them in the health report.
+                    health.record_event(
+                        "warn", "list_validator",
+                        f"passed with {_val_report.total_warnings} warning(s) "
+                        f"(see output/list_validation_*.json)",
                     )
 
                 kvs_id = kvs._id if hasattr(kvs, "_id") else ""
@@ -1277,6 +1372,34 @@ async def actor_main() -> None:
                 except Exception as e:
                     Actor.log.warning("Slack notification failed: %s", e)
 
+            # ── Run-health report — ALWAYS sent, outside the publish gate ──
+            # A totally-failed run must look different from a quiet day, so
+            # this fires even (especially) when notices is empty or validation
+            # blocked publishing.
+            try:
+                _collect_health_events(health)
+                health.log_counts = _wec.snapshot()
+                health.notices_total = total
+                health.elapsed_min = elapsed_min
+                health.cost_usd = sum(cost_breakdown.values())
+                _health_report = _rh.analyze(health, _health_baselines)
+                _health_sent = _rh.send_health_report(_health_report)
+                await kvs.set_value(
+                    _rh.STATE_KEY,
+                    _rh.update_baselines(_health_baselines, health),
+                )
+                _status = _rh.format_status_message(_health_report)
+                if not _health_sent:
+                    _status = ("SLACK DEAD — check SLACK_WEBHOOK_URL · " + _status)[:130]
+                await Actor.set_status_message(_status)
+                if _health_report.all_failed:
+                    # Every scrape target hard-failed — there is nothing worth
+                    # protecting downstream; fail the run so Apify shows red.
+                    await Actor.fail(status_message=_status)
+                    return
+            except Exception:
+                Actor.log.exception("Run-health reporting failed")
+
             # ── Persist state for next run ──
             # Use the pre-pipeline snapshot key so Smarty mutations don't poison dedup.
             for n in notices:
@@ -1320,6 +1443,14 @@ async def actor_main() -> None:
             try:
                 from slack_notifier import notify_error
                 notify_error("Apify Actor Pipeline", e, context=f"mode={mode}")
+            except Exception:
+                pass
+            # Best-effort: ship whatever scraper health was collected before
+            # the crash, so the Slack alert names which scrapers ran/failed.
+            try:
+                if health.scrapers:
+                    health.log_counts = _wec.snapshot()
+                    _rh.send_health_report(_rh.analyze(health, {}))
             except Exception:
                 pass
             await Actor.fail(status_message=f"Pipeline error: {e}")
@@ -2686,7 +2817,44 @@ def cli_main() -> None:
 
 def _run_scrape_pipeline(args, targets) -> None:
     """Run the daily/historical scrape → enrich → export → upload pipeline."""
-    from scrapers import scrape_targets, list_registered
+    from scrapers import scrape_targets, list_registered, registry_gaps, KNOWN_MISSING
+    import run_health as _rh
+
+    # Run-health mirror of the Actor path: count WARN/ERROR globally, collect
+    # per-scraper outcomes, send the always-on health report at the end.
+    _wec = _rh.WarnErrorCounter()
+    logging.getLogger().addHandler(_wec)
+    health = _rh.RunHealth()
+    health.registry_gaps = [g for g in registry_gaps() if g not in KNOWN_MISSING]
+    health.known_gaps = list(KNOWN_MISSING)
+    _health_state_file = config.STATE_FILE.parent / "scraper_health_state.json"
+    try:
+        _health_baselines = json.loads(_health_state_file.read_text())
+    except Exception:
+        _health_baselines = {}
+    _pipeline_t0 = datetime.now()
+
+    def _finalize_health(notice_count: int) -> None:
+        """Send the always-on health report + persist baselines (CLI mirror
+        of the Actor block). Called on BOTH the empty-run and normal exits."""
+        try:
+            _collect_health_events(health)
+            health.log_counts = _wec.snapshot()
+            health.notices_total = notice_count
+            health.elapsed_min = (datetime.now() - _pipeline_t0).total_seconds() / 60
+            report = _rh.analyze(health, _health_baselines)
+            if not getattr(args, "no_slack", False) and config.SLACK_WEBHOOK_URL:
+                if not _rh.send_health_report(report):
+                    logging.error("Health Slack send FAILED — webhook missing/dead")
+            else:
+                logging.info("Health report (Slack off):\n%s",
+                             _rh.build_health_block(report))
+            _health_state_file.parent.mkdir(parents=True, exist_ok=True)
+            _health_state_file.write_text(
+                json.dumps(_rh.update_baselines(_health_baselines, health), indent=1)
+            )
+        except Exception:
+            logging.exception("Run-health reporting failed")
 
     registered = list_registered()
     if registered:
@@ -2732,6 +2900,7 @@ def _run_scrape_pipeline(args, targets) -> None:
         since_date=since_arg,
         max_notices=getattr(args, "max_notices", None),
         scraper_kwargs=scraper_kwargs,
+        health=health,
     )) if runnable else []
 
     # Handle async probate lookup before pipeline (requires asyncio.run).
@@ -2847,6 +3016,9 @@ def _run_scrape_pipeline(args, targets) -> None:
                 send_slack_notification([])
             except Exception:
                 logging.exception("Slack notification for empty run failed")
+        # The health report is the real "we ran and here's what happened"
+        # signal — send it even (especially) on an empty run.
+        _finalize_health(0)
         sys.exit(0)
 
     # Tracerfy batch skip trace — only on DP candidates (deceased owners,
@@ -3032,6 +3204,16 @@ def _run_scrape_pipeline(args, targets) -> None:
             "Output validation BLOCKED publishing (%d error(s)) — skipping Drive, "
             "Slack summary and CRM upload. See the Slack alert + validation report.",
             _val_report.total_errors,
+        )
+        health.record_event(
+            "error", "list_validator",
+            f"BLOCKED publishing: {_val_report.total_errors} error(s)",
+        )
+    elif getattr(_val_report, "total_warnings", 0):
+        health.record_event(
+            "warn", "list_validator",
+            f"passed with {_val_report.total_warnings} warning(s) "
+            f"(see output/list_validation_*.json)",
         )
 
     # Always upload to Google Drive unless suppressed — permanent audit trail
@@ -3386,6 +3568,9 @@ def _run_scrape_pipeline(args, targets) -> None:
     if getattr(args, "audit_records", False):
         logging.info("--audit-records: Not yet implemented. "
                       "Will check DataSift Incomplete tab via Playwright in a future build.")
+
+    # Run-health report — always sent, outside the _publish_ok gate.
+    _finalize_health(len(notices))
 
     logging.info("Done — %d notices exported", len(notices))
 

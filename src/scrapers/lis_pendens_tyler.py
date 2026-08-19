@@ -27,17 +27,17 @@ import os
 import re
 from datetime import datetime, timedelta
 
-from playwright.async_api import async_playwright, Page
+from playwright.async_api import async_playwright
 
 from notice_parser import NoticeData, normalize_court_name
 from scrapers import register
 from scrapers.lis_pendens_common import pick_defendant
+from scrapers import tyler_common as tc
+from scrapers.debug_capture import dump_page, dump_text
 
 logger = logging.getLogger(__name__)
 
-BASE = "https://williamsoncountytx-web.tylerhost.net/williamsonweb"
-DISCLAIMER_URL = f"{BASE}/user/disclaimer"
-SEARCH_ID = "DOCSEARCH149S1"
+BASE = tc.BASE
 
 # Lis pendens DISPLAY values to request in the doc-type autocomplete. Both
 # spellings are attempted; whichever the portal offers commits a chip.
@@ -57,24 +57,9 @@ REQUEST_DELAY = 1.5
 MAX_PAGES = 60
 CHUNK_DAYS = 14   # the portal caps results per search; window the date range
 
-_DATE_RE = re.compile(r"\b(\d{1,2}/\d{1,2}/\d{4})\b")
-_INST_RE = re.compile(r"\b(\d{6,})\b")
-
 
 def _force_headless() -> bool:
     return os.getenv("LIS_PENDENS_TYLER_HEADLESS", "").strip().lower() in ("1", "true", "yes")
-
-
-def _date_str(dt: datetime) -> str:
-    return dt.strftime("%m/%d/%Y")
-
-
-def _clean_name(raw: str) -> str:
-    name = (raw or "").strip().rstrip(",;.").strip()
-    name = re.sub(r"\(\+\d*\)\s*$", "", name).strip()
-    if name and (name.isupper() or name.islower()):
-        name = name.title()
-    return name
 
 
 def _is_lis_pendens_doctype(doctype: str) -> bool:
@@ -82,137 +67,6 @@ def _is_lis_pendens_doctype(doctype: str) -> bool:
     if not up or "LIS PENDENS" not in up:
         return False
     return not any(x in up for x in _LP_EXCLUDE)
-
-
-def _parse_h1(h1: str) -> tuple[str, str, str]:
-    """From "{instrument} • {DOC TYPE} • {MM/DD/YYYY hh:mm AM}" return
-    (instrument, doctype, date_iso)."""
-    h1 = (h1 or "").replace("\xa0", " ").strip()
-    m_inst = _INST_RE.search(h1)
-    m_date = _DATE_RE.search(h1)
-    instrument = m_inst.group(1) if m_inst else ""
-    date_iso = ""
-    if m_date:
-        try:
-            date_iso = datetime.strptime(m_date.group(1), "%m/%d/%Y").strftime("%Y-%m-%d")
-        except ValueError:
-            date_iso = ""
-    mid = h1
-    if instrument:
-        idx = mid.find(instrument)
-        if idx >= 0:
-            mid = mid[idx + len(instrument):]
-    if m_date:
-        di = mid.find(m_date.group(1))
-        if di >= 0:
-            mid = mid[:di]
-    doctype = re.sub(r"[••·|;]+", " ", mid)
-    doctype = re.sub(r"\s+", " ", doctype).strip()
-    return instrument, doctype, date_iso
-
-
-_FETCH_PAGE_JS = r"""
-async (args) => {
-  const [searchId, pageNum] = args;
-  const url = `/williamsonweb/searchResults/${searchId}?page=${pageNum}&_=${Date.now()}`;
-  let resp;
-  try { resp = await fetch(url, {credentials: 'include'}); }
-  catch (e) { return {ok: false, status: -1, rows: []}; }
-  if (!resp.ok) return {ok: false, status: resp.status, rows: []};
-  const html = await resp.text();
-  const doc = new DOMParser().parseFromString(html, 'text/html');
-  const clean = s => (s || '').replace(/\s+/g, ' ').trim();
-  const rows = [...doc.querySelectorAll('li.ss-search-row')].map(li => {
-    const docid = li.getAttribute('data-documentid') || '';
-    const href = li.getAttribute('data-href') || '';
-    const h1el = li.querySelector('h1');
-    const h1 = h1el ? clean(h1el.textContent) : '';
-    const grantors = [], grantees = [], legal = [];
-    li.querySelectorAll('.searchResultFourColumn').forEach(block => {
-      const items = [...block.querySelectorAll('li')]
-        .map(x => clean(x.textContent)).filter(Boolean);
-      if (!items.length) return;
-      const label = items[0].toLowerCase();
-      const vals = items.slice(1);
-      if (label.indexOf('grantor') === 0) grantors.push(...vals);
-      else if (label.indexOf('grantee') === 0) grantees.push(...vals);
-      else if (label.indexOf('legal') === 0) legal.push(...vals);
-    });
-    return {docid, href, h1, grantors, grantees, legal};
-  });
-  return {ok: true, status: 200, rows};
-}
-"""
-
-
-async def _accept_disclaimer_and_open_search(page: Page) -> bool:
-    await page.goto(DISCLAIMER_URL, wait_until="domcontentloaded", timeout=45000)
-    await page.wait_for_timeout(2500)
-    for how in (
-        lambda: page.get_by_role("button", name="Accept").first.click(timeout=4000),
-        lambda: page.locator("a:has-text('Accept'), input[value*='Accept']").first.click(timeout=4000),
-    ):
-        try:
-            await how()
-            break
-        except Exception:
-            continue
-    await page.wait_for_timeout(3000)
-    for how in (
-        lambda: page.get_by_role("link", name="Official Public Record Search").first.click(timeout=6000),
-        lambda: page.locator(f"a[href*='{SEARCH_ID}']").first.click(timeout=6000),
-    ):
-        try:
-            await how()
-            break
-        except Exception:
-            continue
-    try:
-        await page.wait_for_selector("#field_selfservice_documentTypes", timeout=30000)
-        return True
-    except Exception:
-        return False
-
-
-async def _add_doc_type(page: Page, value: str) -> bool:
-    dt = page.locator("#field_selfservice_documentTypes")
-    try:
-        await dt.scroll_into_view_if_needed()
-        await dt.click(timeout=6000)
-        await dt.fill("")
-        await dt.type(value, delay=35)
-        await page.wait_for_timeout(1400)
-    except Exception as e:
-        logger.debug("doc-type %r type error: %s", value, e)
-        return False
-    clicked = await page.evaluate(
-        """(val) => {
-          const lis = [...document.querySelectorAll(
-            '#field_selfservice_documentTypes-aclist li, #field_selfservice_documentTypes-aclist a')];
-          const norm = s => (s || '').replace(/\\s+/g,' ').trim().toUpperCase();
-          const exact = lis.find(l => norm(l.textContent) === val.toUpperCase());
-          const target = exact || null;
-          if (target) { (target.querySelector('a') || target).click(); return true; }
-          return false;
-        }""",
-        value,
-    )
-    await page.wait_for_timeout(500)
-    try:
-        await dt.fill("")
-    except Exception:
-        pass
-    if not clicked:
-        return False
-    present = await page.evaluate(
-        """(val) => {
-          const chips = [...document.querySelectorAll(
-            '#field_selfservice_documentTypes-holder input[id$=\"-searchInput\"]')];
-          return chips.some(c => (c.value || '').trim().toUpperCase() === val.toUpperCase());
-        }""",
-        value,
-    )
-    return bool(present)
 
 
 @register("Williamson", "lis_pendens")
@@ -238,10 +92,14 @@ class WilliamsonTylerLisPendensScraper:
         else:
             from_date = to_date - timedelta(days=30)
 
+        self.last_meta = {
+            "window_days": (to_date - from_date).days + 1,
+            "returned": 0, "kept": 0,
+        }
         headless = _force_headless()
         logger.info(
             "Williamson lis pendens scrape (Tyler Self-Service): range=%s..%s headless=%s",
-            _date_str(from_date), _date_str(to_date), headless,
+            tc.date_str(from_date), tc.date_str(to_date), headless,
         )
         if headless:
             logger.warning(
@@ -266,42 +124,35 @@ class WilliamsonTylerLisPendensScraper:
                 return []
 
             context = await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
-                ),
+                user_agent=tc.USER_AGENT,
                 viewport={"width": 1400, "height": 1300},
                 ignore_https_errors=True,
             )
-            await context.add_init_script(
-                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
-                "window.chrome={runtime:{}};"
-                "Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3,4,5]});"
-            )
+            await context.add_init_script(tc.INIT_SCRIPT)
             page = await context.new_page()
             page.set_default_timeout(45000)
 
             try:
-                if not await _accept_disclaimer_and_open_search(page):
-                    logger.error(
+                if not await tc.accept_disclaimer_and_open_search(page):
+                    await dump_page(page, "wilco_lp_form_never_rendered")
+                    from scrapers import ScraperError
+                    raise ScraperError(
                         "Williamson lis pendens: Document Search form never rendered "
-                        "(disclaimer/human-verification flow failed). Returning 0.",
+                        "(disclaimer/human-verification flow failed)"
                     )
-                    await browser.close()
-                    return []
 
                 added = []
                 for name in LIS_PENDENS_DOC_TYPE_NAMES:
-                    if await _add_doc_type(page, name):
+                    if await tc.add_doc_type(page, name):
                         added.append(name)
                 logger.info("Williamson lis pendens: doc types selected: %s", added or "(none)")
                 if not added:
-                    logger.warning(
-                        "Williamson lis pendens: no lis pendens doc type could be selected "
-                        "— aborting to avoid an unfiltered (all-record-type) search.",
+                    await dump_page(page, "wilco_lp_no_doctypes")
+                    from scrapers import ScraperError
+                    raise ScraperError(
+                        "Williamson lis pendens: no lis pendens doc type could be "
+                        "selected — aborted to avoid an unfiltered search"
                     )
-                    await browser.close()
-                    return []
 
                 windows: list[tuple[datetime, datetime]] = []
                 ws = from_date
@@ -314,45 +165,60 @@ class WilliamsonTylerLisPendensScraper:
                     len(windows), CHUNK_DAYS,
                 )
 
+                recovered_once = False
+                failed_windows = 0
+                last_fail_status = None
                 for win_start, win_end in windows:
-                    await page.evaluate(
-                        """(args) => {
-                          const [s, e] = args;
-                          const set = (id, v) => {
-                            const el = document.getElementById(id);
-                            if (el) { el.value = v; el.dispatchEvent(new Event('change', {bubbles: true})); }
-                          };
-                          set('field_RecDateID_DOT_StartDate', s);
-                          set('field_RecDateID_DOT_EndDate', e);
-                        }""",
-                        [_date_str(win_start), _date_str(win_end)],
-                    )
-                    try:
-                        await page.locator("#searchButton").click()
-                    except Exception as e:
+                    await tc.set_window_dates(page, win_start, win_end)
+                    if not await tc.click_search(page):
                         logger.warning(
-                            "Williamson lis pendens: search click failed for %s..%s: %s",
-                            _date_str(win_start), _date_str(win_end), e,
+                            "Williamson lis pendens: search click failed for %s..%s",
+                            tc.date_str(win_start), tc.date_str(win_end),
                         )
+                        failed_windows += 1
                         continue
                     await page.wait_for_timeout(4000)
 
                     win_new = 0
+                    window_ok = True
                     for page_num in range(1, MAX_PAGES + 1):
                         try:
-                            res = await page.evaluate(_FETCH_PAGE_JS, [SEARCH_ID, page_num])
+                            res = await tc.fetch_results_page(page, page_num)
                         except Exception as e:
                             logger.warning("Williamson lis pendens: page %d fetch error: %s", page_num, e)
                             break
+                        if (not res or not res.get("ok")) and page_num == 1 and not recovered_once:
+                            # The human-verification gate re-armed (405 for 27
+                            # straight days before this existed). Recover the
+                            # session ONCE per scrape, redo this window, retry.
+                            recovered_once = True
+                            dump_text(
+                                "wilco_lp_fetch_fail",
+                                f"status={(res or {}).get('status')}\n"
+                                f"snippet:\n{(res or {}).get('snippet', '')}",
+                            )
+                            if await tc.recover_search_session(
+                                page, LIS_PENDENS_DOC_TYPE_NAMES, "Williamson lis pendens"
+                            ):
+                                await tc.set_window_dates(page, win_start, win_end)
+                                if await tc.click_search(page):
+                                    await page.wait_for_timeout(4000)
+                                    try:
+                                        res = await tc.fetch_results_page(page, page_num)
+                                    except Exception:
+                                        res = None
                         if not res or not res.get("ok"):
                             if page_num == 1:
+                                last_fail_status = (res or {}).get("status")
                                 logger.warning(
                                     "Williamson lis pendens: results fetch failed (status %s) for %s..%s",
-                                    (res or {}).get("status"),
-                                    _date_str(win_start), _date_str(win_end),
+                                    last_fail_status,
+                                    tc.date_str(win_start), tc.date_str(win_end),
                                 )
+                                window_ok = False
                             break
                         rows = res.get("rows") or []
+                        self.last_meta["returned"] += len(rows)
                         if not rows:
                             break
 
@@ -360,7 +226,7 @@ class WilliamsonTylerLisPendensScraper:
                             docid = (row.get("docid") or "").strip()
                             if docid and docid in seen_docids:
                                 continue
-                            instrument, doctype, date_iso = _parse_h1(row.get("h1", ""))
+                            instrument, doctype, date_iso = tc.parse_h1(row.get("h1", ""))
                             if not _is_lis_pendens_doctype(doctype):
                                 continue  # liens, deeds, releases, etc.
                             grantors = row.get("grantors") or []
@@ -375,9 +241,9 @@ class WilliamsonTylerLisPendensScraper:
                             win_new += 1
 
                             notice = NoticeData(notice_type="lis_pendens", county="Williamson", state="TX")
-                            notice.lien_creditor = _clean_name(plaintiff)
+                            notice.lien_creditor = tc.clean_name(plaintiff)
                             notice.tax_owner_name = defendant.upper()
-                            notice.owner_name = normalize_court_name(_clean_name(defendant))
+                            notice.owner_name = normalize_court_name(tc.clean_name(defendant))
                             notice.date_added = date_iso
                             href = (row.get("href") or "").strip()
                             if href:
@@ -391,22 +257,43 @@ class WilliamsonTylerLisPendensScraper:
 
                             if max_notices and len(notices) >= max_notices:
                                 logger.info("Williamson lis pendens: hit max_notices=%d cap", max_notices)
+                                self.last_meta["kept"] = len(notices)
                                 await browser.close()
                                 return notices
 
                         await asyncio.sleep(REQUEST_DELAY)
 
+                    if not window_ok:
+                        failed_windows += 1
                     logger.info(
                         "Williamson lis pendens: window %s..%s → %d new (running %d)",
-                        _date_str(win_start), _date_str(win_end), win_new, len(notices),
+                        tc.date_str(win_start), tc.date_str(win_end), win_new, len(notices),
                     )
 
+                if windows and failed_windows == len(windows):
+                    # Every window failed even after one session recovery —
+                    # raise so the run-health report alerts on day 1, not day 27.
+                    from scrapers import ScraperError
+                    raise ScraperError(
+                        f"Williamson lis pendens: results fetch failed in all "
+                        f"{failed_windows} window(s) (last status {last_fail_status}) "
+                        f"even after session recovery"
+                    )
+
+                self.last_meta["kept"] = len(notices)
                 logger.info(
                     "Williamson lis pendens: %d records parsed (Tyler Self-Service)",
                     len(notices),
                 )
             except Exception as e:
+                # Fail LOUD through ScraperError (run-health alerts) while
+                # keeping whatever windows completed before the failure.
+                from scrapers import ScraperError
+                if isinstance(e, ScraperError):
+                    e.partial = notices
+                    raise
                 logger.error("Williamson lis pendens: scrape failed: %s", e, exc_info=True)
+                raise ScraperError(f"Williamson lis pendens: {e}", partial=notices) from e
             finally:
                 try:
                     await browser.close()

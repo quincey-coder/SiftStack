@@ -343,6 +343,78 @@ async def wait_ready(page: Page, timeout_ms: int | None = None) -> None:
         )
 
 
+def effective_from_date(from_date, to_date, mode: str):
+    """Widen a daily window to cover the clerk's Temp-index lag.
+
+    ROOT CAUSE (captured live 2026-08-18): freshly-filed documents sit in the
+    Travis clerk's "Temp" index for several days with NO grantor/grantee names
+    attached — the Name cell is literally empty `[R]/[E]` markers. A 1-day
+    daily window therefore only ever sees nameless Temp rows, which parse to
+    zero. This is why Travis probate and lis pendens produced 0 records for
+    30+ straight days while the search itself "worked".
+
+    Looking back TCC_INDEX_LAG_DAYS (default 7) picks the same filings up once
+    the clerk verifies them; the cross-run seen_notice_ids dedup absorbs the
+    re-scans.
+    """
+    from datetime import timedelta
+
+    if mode != "daily":
+        return from_date
+    lag = 7
+    raw = os.getenv("TCC_INDEX_LAG_DAYS", "").strip()
+    if raw.isdigit():
+        lag = int(raw)
+    widened = to_date - timedelta(days=lag)
+    return min(from_date, widened)
+
+
+def count_temp_rows(body_text: str) -> int:
+    """Count result rows still in the clerk's Temp (unverified) index."""
+    import re as _re
+    return len(_re.findall(r"\bTemp\b", body_text or ""))
+
+
+async def click_search(page: Page, attempts: int = 3) -> None:
+    """Click the tccsearch Search button with a null guard + retries.
+
+    The bare `document.getElementById(...).click()` evaluate crashed with
+    "Cannot read properties of null (reading 'click')" on 10 of 30 days when
+    the Infragistics form lagged the framework (cold proxy connection). Wait
+    for the button to attach, click via a null-guarded evaluate, and retry
+    with a settle delay before giving up loudly.
+    """
+    last_err: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            await page.wait_for_selector(
+                "#cphNoMargin_SearchButtons1_btnSearch", state="attached",
+                timeout=10000,
+            )
+        except Exception as e:
+            last_err = e
+        clicked = False
+        try:
+            clicked = await page.evaluate(
+                "() => { const b = document.getElementById("
+                "'cphNoMargin_SearchButtons1_btnSearch'); "
+                "if (!b) return false; b.click(); return true; }"
+            )
+        except Exception as e:
+            last_err = e
+        if clicked:
+            return
+        logger.warning(
+            "tccsearch: Search button not clickable (attempt %d/%d) — waiting "
+            "for the form to settle", attempt + 1, attempts,
+        )
+        await page.wait_for_timeout(2500)
+    raise TccNotReady(
+        f"tccsearch: Search button never became clickable after {attempts} "
+        f"attempts ({last_err}) — form render raced or page is a challenge/error page"
+    )
+
+
 async def safe_check(page: Page, selector: str, timeout_ms: int = 15000) -> bool:
     """Check a doc-type checkbox, waiting for it to attach.
 

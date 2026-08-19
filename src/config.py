@@ -58,6 +58,14 @@ TRESTLE_SCORE_SIGNERS_ONLY = os.getenv("TRESTLE_SCORE_SIGNERS_ONLY", "1").strip(
 # the saved CARD, not the wallet, so payment is always an explicit call.
 SMARTSKIP_EMAIL = os.getenv("SMARTSKIP_EMAIL", "")
 SMARTSKIP_PASSWORD = os.getenv("SMARTSKIP_PASSWORD", "")
+# DirectSkip skip trace — single-record API (relatives + phones per lookup).
+# Auth = api_key in the JSON body; the caller's PUBLIC IP must be allowlisted
+# with support@directskip.com. Pay-per-hit: a no-match bills nothing. The portal
+# login is the batch fallback (cookie auth, not IP-bound). See src/directskip.py.
+DIRECTSKIP_EMAIL = os.getenv("DIRECTSKIP_EMAIL", "")
+DIRECTSKIP_PASSWORD = os.getenv("DIRECTSKIP_PASSWORD", "")
+# Prefer DIRECTSKIP_API_KEY; fall back to the bare API= key some accounts ship.
+DIRECTSKIP_API_KEY = os.getenv("DIRECTSKIP_API_KEY", "") or os.getenv("API", "")
 # Enformion is retained for ENTITY owners only (BusinessV2). Its Person Search is
 # retired — see src/smartskip.py.
 ENFORMION_AP_NAME = os.getenv("ENFORMION_AP_NAME", "")
@@ -146,7 +154,11 @@ MAX_RETRIES = 3
 # making more calls and logs a warning. Override via env vars if needed.
 MAX_TRACERFY_COST_USD = float(os.getenv("MAX_TRACERFY_COST_USD", "100.0"))
 MAX_ZILLOW_COST_USD = float(os.getenv("MAX_ZILLOW_COST_USD", "100.0"))
+# DirectSkip bills per HIT (a no-match is free). batch_search never spends past
+# this cap. Default is deliberately low — a batch must opt into more via --max-cost.
+MAX_DIRECTSKIP_COST_USD = float(os.getenv("MAX_DIRECTSKIP_COST_USD", "5.0"))
 TRACERFY_COST_PER_RECORD = 0.02  # batch endpoint pricing
+DIRECTSKIP_COST_PER_HIT = float(os.getenv("DIRECTSKIP_COST_PER_HIT", "0.10"))  # per matched record
 ZILLOW_COST_PER_LOOKUP = 0.01    # OpenWeb Ninja pricing after free tier
 
 # ── Image Processing ───────────────────────────────────────────────────

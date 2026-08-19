@@ -25,7 +25,14 @@ PROPERTY_ENDPOINT = f"{API_BASE}/property-details-address"
 REQUEST_DELAY_MIN = 1.0   # seconds between requests
 REQUEST_DELAY_MAX = 2.0
 REQUEST_TIMEOUT = 30       # seconds per API call (Zillow can be 0.5-4s+)
-MAX_RETRIES = 2
+# 5 attempts with exponential backoff — the vendor's 503 spells (escalating
+# since 2026-08-08, 20-76 errors/day) usually clear within a minute, and 2
+# quick attempts were losing 5-23 lookups/day.
+MAX_RETRIES = 5
+
+# Per-run stats polled by main._collect_health_events → the Slack health block
+# flags the run when the hard-failure share gets high.
+LAST_RUN_STATS: dict = {}
 
 # ── Mapping tables ────────────────────────────────────────────────────
 
@@ -133,6 +140,12 @@ def _fetch_property(address: str, city: str, state: str, zip_code: str,
     headers = {"x-api-key": api_key}
     params = {"address": full_address}
 
+    def _backoff(attempt: int) -> None:
+        # Exponential backoff + jitter for 5xx/transport errors: 2, 4, 8, 16s
+        # (capped at 60) + 0-3s jitter. The vendor's 503 spells usually clear
+        # within a minute.
+        time.sleep(min(60, 2 ** attempt) + random.uniform(0, 3))
+
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             resp = requests.get(
@@ -148,6 +161,14 @@ def _fetch_property(address: str, city: str, state: str, zip_code: str,
                 logger.warning("Zillow rate limit hit -- waiting 10s (attempt %d)", attempt)
                 time.sleep(10)
                 continue
+            if resp.status_code >= 500:
+                logger.warning(
+                    "Zillow %d for '%s' (attempt %d/%d) -- backing off",
+                    resp.status_code, full_address, attempt, MAX_RETRIES,
+                )
+                if attempt < MAX_RETRIES:
+                    _backoff(attempt)
+                continue
             resp.raise_for_status()
             body = resp.json()
             # OpenWeb Ninja wraps response in {"status": "OK", "data": {...}}
@@ -157,9 +178,14 @@ def _fetch_property(address: str, city: str, state: str, zip_code: str,
             return None
         except requests.Timeout:
             logger.warning("Zillow timeout for '%s' (attempt %d/%d)", full_address, attempt, MAX_RETRIES)
+            if attempt < MAX_RETRIES:
+                _backoff(attempt)
         except requests.RequestException as e:
             logger.warning("Zillow API error for '%s': %s (attempt %d/%d)", full_address, e, attempt, MAX_RETRIES)
+            if attempt < MAX_RETRIES:
+                _backoff(attempt)
 
+    LAST_RUN_STATS["final_fail"] = LAST_RUN_STATS.get("final_fail", 0) + 1
     return None
 
 
@@ -350,6 +376,10 @@ def enrich_properties(
     equity_values: list[float] = []
     spent = 0.0
 
+    # Reset the per-run health stats (read by main._collect_health_events).
+    LAST_RUN_STATS.clear()
+    LAST_RUN_STATS.update({"attempted": 0, "enriched": 0, "failed": 0, "final_fail": 0})
+
     for idx, (orig_idx, notice) in enumerate(eligible):
         # Spending cap: stop calling Zillow once we'd exceed the cap
         if spent + cfg.ZILLOW_COST_PER_LOOKUP > cfg.MAX_ZILLOW_COST_USD:
@@ -401,5 +431,16 @@ def enrich_properties(
         "Zillow enrichment complete: %d enriched, %d failed, %d skipped (no addr)%s, $%.2f spent",
         enriched, failed, skipped, cap_msg + avg_equity, spent,
     )
+
+    # `failed` counts hard failures AND no-data (404) responses; `final_fail`
+    # (incremented inside _fetch_property) is only retry-exhausted errors —
+    # that's what the health share flag keys on.
+    LAST_RUN_STATS.update({
+        "attempted": len(eligible) - cap_skipped,
+        "enriched": enriched,
+        "failed": LAST_RUN_STATS.get("final_fail", 0),
+        "no_data_or_failed": failed,
+        "cap_skipped": cap_skipped,
+    })
 
     return notices

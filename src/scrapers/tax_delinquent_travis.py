@@ -55,6 +55,10 @@ LAST_RUN_RAW_CSV_PATH: Path | None = None
 # Collected by main.py after enrichment and appended to the upload CSV tagged
 # "Sold" so DataSift applies the tag to the matching record by address.
 LAST_RUN_SOLD: list | None = None
+# Schema-drift alarms raised this run (e.g. the NO_YEAR share breach). Polled
+# by main._collect_health_events so they reach Slack unconditionally — the
+# Aug-5 export flip ran silent for two days because this was log-only.
+LAST_ALARMS: list[str] = []
 
 
 def _parse_address(street_num: str, street_name: str) -> str:
@@ -174,6 +178,7 @@ class TravisTaxDelinquentScraper:
         LAST_RUN_REPORT_PATH = None
         LAST_RUN_RAW_CSV_PATH = None
         LAST_RUN_SOLD = None
+        LAST_ALARMS.clear()
 
         logger.info(
             "Travis tax delinquent: filters %d+ years, $%.0f+ owed, "
@@ -489,14 +494,15 @@ class TravisTaxDelinquentScraper:
         # parseable 1st Year Delinquent" — schema drift, not ordinary data.
         # It is 0 in normal operation, so any real volume here is a signal.
         if rows and removed["no_year"] / len(rows) > NO_YEAR_ALARM_SHARE:
-            logger.error(
-                "Travis tax delinquent: %d/%d rows (%.1f%%) carry a delinquent "
-                "sequence but no parseable '1st Year Delinquent' — expected ~0%%. "
-                "The SINCE column may have changed format; check "
-                "travis_tax_schema.DELQ_ALIASES and the raw archive.",
-                removed["no_year"], len(rows),
-                100 * removed["no_year"] / len(rows),
+            _alarm = (
+                f"{removed['no_year']}/{len(rows)} rows "
+                f"({100 * removed['no_year'] / len(rows):.1f}%) carry a delinquent "
+                f"sequence but no parseable '1st Year Delinquent' — expected ~0%. "
+                f"The SINCE column may have changed format; check "
+                f"travis_tax_schema.DELQ_ALIASES and the raw archive."
             )
+            logger.error("Travis tax delinquent: %s", _alarm)
+            LAST_ALARMS.append(_alarm)
 
         # ── Cross-run diff + state commit ─────────────────────────
         try:

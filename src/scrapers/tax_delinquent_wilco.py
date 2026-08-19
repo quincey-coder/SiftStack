@@ -261,8 +261,20 @@ class WilliamsonTaxDelinquentScraper:
             header = list(next(rows))
         except StopIteration:
             wb.close()
-            return []
+            from scrapers import ScraperError
+            raise ScraperError(
+                "Williamson tax delinquent: XLSX has no header row — "
+                "empty/corrupt download"
+            )
         col = {h: i for i, h in enumerate(header) if h is not None}
+        if "Quick Ref" not in col:
+            wb.close()
+            from scrapers import ScraperError
+            raise ScraperError(
+                f"Williamson tax delinquent: expected column 'Quick Ref' missing "
+                f"from header {header[:10]!r} — schema drift, extend the column "
+                f"map instead of letting every row silently fail"
+            )
 
         def _g(row, name, default=""):
             i = col.get(name)

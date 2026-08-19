@@ -13,6 +13,13 @@ relative.
 Zero tolerance for: numbers silently dropped, a relative's phone presented as
 the owner's, or a caller dialing someone whose relationship they can't see.
 
+> **Getting the file:** result files can now be pulled programmatically instead
+> of downloaded by hand — `python src/directskip.py list` then
+> `python src/directskip.py download --id <order> --out file.csv` (portal), or
+> traced fresh via the single-record API (`src/directskip.py search`). This
+> cleaning skill is unchanged: it still takes a `contactinfo` CSV and produces
+> the DataSift upload. Use it whenever you have the vendor CSV, however it arrived.
+
 ## CRITICAL: Before Starting
 
 1. Read `scripts/clean_directskip.py` — the cleaning engine.

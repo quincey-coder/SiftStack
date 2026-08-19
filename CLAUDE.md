@@ -115,6 +115,80 @@ dedup/sold baselines don't know what the cloud already uploaded.
 - **market_analyzer.py** — ZIP code scoring engine. 6-factor weighted composite (Distress 30%, Value 20%, Equity 15%, Tax Delinquency 15%, Competition 10%, DOM 10%). Grades A/B/C/D, budget allocation across top ZIPs.
 - **drive_uploader.py** — Google Drive upload via service account. `upload_file()` (generic, returns webViewLink) and `upload_csv()` (CSV-specific, returns file ID).
 
+## Run-Health + Alerting — nothing breaks silently (build 1.1.54, 2026-08-18)
+
+For 30 days every Apify run showed SUCCEEDED while Williamson lis_pendens was
+dead 27 days (Tyler 405), Travis probate/lis_pendens parsed 0 of everything
+(Temp-index lag, below), and Bell lien/lis_pendens pulled 2500-row junk on ~10
+days (date filter silently not applied). The anti-silence layer:
+
+- **`src/run_health.py`** — per-scraper outcome records collected in
+  `scrapers.scrape_targets` (count/duration/error/evidence), a WARN/ERROR
+  counting log handler, rolling 14-day per-scraper baselines (KVS key
+  `scraper_health_state` in `sift-stack-state`; local
+  `state_backups/scraper_health_state.json`), and a Slack health block that is
+  **ALWAYS sent — outside the `_publish_ok` gate, even on 0 notices**. Flags:
+  hard fails, zero-streaks vs baseline, parse-zero (`returned>0 kept==0`),
+  result-cap/window spikes, Zillow failure share >30%, guardrail trips,
+  validator warnings, registry gaps. `Actor.set_status_message` carries the
+  verdict; `Actor.fail` only when EVERY target hard-failed.
+- **`ScraperError(msg, partial=[...])`** (`scrapers/__init__.py`) — scrapers
+  raise instead of returning `[]`; partial results still flow. The per-target
+  handler records health and keeps going. One central retry re-runs a scraper
+  once on Cloudflare/proxy-tunnel signatures.
+- **Scrapers self-report their parse rate** via `self.last_meta`
+  (`returned`/`kept`/`window_days`/`hit_cap`) — a search that returns rows the
+  parser can't keep now alerts on day 1 instead of never.
+- **Apify platform webhooks** (`scripts/setup_apify_webhooks.py`, idempotent)
+  → Slack on ACTOR.RUN.FAILED / TIMED_OUT / ABORTED — covers crashes before
+  our code runs (migrations, OOM, timeout).
+- **Alert drill:** `FORCE_SCRAPER_FAIL=bell/lien` env (CLI) or the
+  `force_scraper_fail` actor input makes one scraper raise intentionally to
+  prove the alert path.
+- **Per-scraper smoke harness:** `python src/scraper_smoke.py [--only
+  Travis/probate] [--skip-slow] [--days 7] [--max-notices 5] [--notify]` —
+  runs every registered scraper directly (bypasses the exception swallow),
+  headed + sequential, classifies ok/zero/fail/timeout, and dumps raw page
+  HTML/innerText evidence (`scrapers/debug_capture.py`,
+  `SIFT_DEBUG_CAPTURE_DIR`) on any parse-zero/failure. Windows prereqs:
+  Tesseract on PATH (Bell foreclosure OCR — NOT installed on the operator box,
+  so Bell/foreclosure reads zero locally but works in Docker), playwright-stealth,
+  residential IP.
+
+### Travis clerk "Temp index" lag — why probate/lis_pendens read zero (2026-08-18)
+
+Freshly-filed tccsearch documents sit in a **Temp index with NO grantor/grantee
+names** (the Name cell is bare `[R]`/`[E]` markers) for several days until the
+clerk verifies them. A 1-day daily window therefore only ever saw nameless rows
+→ parser kept 0 → **Travis probate and lis pendens produced nothing for 30+
+days while "Search returned N records" logged daily.** Fix:
+`tccsearch_common.effective_from_date` widens every daily window by
+`TCC_INDEX_LAG_DAYS` (default 7) so filings are re-scanned once verified —
+cross-run `seen_notice_ids` dedup absorbs the repeats. All four tccsearch
+scrapers use it. The parse-zero alarm stays quiet when ALL returned rows are
+still Temp (`count_temp_rows`) and fires otherwise.
+
+### Other hard-won source facts (2026-08-18)
+- **Williamson Tyler portal fronts an AWS WAF "Human Verification" challenge**
+  that re-arms when a second scraper hits it minutes after the first (lien ran
+  → lis_pendens got HTTP 405 on `searchResults` for 27 straight days).
+  `tyler_common.pass_aws_waf` waits out the auto-solving challenge;
+  `recover_search_session` re-runs the disclaimer flow once on a 405, then the
+  scraper raises loudly. Shared plumbing for both Williamson scrapers lives in
+  `scrapers/tyler_common.py`.
+- **GovOS publicsearch renamed `#docTypes-input` → `#docTypes`** (React rewrite,
+  2026-08-18) — both Bell scrapers accept either id. After every search,
+  `publicsearch_common.verify_window_applied` reads the results back
+  (total-results header + page-1 row dates) and retries once, then raises —
+  the silent "2500 rows for a 1-day window" class can't recur.
+- **Travis tax sale = RealAuction, plain HTTP, no login** (`tax_sale_travis.py`):
+  calendar (`dayid=` on TAX SALE cells) → PREVIEW page primes a server-side
+  session → `FNC=LOAD&AREA=W` returns JSON with Cause #, Adjudged Value, Est.
+  Min. Bid, Account Number (TCAD parcel), truncated address. Owner/situs
+  resolve from the parcel in enrichment (fire_damage pattern). The item
+  details view needs a bidder login — never fetch it. The old
+  `TRAVIS_TAX_SALES_URL` tax-office page is a 404.
+
 ## TX Data Source Details
 
 All Texas data sources are **public** — no logins or credentials required for any county source. (tccsearch.org sits behind Cloudflare — see below — and the Odyssey portals use reCAPTCHA, but neither needs an account.)
@@ -236,7 +310,7 @@ Configured in `config.py`:
 |--------|------|--------|
 | Travis | Foreclosure | tccsearch.org |
 | Travis | Tax Delinquent | Travis Tax Office CSV (13K+ records) |
-| Travis | Tax Sale | Travis Tax Office upcoming sales |
+| Travis | Tax Sale | RealAuction (travis.texas.realforeclose.com, plain HTTP JSON) |
 | Travis | Probate | Odyssey portal |
 | Travis | Lien | tccsearch.org OPR (doc-type checkboxes) |
 | Travis | Fire Damage | CTECC Real-Time Fire feed (Socrata `wpu4-x69d`) |
@@ -374,10 +448,107 @@ left phoneless) → obituary/web research (**mandatory**, free) → Trestle
 - Owner phones land in the flat dial slots; **relatives' phones stay inside
   `heir_map_json`** so a relative's number is never dialled as the owner's.
 
-**Status: the HTTP lifecycle is UNVERIFIED against a live account** (no
-`SMARTSKIP_EMAIL`/`SMARTSKIP_PASSWORD` configured yet). Parsing, the heir-map
-bridge, `apply_export`, and the payment guards are all verified offline against
-both export layouts.
+**Status: the HTTP lifecycle is VERIFIED live (2026-08-17).** A 3-record probate
+batch ran end-to-end through `skip_orchestrator`: signin → submit → calculate (3
+rows) → `pay` (amex ...1007, $0.45) → `wait_for_completion` → download → `parse_export`
+(format 1, 3/3 with results). Parsing, the heir-map bridge, `apply_export`, and the
+payment guards were already verified offline against both export layouts.
+
+## DirectSkip skip trace (`src/directskip.py`, 2026-08-17) — API LIVE-VERIFIED
+
+DirectSkip is a second skip-trace vendor, wired the SmartSkip way (operator-run
+CLI, NOT in the pipeline), but it is **single-record and synchronous**, so the
+client follows the stateless `tracerfy`/`phone_validator` shape, not
+`SmartSkipClient`'s batch lifecycle. It reuses SmartSkip's hygiene + heir-map
+helpers by import — no divergent copies.
+
+- **API (primary), confirmed + live-tested:** `POST
+  https://api0.directskip.com/v2/search_contact.php`, headers
+  `Accept/Content-Type: application/json`, auth = `api_key` **in the JSON body**.
+  Earlier probing of `api.directskip.com/v1/` was silent because that host/version
+  is wrong. Request fields: `first_name,last_name,mailing_*,property_*` (+ optional
+  `custom_field_1..3`, flags `auto_match_boost/dnc_scrub/owner_fix`). Response:
+  `{status:{error}, input, result_code, contacts:[{names,phones,emails,confirmed_address,relatives}]}`.
+- **Auth is IP-allowlisted** (registered via support@directskip.com with the
+  account email + public IP). The operator machine (`99.67.238.70`) is registered
+  and authenticates. **Apify has no static egress IP** — run the API only from the
+  fixed-IP operator box; use the portal transport (cookie auth, not IP-bound) if a
+  cloud run ever needs DirectSkip.
+- **Money safety:** pay-per-hit, `DIRECTSKIP_COST_PER_HIT=0.10`; a **no-match bills
+  $0** (verified live with a fake person). `batch_search` enforces
+  `MAX_DIRECTSKIP_COST_USD` (default $5) — it never issues a call that could push
+  spend past the cap, and a no-match doesn't count. Single `search` = one hit max.
+- **`ResultCode` `CI`** = real match; **`AB1`/`AB2`** = address-only match that
+  returns a **different person** — never treated as the owner, never fills a dial
+  slot, never promoted to DM (`address_only_match`). Blank = no match.
+- **Same trust boundaries as SmartSkip:** `Deceased` is an observation
+  (recorded in `smartskip_deceased_flag`, never sets `owner_deceased`); owner
+  phones → dial slots, relatives' phones stay in `heir_map_json`; signing
+  authority via the ONE `obituary_enricher.rank_decision_makers`. Heir entries are
+  tagged `source="directskip"` (deep_prospector sniffs this).
+- **Portal (fallback):** `app.directskip.com` — plain `login.php` (no captcha/CSRF),
+  orders at `files.php`, results at `download.php?code=<hash>`, credit balance on
+  `index.php`. The 266-col `contactinfo` CSV parses via `parse_export` (same
+  required-header gate as the `directskip-datasift-clean` skill). The submit wizard
+  (`neworder.php`, steps 1-2 mapped: `submit_step1` upload → `header_*` select
+  mapping) spends prepaid credits only at its step-4 confirm; that confirm path is
+  intentionally not wired yet (needs one live discovery run of steps 3-4).
+- **Verified offline:** `tests/test_directskip.py` (11 tests, mocked HTTP) — both
+  parsers converge, AB never becomes owner, deceased stays an observation, cost cap
+  stops the batch and a no-match is free, entity skip. **Verified live ($0):** the
+  no-match API round-trip through the real client.
+
+## Multi-provider skip-trace orchestrator (`src/skip_orchestrator.py`, 2026-08-17)
+
+One DataSift records **export** in → SmartSkip + DirectSkip + Trestle → one merged
+DataSift-ready **upload CSV** with per-number provenance. The `directskip-datasift-clean`
+skill cleans a *single already-returned* vendor file; this orchestrates a *live
+multi-provider run* from an export. Operator CLI, NOT wired into `main.py`; does
+NOT upload (DataSift API is read-only — the CSV goes through the wizard).
+
+- **Flow:** `load_datasift_export` (read-only; maps DataSift export headers →
+  `NoticeData`, flags entities out) → `estimate` (free rundown) → `run` (DirectSkip
+  per-record sync, then SmartSkip bulk, then Trestle-score every unique number) →
+  `merge_record` → tier-eviction to the phone cap → `write_upload_csv`.
+- **Merge with provenance** (the point of this module): every `MergedPhone` carries
+  a `providers` set, so the Notes label each number `[Dial First 92] [SmartSkip+DirectSkip]`.
+  Relatives are unioned across vendors by name; **SmartSkip's relationship label wins**
+  (DirectSkip relatives have no relationship). A **PROVENANCE / DISCREPANCIES** block
+  lists only-SmartSkip vs only-DirectSkip numbers and each vendor's exclusive relatives.
+- **Prioritize + cap:** `select_survivors` keeps Dial First/Second and evicts worst
+  first (invalid → Drop → Dial Fourth → unscored → Dial Third) to fit `--phone-cap`
+  (default 30). Same algorithm as `clean_directskip.py` (shared logic, not shared code —
+  the skill is a self-contained distributable and can't import `src`).
+- **Money:** `estimate` spends nothing. `run` is gated by a hard `--max-cost` ceiling
+  across all three; SmartSkip's card charge additionally needs `--confirm` (mirrors
+  `smartskip.pay`). DirectSkip no-match is free; Trestle dedupes before billing; if the
+  Trestle budget is short, the cheapest-to-skip numbers stay UNSCORED (logged), never
+  silently dropped. Rates: SmartSkip $0.15, DirectSkip $0.10, Trestle $0.015/number.
+- **Litigator (TCPA):** Trestle's `litigator_checks` add-on is ON for every number
+  (`DEFAULT_ADD_LITIGATOR`, verified in the live run). A flagged number is **withheld
+  from the dial slots entirely** (never uploaded to a Phone column) but kept in Notes,
+  loudly labelled `(!) LITIGATOR - DO NOT CALL`, plus a withheld-summary block — so the
+  record's OTHER numbers still reach the person. By operator preference there is **no
+  record-level `litigator` tag** (it would suppress the whole record).
+- **Output:** the 30-phone DataSift layout (`Property Street Address…Phone 1..30,
+  Email 1..6, Tags, Notes, Owner Deceased`). Record `Tags` include `skip_traced_MM/YYYY`
+  + provider tags (`SmartSkip`/`DirectSkip` — whoever contributed) + `living`/`deceased`.
+  Per-number tier/provider/relative labels live in **Notes** (the guaranteed channel;
+  DataSift appends behind existing phones, so labels are number-keyed, never slot-keyed).
+- **CLI:** `python src/skip_orchestrator.py estimate --input export.csv` /
+  `... run --input export.csv --max-cost 50 --confirm --out upload.csv`. Skill:
+  `datasift-skiptrace-run`. Tests: `tests/test_skip_orchestrator.py` (11, offline).
+  `run` continues DirectSkip-only if SmartSkip fails, so output is always produced.
+- **Loader note:** DataSift EXPORTS use Title-first-word headers (`Property address`,
+  `Apn`, `First Name`); the loader matches case/punctuation-insensitively, prefers the
+  5-digit `zip5` columns, and reads the deceased flag from the record's own `Tags`.
+  Vendor names arrive ALL-CAPS and are title-cased (`_title`) — ALL-CAPS is a red flag.
+  Real exports can be **ragged** (row field-count ≠ header); only late columns (e.g.
+  APN passthrough, unused) are affected, never the early name/address fields.
+- **Verified live 2026-08-17** on a 3-record Williamson probate export: DirectSkip 3/3,
+  SmartSkip 3/3 (first live run — charged the card), Trestle 66 numbers, $1.74. Merged
+  output showed `[Dial First 100] [SmartSkip+DirectSkip]`, SmartSkip relationships
+  (child/in-law), DirectSkip-only relatives in the discrepancies block, all title-cased.
 
 ## Key Domain Rules
 

@@ -88,3 +88,4 @@ youtube_transcripts.py
 *_backup_*.csv
 owner_purge_poll.log
 purge_all_*.log
+scraper_health_state.json

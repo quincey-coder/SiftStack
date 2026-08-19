@@ -101,9 +101,10 @@ class BellProbateScraper:
                     except Exception:
                         pass
 
-                # Set date range
-                date_from_str = from_date.strftime("%-m/%-d/%Y")
-                date_to_str = to_date.strftime("%-m/%-d/%Y")
+                # Set date range (no %-m — that strftime flag is Linux-only and
+                # raises on Windows, which broke local smoke runs)
+                date_from_str = f"{from_date.month}/{from_date.day}/{from_date.year}"
+                date_to_str = f"{to_date.month}/{to_date.day}/{to_date.year}"
 
                 # The date fields are text inputs — clear and fill
                 date_inputs = await page.locator('input[type="text"]').all()
@@ -202,6 +203,18 @@ class BellProbateScraper:
                 raise
             finally:
                 await browser.close()
+
+        # Run-health evidence: a daily window returning hundreds of results
+        # means the date filter didn't stick (the results table caps at ~50
+        # visible rows, so the symptom is exactly 50 notices on those days).
+        window_days = (to_date - from_date).days + 1
+        self.last_meta = {
+            "window_days": window_days,
+            "returned": total,
+            "kept": len(all_notices),
+        }
+        if window_days <= 7 and total > 200:
+            self.last_meta["hit_cap"] = True
 
         logger.info(
             "Bell probate scrape complete: %d notices from %d results",

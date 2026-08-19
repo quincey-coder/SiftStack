@@ -33,8 +33,13 @@ MONTHS = [
 ]
 
 
-def _get_month_file_list(month_name: str) -> list[str]:
-    """Fetch the file listing page for a month and return PDF filenames."""
+def _get_month_file_list(month_name: str) -> list[str] | None:
+    """Fetch the file listing page for a month and return PDF filenames.
+
+    Returns None on an HTTP failure (so the caller can tell "fetch broke"
+    apart from "month legitimately has no files yet") — this whole county
+    used to fail at DEBUG level and read as an ordinary quiet month.
+    """
     url = f"{BASE_URL}/{month_name}/files.aspx"
     try:
         resp = requests.get(url, timeout=15)
@@ -42,8 +47,8 @@ def _get_month_file_list(month_name: str) -> list[str]:
         # Extract PDF filenames from HREF attributes
         return re.findall(r'HREF="([^"]+\.pdf)"', resp.text, re.IGNORECASE)
     except requests.RequestException as e:
-        logger.debug("Failed to fetch %s file listing: %s", month_name, e)
-        return []
+        logger.warning("Failed to fetch %s file listing: %s", month_name, e)
+        return None
 
 
 def _find_index_pdf(filenames: list[str]) -> str | None:
@@ -257,16 +262,23 @@ class WilliamsonForeclosureScraper:
         )
 
         all_notices: list[NoticeData] = []
+        fetch_failures = 0
 
         for month_name, year in months_to_check:
             files = _get_month_file_list(month_name)
+            if files is None:
+                fetch_failures += 1
+                continue
             if not files:
-                logger.debug("No files for %s %d", month_name, year)
+                logger.info("No files posted for %s %d", month_name, year)
                 continue
 
             idx_file = _find_index_pdf(files)
             if not idx_file:
-                logger.debug("No index PDF for %s %d", month_name, year)
+                logger.warning(
+                    "No index PDF for %s %d (files present: %d) — "
+                    "index naming may have changed", month_name, year, len(files),
+                )
                 continue
 
             logger.info("Processing %s %d index: %s", month_name, year, idx_file)
@@ -281,6 +293,13 @@ class WilliamsonForeclosureScraper:
             if max_notices and len(all_notices) >= max_notices:
                 all_notices = all_notices[:max_notices]
                 break
+
+        if fetch_failures and fetch_failures == len(months_to_check):
+            from scrapers import ScraperError
+            raise ScraperError(
+                f"Williamson foreclosure: every month listing fetch failed "
+                f"({fetch_failures}/{len(months_to_check)}) — site down or URL changed"
+            )
 
         logger.info(
             "Williamson foreclosure scrape complete: %d notices",

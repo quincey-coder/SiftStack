@@ -37,6 +37,9 @@ from notice_parser import NoticeData, normalize_court_name
 from scrapers import register
 from scrapers.lis_pendens_common import pick_defendant
 from scrapers.tccsearch_common import (
+    click_search,
+    count_temp_rows,
+    effective_from_date,
     goto_with_retry,
     launch_tcc_context,
     pass_cloudflare,
@@ -122,9 +125,7 @@ async def _set_date_range(page: Page, from_date: datetime, to_date: datetime) ->
 
 async def _submit_search(page: Page) -> int:
     async with page.expect_navigation(wait_until="domcontentloaded", timeout=40000):
-        await page.evaluate(
-            "document.getElementById('cphNoMargin_SearchButtons1_btnSearch').click()"
-        )
+        await click_search(page)  # null-guarded + retried
     await page.wait_for_timeout(2000)
     body_text = await page.inner_text("body")
     count_match = re.search(r"(\d+)\s+records?\s+found", body_text)
@@ -283,6 +284,10 @@ class TravisLisPendensScraper:
         else:
             from_date = to_date - timedelta(days=30)
 
+        # Cover the clerk's Temp-index lag (see tccsearch_common
+        # .effective_from_date) — a 1-day window parses to zero forever.
+        from_date = effective_from_date(from_date, to_date, mode)
+
         logger.info(
             "Travis lis pendens scrape: mode=%s, range=%s to %s",
             mode, from_date.strftime("%Y-%m-%d"), to_date.strftime("%Y-%m-%d"),
@@ -299,10 +304,19 @@ class TravisLisPendensScraper:
                 await page.wait_for_timeout(1500)
                 await wait_ready(page)
 
-                await safe_check(page, _doc_type_selector(self.doc_type))
+                if not await safe_check(page, _doc_type_selector(self.doc_type)):
+                    from scrapers import ScraperError
+                    raise ScraperError(
+                        "Travis lis pendens: doc-type checkbox not checkable — "
+                        "search would be misfiltered"
+                    )
                 await _set_date_range(page, from_date, to_date)
 
                 total = await _submit_search(page)
+                self.last_meta = {
+                    "returned": total,
+                    "window_days": (to_date - from_date).days + 1,
+                }
                 if total == 0:
                     await browser.close()
                     return []
@@ -329,12 +343,36 @@ class TravisLisPendensScraper:
 
                     await asyncio.sleep(random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX))
 
+                if total > 0 and not all_notices:
+                    # 100% parse rejection. Expected ONLY when every row is
+                    # still in the clerk's Temp index (no names yet) — anything
+                    # else is the silent regression class this guards against.
+                    body_text = await page.inner_text("body")
+                    temp_rows = count_temp_rows(body_text)
+                    if temp_rows >= total:
+                        logger.info(
+                            "Travis lis pendens: all %d record(s) still in the "
+                            "Temp index (names not yet attached) — the lookback "
+                            "window will pick them up once verified", total,
+                        )
+                        self.last_meta["temp_pending"] = total
+                        self.last_meta["returned"] = 0  # not parseable yet
+                    else:
+                        from scrapers import ScraperError
+                        from scrapers.debug_capture import dump_page
+                        await dump_page(page, "travis_lis_pendens_parse_zero")
+                        raise ScraperError(
+                            f"Travis lis pendens: {total} records found but 0 "
+                            f"parsed ({temp_rows} Temp) — grid/parser regression"
+                        )
+
             except Exception as e:
                 logger.error("Travis lis pendens scraper failed: %s", e)
                 raise
             finally:
                 await browser.close()
 
+        self.last_meta["kept"] = len(all_notices)
         logger.info(
             "Travis lis pendens scrape complete: %d records from %d total",
             len(all_notices), total,

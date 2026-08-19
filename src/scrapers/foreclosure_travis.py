@@ -34,6 +34,8 @@ from playwright.async_api import async_playwright, Page
 from notice_parser import NoticeData
 from scrapers import register
 from scrapers.tccsearch_common import (
+    click_search,
+    effective_from_date,
     goto_with_retry,
     launch_tcc_context,
     pass_cloudflare,
@@ -168,9 +170,9 @@ async def _set_date_range(page: Page, from_date: datetime, to_date: datetime) ->
 async def _submit_search(page: Page) -> int:
     """Submit the search form and return total results count."""
     async with page.expect_navigation(wait_until="domcontentloaded", timeout=30000):
-        await page.evaluate(
-            "document.getElementById('cphNoMargin_SearchButtons1_btnSearch').click()"
-        )
+        await click_search(page)  # null-guarded + retried (the old bare
+        # getElementById().click() crashed on 10 of 30 days when the form
+        # render raced the framework)
     await page.wait_for_timeout(2000)
 
     # Extract total count from "Showing Records 1 through 20 ( 150 records found ... )"
@@ -368,6 +370,10 @@ class TravisForeclosureScraper:
         else:
             from_date = to_date - timedelta(days=30)
 
+        # Cover the clerk's Temp-index lag so paper-filed notices that were
+        # nameless on day 1 get re-scanned once verified (dedup absorbs repeats).
+        from_date = effective_from_date(from_date, to_date, mode)
+
         logger.info(
             "Travis foreclosure scrape: mode=%s, range=%s to %s",
             mode, from_date.strftime("%Y-%m-%d"), to_date.strftime("%Y-%m-%d"),
@@ -390,14 +396,24 @@ class TravisForeclosureScraper:
                 # was withheld (datacenter-IP block) instead of a 30s check timeout.
                 await wait_ready(page)
 
-                # Step 3: Check foreclosure document type
-                await safe_check(page, _doc_type_selector(DOC_TYPE_FORECLOSURE))
+                # Step 3: Check foreclosure document type — a failed check
+                # means the search would run UNFILTERED, so it's fatal.
+                if not await safe_check(page, _doc_type_selector(DOC_TYPE_FORECLOSURE)):
+                    from scrapers import ScraperError
+                    raise ScraperError(
+                        "Travis foreclosure: doc-type checkbox not checkable — "
+                        "search would be misfiltered"
+                    )
 
                 # Step 4: Set date range
                 await _set_date_range(page, from_date, to_date)
 
                 # Step 5: Submit search
                 total = await _submit_search(page)
+                self.last_meta = {
+                    "returned": total,
+                    "window_days": (to_date - from_date).days + 1,
+                }
                 if total == 0:
                     await browser.close()
                     return []
@@ -432,6 +448,7 @@ class TravisForeclosureScraper:
             finally:
                 await browser.close()
 
+        self.last_meta["kept"] = len(all_notices)
         logger.info(
             "Travis foreclosure scrape complete: %d notices from %d total records",
             len(all_notices), total,

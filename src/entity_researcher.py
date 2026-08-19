@@ -163,7 +163,8 @@ def _search_entity(entity_name: str, state: str = "Texas") -> list[dict]:
     query = f'"{entity_name}" {state} registered agent OR member OR officer'
 
     try:
-        results = DDGS().text(query, max_results=8, backend="google,duckduckgo,brave")
+        # ddgs dropped its "google" backend (logged a WARNING per request).
+        results = DDGS().text(query, max_results=8, backend="duckduckgo,brave")
     except Exception as e:
         logger.debug("Search failed for '%s': %s", query, e)
         return []

@@ -210,15 +210,19 @@ async def _add_doc_types(page: Page) -> list[str]:
     the search is filtered to lis pendens.
     """
     added: list[str] = []
-    dt = page.locator("#docTypes-input")
+    # 2026-08-18: GovOS renamed the input #docTypes-input → #docTypes (React
+    # rewrite of the control); the dropdown items kept their classes. Accept
+    # both ids so the next rename direction also keeps working.
+    dt = page.locator("#docTypes-input, #docTypes").first
     try:
         await dt.wait_for(state="attached", timeout=12000)
         await page.evaluate(
-            "() => document.querySelector('#docTypes-input')?.scrollIntoView({block:'center'})"
+            "() => (document.querySelector('#docTypes-input') || "
+            "document.querySelector('#docTypes'))?.scrollIntoView({block:'center'})"
         )
         await page.wait_for_timeout(400)
     except Exception:
-        logger.warning("docTypes-input never appeared")
+        logger.warning("doc-types input (#docTypes-input / #docTypes) never appeared")
         return []
     for name in LIS_PENDENS_DOC_TYPE_NAMES:
         try:
@@ -239,7 +243,9 @@ async def _add_doc_types(page: Page) -> list[str]:
             await dt.fill("")
             await page.wait_for_timeout(150)
         except Exception as e:
-            logger.debug("doc type %r add error: %s", name, e)
+            # WARNING, not debug — an invisible interaction failure here is
+            # exactly how doc-type selection died silently on 2026-08-18.
+            logger.warning("doc type %r add error: %s", name, e)
     return added
 
 
@@ -367,38 +373,68 @@ class _PublicSearchLisPendensScraper:
                     await browser.close()
                     return []
 
-                await _dismiss_popups(page)
+                from scrapers import ScraperError
+                from scrapers.publicsearch_common import verify_window_applied
+                from scrapers.debug_capture import dump_page
 
-                selected = await _add_doc_types(page)
-                logger.info("%s lis pendens: document types selected: %s", self.COUNTY, selected)
+                label = f"{self.COUNTY} lis pendens"
+                self.last_meta = {"window_days": (to_date - from_date).days + 1}
 
-                try:
-                    await page.fill("#recordedDateRange-start", _date_str(from_date))
-                    await page.keyboard.press("Escape")
-                    await page.fill("#recordedDateRange-end", _date_str(to_date))
-                    await page.keyboard.press("Escape")
-                except Exception as e:
-                    logger.warning("%s lis pendens: could not set date range: %s", self.COUNTY, e)
+                # Full search flow with ONE retry: doc types → dates → Search →
+                # verify the portal actually APPLIED the date window (on ~10 of
+                # 30 days it silently didn't, pulling the 2500-row junk cap).
+                window_ok = False
+                for attempt in range(2):
+                    if attempt:
+                        logger.warning(
+                            "%s: re-running the advanced search once "
+                            "(doc types or date filter did not apply)", label,
+                        )
+                        await page.goto(f"{base}/search/advanced", wait_until="domcontentloaded")
+                        try:
+                            await page.wait_for_selector("#recordedDateRange-start", timeout=40000)
+                        except Exception:
+                            break
+                    await _dismiss_popups(page)
 
-                if not selected:
-                    logger.warning(
-                        "%s lis pendens: no document types selected — search would be "
-                        "unfiltered; aborting to avoid pulling all record types.",
-                        self.COUNTY,
+                    selected = await _add_doc_types(page)
+                    logger.info("%s: document types selected: %s", label, selected)
+                    if not selected:
+                        await dump_page(page, f"{self.COUNTY.lower()}_lp_no_doctypes")
+                        continue  # retry once, then the loop exit raises below
+
+                    try:
+                        await page.fill("#recordedDateRange-start", _date_str(from_date))
+                        await page.keyboard.press("Escape")
+                        await page.fill("#recordedDateRange-end", _date_str(to_date))
+                        await page.keyboard.press("Escape")
+                    except Exception as e:
+                        logger.warning("%s: could not set date range: %s", label, e)
+
+                    await _dismiss_popups(page)
+                    await page.get_by_role("button", name="Search", exact=True).click()
+
+                    if not await _wait_for_results(page):
+                        await dump_page(page, f"{self.COUNTY.lower()}_lp_results_never_rendered")
+                        raise ScraperError(
+                            f"{label}: results never rendered (anti-bot or source change)"
+                        )
+
+                    ok, evidence = await verify_window_applied(
+                        page, from_date, to_date, label
                     )
-                    await browser.close()
-                    return []
+                    self.last_meta.update(evidence)
+                    if ok:
+                        window_ok = True
+                        break
+                    await dump_page(page, f"{self.COUNTY.lower()}_lp_window_not_applied")
 
-                await _dismiss_popups(page)
-                await page.get_by_role("button", name="Search", exact=True).click()
-
-                if not await _wait_for_results(page):
-                    logger.warning(
-                        "%s lis pendens: results never rendered (anti-bot / no matches). "
-                        "Returning %d.", self.COUNTY, len(all_notices),
+                if not window_ok:
+                    raise ScraperError(
+                        f"{label}: search filters did not apply after retry — "
+                        f"doc types or recordedDateRange failed "
+                        f"(evidence {self.last_meta})"
                     )
-                    await browser.close()
-                    return all_notices
 
                 page_num = 1
                 empty_streak = 0
@@ -436,10 +472,23 @@ class _PublicSearchLisPendensScraper:
                     await asyncio.sleep(REQUEST_DELAY)
 
             except Exception as e:
-                logger.error("%s lis pendens scraper failed: %s", self.COUNTY, e)
+                # Fail LOUD: propagate through ScraperError so the run-health
+                # report alerts, while still handing back whatever pages were
+                # scraped before the failure.
+                from scrapers import ScraperError
+                if isinstance(e, ScraperError):
+                    e.partial = all_notices
+                    raise
+                logger.error(
+                    "%s lis pendens scraper failed: %s", self.COUNTY, e, exc_info=True
+                )
+                raise ScraperError(
+                    f"{self.COUNTY} lis pendens: {e}", partial=all_notices
+                ) from e
             finally:
                 await browser.close()
 
+        self.last_meta["kept"] = len(all_notices)
         logger.info("%s lis pendens scrape complete: %d records", self.COUNTY, len(all_notices))
         return all_notices
 

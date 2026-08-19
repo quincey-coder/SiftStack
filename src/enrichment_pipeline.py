@@ -448,7 +448,23 @@ def run_enrichment_pipeline(
         try:
             import asyncio
             from property_lookup import lookup_decedent_properties
-            asyncio.run(lookup_decedent_properties(probate_no_addr))
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                # CLI path (no running loop) — plain asyncio.run works.
+                asyncio.run(lookup_decedent_properties(probate_no_addr))
+            else:
+                # Actor path: run_enrichment_pipeline is called from inside the
+                # actor's event loop, where asyncio.run() raises. Run the
+                # lookup on its own loop in a worker thread instead — before
+                # this, the fallback lookup silently failed on every cloud run
+                # that still had address-less probate records at this step.
+                import threading
+                def _worker():
+                    asyncio.run(lookup_decedent_properties(probate_no_addr))
+                t = threading.Thread(target=_worker, daemon=True)
+                t.start()
+                t.join(timeout=600)
             found = sum(1 for n in probate_no_addr if n.address.strip())
             logger.info("  Property address found: %d/%d", found, len(probate_no_addr))
         except Exception as e:

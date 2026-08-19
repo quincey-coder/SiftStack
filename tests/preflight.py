@@ -15,7 +15,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv()
+# Pin to the repo-root .env regardless of the CWD this is launched from.
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 # Color output
 GREEN = "\033[92m"
@@ -72,8 +73,9 @@ for key in optional:
 print(f"\n{BOLD}{CYAN}2. Python module imports{RESET}")
 
 def test_imports():
-    # src/ modules use flat imports — must add src/ to sys.path
-    sys.path.insert(0, str(Path(__file__).parent / "src"))
+    # src/ modules use flat imports — must add src/ to sys.path.
+    # This file lives in tests/, so src/ is a SIBLING of our parent.
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
     import config  # noqa
     import notice_parser  # noqa
     import enrichment_pipeline  # noqa
@@ -315,7 +317,7 @@ check("Dropbox refresh token", test_dropbox)
 print(f"\n{BOLD}{CYAN}12. Google Drive (Shared Drive upload){RESET}")
 
 def test_drive():
-    from src.drive_uploader import upload_file
+    from drive_uploader import upload_file  # src/ is on sys.path (test_imports)
     folder_id = env("GOOGLE_DRIVE_FOLDER_ID")
     key = env("GOOGLE_SERVICE_ACCOUNT_KEY")
     with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
@@ -327,6 +329,34 @@ def test_drive():
     return f"uploaded: {link[:60]}..."
 
 check("Drive Shared Drive upload", test_drive)
+
+
+# ── DATASIFT API (read-only $0 ping) ────────────────────────────────
+print(f"\n{BOLD}{CYAN}13. DataSift internal API (read-only){RESET}")
+
+def test_datasift_api():
+    env("DATASIFT_EMAIL"); env("DATASIFT_PASSWORD")
+    from datasift_api_client import DataSiftAPIClient
+    client = DataSiftAPIClient.from_env()
+    user = client.get_user()
+    email = (user or {}).get("email") or (user or {}).get("username") or "?"
+    return f"authenticated as {email}"
+
+check("DataSift get_user()", test_datasift_api)
+
+
+# ── SOCRATA (Austin open data — fire damage + code enforcement) ─────
+print(f"\n{BOLD}{CYAN}14. Socrata (data.austintexas.gov){RESET}")
+
+def test_socrata():
+    import urllib.request
+    # $limit=1 on the CTECC fire feed — anonymous, free
+    url = "https://data.austintexas.gov/resource/wpu4-x69d.json?$limit=1"
+    with urllib.request.urlopen(url, timeout=15) as r:
+        rows = json.loads(r.read())
+    return f"fire feed reachable ({len(rows)} row)"
+
+check("Socrata $limit=1", test_socrata)
 
 
 # ── SUMMARY ─────────────────────────────────────────────────────────

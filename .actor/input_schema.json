@@ -52,6 +52,13 @@
             "maximum": 10000,
             "editor": "number"
         },
+        "force_scraper_fail": {
+            "title": "Force Scraper Fail (alert drill)",
+            "type": "string",
+            "description": "Alert-system drill: 'county/type' (e.g. 'bell/lien') makes that one scraper raise intentionally so you can verify the 🚨 health alert fires. Leave empty in production.",
+            "editor": "textfield",
+            "default": ""
+        },
 
         "enable_obituary": {
             "title": "Enable Obituary / Deceased-Owner Detection",

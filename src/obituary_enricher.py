@@ -857,7 +857,10 @@ def _ddgs_search(query: str, max_results: int = 8) -> list[dict]:
     try:
         with _ddgs_lock:
             return DDGS().text(query, max_results=max_results,
-                               backend="google,duckduckgo,brave")
+                               # ddgs dropped its "google" backend (each request
+                               # logged a WARNING and fell through) — 25 of the
+                               # 36 warning lines in a typical run were this.
+                               backend="duckduckgo,brave")
     except Exception as e:
         logger.debug("DDGS search failed for '%s': %s", query, e)
         return []

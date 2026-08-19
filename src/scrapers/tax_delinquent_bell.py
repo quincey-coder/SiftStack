@@ -356,8 +356,19 @@ class BellTaxDelinquentScraper:
             header = list(next(rows))
         except StopIteration:
             wb.close()
-            return []
+            from scrapers import ScraperError
+            raise ScraperError(
+                "Bell tax delinquent: XLSX has no header row — empty/corrupt download"
+            )
         col = {h: i for i, h in enumerate(header) if h is not None}
+        if "prop_id" not in col:
+            wb.close()
+            from scrapers import ScraperError
+            raise ScraperError(
+                f"Bell tax delinquent: expected column 'prop_id' missing from "
+                f"header {header[:10]!r} — schema drift, extend the column map "
+                f"instead of letting every row silently fail"
+            )
 
         def _g(row, name, default=""):
             i = col.get(name)

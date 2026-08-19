@@ -44,6 +44,8 @@ from notice_parser import NoticeData, normalize_court_name
 from scrapers import register
 from scrapers.lien_common import pick_debtor
 from scrapers.tccsearch_common import (
+    click_search,
+    effective_from_date,
     goto_with_retry,
     launch_tcc_context,
     pass_cloudflare,
@@ -163,9 +165,7 @@ async def _set_date_range(page: Page, from_date: datetime, to_date: datetime) ->
 
 async def _submit_search(page: Page) -> int:
     async with page.expect_navigation(wait_until="domcontentloaded", timeout=40000):
-        await page.evaluate(
-            "document.getElementById('cphNoMargin_SearchButtons1_btnSearch').click()"
-        )
+        await click_search(page)  # null-guarded + retried
     await page.wait_for_timeout(2000)
     body_text = await page.inner_text("body")
     count_match = re.search(r"(\d+)\s+records?\s+found", body_text)
@@ -334,6 +334,10 @@ class TravisLienScraper:
         else:
             from_date = to_date - timedelta(days=30)
 
+        # Cover the clerk's Temp-index lag so paper-filed liens that were
+        # nameless on day 1 get re-scanned once verified (dedup absorbs repeats).
+        from_date = effective_from_date(from_date, to_date, mode)
+
         logger.info(
             "Travis lien scrape: mode=%s, range=%s to %s, doc_types=%s",
             mode, from_date.strftime("%Y-%m-%d"), to_date.strftime("%Y-%m-%d"),
@@ -355,12 +359,30 @@ class TravisLienScraper:
                 # was withheld (datacenter-IP block) instead of dying on $find.
                 await wait_ready(page)
 
+                checked = 0
                 for idx in self.doc_types:
-                    await safe_check(page, _doc_type_selector(idx))
+                    if await safe_check(page, _doc_type_selector(idx)):
+                        checked += 1
+                if checked == 0:
+                    from scrapers import ScraperError
+                    raise ScraperError(
+                        "Travis lien: NO doc-type checkbox could be checked — "
+                        "search would be unfiltered"
+                    )
+                if checked < len(self.doc_types):
+                    logger.warning(
+                        "Travis lien: only %d/%d doc-type checkboxes checked — "
+                        "results will be partial", checked, len(self.doc_types),
+                    )
 
                 await _set_date_range(page, from_date, to_date)
 
                 total = await _submit_search(page)
+                self.last_meta = {
+                    "returned": total,
+                    "window_days": (to_date - from_date).days + 1,
+                    "doctypes_checked": checked,
+                }
                 if total == 0:
                     await browser.close()
                     return []
@@ -393,6 +415,7 @@ class TravisLienScraper:
             finally:
                 await browser.close()
 
+        self.last_meta["kept"] = len(all_notices)
         logger.info(
             "Travis lien scrape complete: %d liens from %d total records",
             len(all_notices), total,
