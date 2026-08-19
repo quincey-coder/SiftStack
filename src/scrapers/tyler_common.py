@@ -140,7 +140,7 @@ _WAF_MARKER_JS = (
 )
 
 
-async def pass_aws_waf(page: Page, timeout_s: int = 45) -> bool:
+async def pass_aws_waf(page: Page, timeout_s: int = 90) -> bool:
     """Wait out the AWS WAF 'Human Verification' JS challenge.
 
     Tyler fronts the portal with AWS WAF; when its rate rule trips (e.g. the

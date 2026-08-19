@@ -31,6 +31,7 @@ from playwright.async_api import async_playwright
 
 from notice_parser import NoticeData, normalize_court_name
 from scrapers import register
+from scrapers.tccsearch_common import proxy_kwargs as _proxy_kwargs
 from scrapers.lis_pendens_common import pick_defendant
 from scrapers import tyler_common as tc
 from scrapers.debug_capture import dump_page, dump_text
@@ -124,6 +125,12 @@ class WilliamsonTylerLisPendensScraper:
                 return []
 
             context = await browser.new_context(
+                # Cloud egress fix (2026-08-19): route through the residential
+                # proxy when configured — the datacenter IP is what AWS WAF
+                # (Williamson Tyler) challenges endlessly and what heats the
+                # GovOS anti-bot on the second publicsearch session per run.
+                # No-op locally (SCRAPER_PROXY_URL unset).
+                **_proxy_kwargs(),
                 user_agent=tc.USER_AGENT,
                 viewport={"width": 1400, "height": 1300},
                 ignore_https_errors=True,

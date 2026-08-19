@@ -410,6 +410,7 @@ async def actor_main() -> None:
 
         # Alert-system drill: makes one named scraper raise intentionally so
         # the 🚨 health alert path can be verified end-to-end on the platform.
+        health.max_notices = int(actor_input.get("max_notices", 0) or 0) or None
         _force_fail = (actor_input.get("force_scraper_fail") or "").strip()
         if _force_fail:
             os.environ["FORCE_SCRAPER_FAIL"] = _force_fail
@@ -2833,6 +2834,7 @@ def _run_scrape_pipeline(args, targets) -> None:
     _wec = _rh.WarnErrorCounter()
     logging.getLogger().addHandler(_wec)
     health = _rh.RunHealth()
+    health.max_notices = getattr(args, "max_notices", None) or None
     health.registry_gaps = [g for g in registry_gaps() if g not in KNOWN_MISSING]
     health.known_gaps = list(KNOWN_MISSING)
     _health_state_file = config.STATE_FILE.parent / "scraper_health_state.json"

@@ -35,6 +35,7 @@ from playwright.async_api import async_playwright, Page
 
 from notice_parser import NoticeData, normalize_court_name
 from scrapers import register
+from scrapers.tccsearch_common import proxy_kwargs as _proxy_kwargs
 from scrapers.lis_pendens_common import pick_defendant
 
 logger = logging.getLogger(__name__)
@@ -342,6 +343,12 @@ class _PublicSearchLisPendensScraper:
                 return []
 
             context = await browser.new_context(
+                # Cloud egress fix (2026-08-19): route through the residential
+                # proxy when configured — the datacenter IP is what AWS WAF
+                # (Williamson Tyler) challenges endlessly and what heats the
+                # GovOS anti-bot on the second publicsearch session per run.
+                # No-op locally (SCRAPER_PROXY_URL unset).
+                **_proxy_kwargs(),
                 user_agent=(
                     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"

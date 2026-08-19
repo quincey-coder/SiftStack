@@ -79,6 +79,10 @@ class RunHealth:
         self.notices_total: int = 0     # post-enrichment survivors
         self.elapsed_min: float = 0.0
         self.cost_usd: float = 0.0
+        # Smoke-test cap (input max_notices). When set, scrapers stop early on
+        # purpose — analyze() must not read the truncation as a source result
+        # cap / date-filter failure (false positive observed 2026-08-19).
+        self.max_notices: int | None = None
 
     def record_scraper(
         self,
@@ -232,7 +236,12 @@ def analyze(health: RunHealth, baselines: dict | None) -> HealthReport:
         # (tax delinquent) legitimately return thousands every day.
         window_days = s.evidence.get("window_days")
         spike_threshold = max(10 * median, SPIKE_ABS_FLOOR) if median else SPIKE_ABS_FLOOR
-        if s.evidence.get("hit_cap"):
+        smoke_capped = bool(
+            health.max_notices and s.count >= health.max_notices
+        )
+        if smoke_capped:
+            pass  # capped by the run's own max_notices — not a source signal
+        elif s.evidence.get("hit_cap"):
             report.flags.append(
                 f":warning: {s.key} — hit the source's result cap ({s.count})"
                 + (f" for a {window_days}-day window" if window_days else "")
