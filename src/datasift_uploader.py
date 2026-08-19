@@ -122,6 +122,7 @@ async def upload_csv(
         "message": "",
     }
 
+    csv_path = Path(csv_path)
     if not csv_path.exists():
         result["message"] = f"CSV file not found: {csv_path}"
         logger.error(result["message"])
@@ -546,11 +547,53 @@ DATASIFT_RECORDS_URL = "https://app.reisift.io/records/properties"
 
 
 async def _navigate_to_records(page: Page) -> None:
-    """Navigate to the Records page and wait for SPA to render."""
-    if "/records" not in page.url:
-        await page.goto(DATASIFT_RECORDS_URL, wait_until="domcontentloaded")
+    """Navigate to the Records page and wait for SPA to render.
+
+    Always performs a real navigation, even when already on /records: a stray
+    action modal survives SPA state and blocks every later click — observed
+    live 2026-08-17, when a skip-trace modal stuck on a "Duplicated task"
+    error sat over the page and made the next list's filter panel unreachable.
+    A full goto resets the SPA and clears it.
+    """
+    await page.goto(DATASIFT_RECORDS_URL, wait_until="domcontentloaded")
     await page.wait_for_timeout(5000)
     await _dismiss_popups(page)
+
+
+async def _select_records_tab(page: Page, tab: str = "All") -> bool:
+    """Switch the records page to the given segmented tab (Clean/Incomplete/All).
+
+    The records page DEFAULTS to the "Clean" tab, which hides records DataSift
+    classifies as Incomplete — so a bulk action that selects "all" visible rows
+    without switching tabs silently misses them (found 2026-08-17: 2/6
+    tax-delinquent and 5/8 fire-damage records were never enriched or
+    skip-traced). Bulk actions must switch to "All" first.
+
+    The tabs are styled leaf elements, not real <button>s with stable ids, so
+    match on exact text among leaf nodes right of the sidebar (x > 250) — the
+    same live-verified pattern the 2026-08-17 fixup used.
+    """
+    try:
+        clicked = await page.evaluate(
+            """(tab) => {
+                const els = [...document.querySelectorAll('button, div, span, a')];
+                const el = els.find(e =>
+                    e.textContent.trim() === tab &&
+                    e.getBoundingClientRect().x > 250 &&
+                    e.children.length === 0);
+                if (el) { el.click(); return true; }
+                return false;
+            }""", tab)
+        await page.wait_for_timeout(3000)
+        if clicked:
+            logger.info("Records page switched to %r tab", tab)
+        else:
+            logger.warning("Could not find the %r records tab — bulk action "
+                           "may miss Incomplete records", tab)
+        return clicked
+    except Exception as e:
+        logger.warning("Records tab switch failed: %s", e)
+        return False
 
 
 async def _filter_by_list(page: Page, list_name: str) -> bool:
@@ -768,12 +811,20 @@ async def enrich_records(page: Page, list_name: str) -> dict:
         # Navigate to Records
         await _navigate_to_records(page)
 
-        # Filter to the uploaded list
+        # Filter to the uploaded list. HARD GATE: without a verified filter,
+        # the select-all below would grab whatever is showing — potentially
+        # every record in the account. Never proceed unfiltered.
         filtered = await _filter_by_list(page, list_name)
         if not filtered:
-            result["message"] = "Could not filter to list for enrichment"
-            logger.warning(result["message"])
-            # Continue anyway — may enrich whatever is showing
+            result["message"] = (
+                f"List filter for {list_name!r} did not apply — refusing to "
+                "enrich an unfiltered selection")
+            logger.error(result["message"])
+            return result
+
+        # Include Incomplete records — the page defaults to the Clean tab,
+        # which would silently exclude them from the selection.
+        await _select_records_tab(page, "All")
 
         # Select all records
         selected = await _select_all_records(page)
@@ -922,10 +973,20 @@ async def skip_trace_records(page: Page, list_name: str) -> dict:
         # Navigate to Records (may already be there from enrichment)
         await _navigate_to_records(page)
 
-        # Filter to the uploaded list
+        # Filter to the uploaded list. HARD GATE: without a verified filter,
+        # the select-all below would grab whatever is showing — potentially
+        # every record in the account. Never skip-trace unfiltered.
         filtered = await _filter_by_list(page, list_name)
         if not filtered:
-            logger.warning("Could not filter to list for skip trace — continuing anyway")
+            result["message"] = (
+                f"List filter for {list_name!r} did not apply — refusing to "
+                "skip trace an unfiltered selection")
+            logger.error(result["message"])
+            return result
+
+        # Include Incomplete records — the page defaults to the Clean tab,
+        # which would silently exclude them from the selection.
+        await _select_records_tab(page, "All")
 
         # Select all records
         selected = await _select_all_records(page)
@@ -1084,13 +1145,24 @@ async def upload_to_datasift(
                     "message": "DataSift login failed",
                 }
 
-            # Upload CSV
-            result = await upload_csv(page, csv_path)
+            # Upload CSV. Generate the list name UP FRONT and pass it through,
+            # so enrich/skip-trace below target the exact list the wizard
+            # created. (Previously the name was derived after the fact and
+            # upload_csv received none, so the two could disagree and the
+            # bulk actions would filter to a list that didn't exist.)
+            from datetime import datetime as _dt
+            list_name = f"SiftStack {_dt.now().strftime('%Y-%m-%d')}"
+            result = await upload_csv(page, csv_path, list_name=list_name)
 
             if result.get("success"):
-                # Derive list name (same format as upload_csv generates)
-                from datetime import datetime as _dt
-                list_name = f"SiftStack {_dt.now().strftime('%Y-%m-%d')}"
+                result["list_name"] = list_name
+
+                if enrich or skip_trace:
+                    # DataSift imports asynchronously; filtering the new list
+                    # too early sees only the rows that have landed so far
+                    # (observed live 2026-08-17).
+                    logger.info("Waiting 60s for the import to land before bulk actions...")
+                    await page.wait_for_timeout(60000)
 
                 # Enrich property data via SiftMap
                 if enrich:
@@ -1205,19 +1277,52 @@ async def upload_datasift_split(
                 "message": f"Uploaded {len(uploads)}/{len(csv_infos)} CSVs",
             }
 
-            # Enrich + skip trace once, using the first list name (has all records)
-            if all_success and csv_infos:
-                first_list = csv_infos[0]["list_name"]
+            # Enrich + skip trace EVERY uploaded list. (This previously ran
+            # once on csv_infos[0]'s list on the assumption it "has all
+            # records" — but each CSV targets its own list, so every list
+            # after the first silently missed both actions.) List names are
+            # deduped because county-split CSVs share one list per notice
+            # type, and re-submitting the same list makes DataSift reject the
+            # skip trace as a "Duplicated task".
+            if all_success and csv_infos and (enrich or skip_trace):
+                # DataSift imports asynchronously; filtering a new list too
+                # early sees only the rows that have landed so far (observed
+                # live 2026-08-17).
+                logger.info("Waiting 60s for imports to land before bulk actions...")
+                await page.wait_for_timeout(60000)
+
+                list_names: list[str] = []
+                for info in csv_infos:
+                    if info["list_name"] not in list_names:
+                        list_names.append(info["list_name"])
+
+                enrich_results, skip_results = [], []
+                for ln in list_names:
+                    if enrich:
+                        er = await enrich_records(page, ln)
+                        er["list_name"] = ln
+                        enrich_results.append(er)
+                        logger.info("Enrichment [%s]: %s", ln, er.get("message", ""))
+                    if skip_trace:
+                        sr = await skip_trace_records(page, ln)
+                        sr["list_name"] = ln
+                        skip_results.append(sr)
+                        logger.info("Skip trace [%s]: %s", ln, sr.get("message", ""))
 
                 if enrich:
-                    enrich_result = await enrich_records(page, first_list)
-                    combined["enrich_result"] = enrich_result
-                    logger.info("Enrichment: %s", enrich_result.get("message", ""))
-
+                    ok = sum(1 for r in enrich_results if r.get("success"))
+                    combined["enrich_result"] = {
+                        "success": ok == len(enrich_results),
+                        "message": f"{ok}/{len(enrich_results)} lists enriched",
+                        "per_list": enrich_results,
+                    }
                 if skip_trace:
-                    skip_result = await skip_trace_records(page, first_list)
-                    combined["skip_trace_result"] = skip_result
-                    logger.info("Skip trace: %s", skip_result.get("message", ""))
+                    ok = sum(1 for r in skip_results if r.get("success"))
+                    combined["skip_trace_result"] = {
+                        "success": ok == len(skip_results),
+                        "message": f"{ok}/{len(skip_results)} lists skip traced",
+                        "per_list": skip_results,
+                    }
 
             return combined
 
