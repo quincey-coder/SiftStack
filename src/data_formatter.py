@@ -153,12 +153,28 @@ def _split_name(full_name: str) -> tuple[str, str, str]:
 def _notice_id_from_url(url: str) -> str:
     """Extract the numeric notice ID from a source URL.
 
-    URLs look like: .../Details.aspx?SID=...&ID=509975
-    Returns the ID value, or empty string if not found.
+    Recognized shapes (returns empty string if none match):
+      .../Details.aspx?SID=...&ID=509975          -> "509975" (Odyssey/tccsearch)
+      https://bell.tx.publicsearch.us/doc/2026030172   -> "bell.tx.publicsearch.us/doc/2026030172"
+      .../williamsonweb/document/DOC123           -> "<host>/document/DOC123" (Tyler)
+
+    The publicsearch/Tyler forms are domain-qualified because instrument
+    numbers repeat across counties. Without these patterns every Bell and
+    Williamson lien/lis-pendens fell through to the address composite —
+    which is EMPTY for name-indexed records pre-enrichment — so they all
+    collapsed onto one degenerate dedup key (addr:lien|bell||) and were
+    silently deduped to zero at export (found 2026-08-19).
     """
     import re
+    from urllib.parse import urlsplit
     m = re.search(r"[?&]ID=(\d+)", url)
-    return m.group(1) if m else ""
+    if m:
+        return m.group(1)
+    m = re.search(r"/(doc|document)/([\w.-]+)", url)
+    if m:
+        host = urlsplit(url).netloc
+        return f"{host}/{m.group(1)}/{m.group(2)}"
+    return ""
 
 
 def deduplicate(notices: list[NoticeData]) -> list[NoticeData]:

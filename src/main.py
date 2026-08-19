@@ -90,6 +90,12 @@ def _notice_dedup_key(notice) -> str:
     ntype = (getattr(notice, "notice_type", "") or "").strip().lower()
     county = (getattr(notice, "county", "") or "").strip().lower()
     zipc = (getattr(notice, "zip", "") or "").strip()[:5]
+    if not addr:
+        # Name-indexed records (liens, lis pendens) carry no address before
+        # enrichment — an empty composite collapses every such record onto
+        # one key. Use the owner name so the key stays discriminating.
+        addr = (getattr(notice, "owner_name", "") or
+                getattr(notice, "tax_owner_name", "") or "").strip().lower()
     return f"addr:{ntype}|{county}|{addr}|{zipc}"
 
 
@@ -108,6 +114,8 @@ def _notice_dedup_key_from_row(row: dict) -> str:
     ntype = (row.get("notice_type") or "").strip().lower()
     county = (row.get("county") or "").strip().lower()
     zipc = (row.get("zip") or "").strip()[:5]
+    if not addr:
+        addr = (row.get("owner_name") or "").strip().lower()
     return f"addr:{ntype}|{county}|{addr}|{zipc}"
 
 
