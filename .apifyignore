@@ -44,3 +44,13 @@ Novation King Transcripts/
 Novation King Transcripts.log
 youtube_transcripts.py
 venv/
+data/
+.ancestry_profile/
+state_backups/
+scraper_health_state.json
+seen_ids.json
+*.xlsx
+*.log
+Logan Fullmer Transcripts/
+McKlane Bobbitt Transcripts/
+Curative Title Playbook/
