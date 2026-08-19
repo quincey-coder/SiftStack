@@ -192,7 +192,7 @@ def validate_addresses(people, aid, tok, batch_size=100):
             p = people[i]
             lk = Lookup()
             lk.street, lk.city = p["street"], p.get("city") or ""
-            lk.state, lk.zipcode = p.get("state") or "TN", p.get("zip") or ""
+            lk.state, lk.zipcode = p.get("state") or "TX", p.get("zip") or ""
             lk.candidates, lk.match = 1, MatchType.INVALID
             batch.add(lk)
         try:

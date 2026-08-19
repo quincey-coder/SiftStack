@@ -75,7 +75,7 @@ NUMBERS_FILE = Path(
 
 # ---------------------------------------------------------------- reisift
 DEALROOM_API = Path(
-    _env("DEALROOM_API_PATH", r"C:\Users\Tyrus\OneDrive\Desktop\Deal Room Coaching Call\_api")
+    _env("DEALROOM_API_PATH", "")
 )
 SIFT_ACCOUNT = _env("SMS_AGENT_SIFT_ACCOUNT", "datasift-apikey")
 SIFT_IMPERSONATE = _env("SMS_AGENT_SIFT_IMPERSONATE", "")  # e.g. ty+2@dataflik.com
@@ -119,7 +119,7 @@ ANSWER_WHO = _env("SMS_AGENT_ANSWER_WHO", "1") not in ("0", "false", "no")
 # Daily campaign window, Eastern (Ty, 2026-08-11). The recipient-local quiet
 # hours above still apply on top: this is when WE work, that is when THEY may
 # be texted, and a send needs both.
-CAMPAIGN_TZ = _env("SMS_AGENT_CAMPAIGN_TZ", "America/New_York")
+CAMPAIGN_TZ = _env("SMS_AGENT_CAMPAIGN_TZ", "America/Chicago")
 CAMPAIGN_START_HOUR = int(_env("SMS_AGENT_CAMPAIGN_START", "9"))
 CAMPAIGN_END_HOUR = int(_env("SMS_AGENT_CAMPAIGN_END", "18"))
 CAMPAIGN_ENABLED = _env("SMS_AGENT_CAMPAIGN", "0") not in ("0", "false", "no")
@@ -176,7 +176,7 @@ ESCALATION_DEBOUNCE_SECONDS = int(_env("SMS_AGENT_ESCALATION_DEBOUNCE", "75"))
 # After this many quiet days, a revived conversation earns a fresh top-level post.
 ESCALATION_QUIET_DAYS = int(_env("SMS_AGENT_ESCALATION_QUIET_DAYS", "14"))
 # Who owns a positive reply. Tagged in the post and assigned on the record.
-HANDOFF_NAME = _env("SMS_AGENT_HANDOFF_NAME", "Adriana")
+HANDOFF_NAME = _env("SMS_AGENT_HANDOFF_NAME", "Quincey")
 HANDOFF_SLACK_ID = _env("SMS_AGENT_HANDOFF_SLACK_ID", "")  # needs a bot token to look up
 HANDOFF_ASSIGNEE_UUID = _env("SMS_AGENT_HANDOFF_ASSIGNEE", "")
 

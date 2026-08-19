@@ -16,7 +16,7 @@ Dial tiers (phone_validator standard): 81-100 first, 61-80 second, 41-60 third,
 
 Input JSON: list of contacts
   [{"label": "...", "first": "..", "last": "..",
-    "address": "..", "city": "..", "state": "TN", "zip": ".."}, ...]
+    "address": "..", "city": "..", "state": "TX", "zip": ".."}, ...]
 (entities with no person: give "label" only and resolve the principal first via
 buyer_sweep / enformion_business.)
 
@@ -69,7 +69,7 @@ def enformion_pass(contacts: list[dict]) -> dict[str, dict]:
         if not (c.get("first") and c.get("last")):
             continue
         data = person_search(c["first"], c["last"], city=c.get("city", ""),
-                             state=c.get("state", "TN"), zip_code=c.get("zip", ""))
+                             state=c.get("state", "TX"), zip_code=c.get("zip", ""))
         best = _best_person(data.get("persons") or [], c)
         phones, emails = {}, set()
         if best:
@@ -110,7 +110,7 @@ def tracerfy_pass(contacts: list[dict]) -> dict[str, dict]:
                 "mail_address", "mail_city", "mail_state"])
     for c in people:
         w.writerow([c["first"], c["last"], c.get("address", ""), c.get("city", ""),
-                    c.get("state", "TN"), c.get("zip", ""), "", "", ""])
+                    c.get("state", "TX"), c.get("zip", ""), "", "", ""])
     try:
         resp = requests.post(TRACERFY_TRACE, headers={"Authorization": f"Bearer {cfg.TRACERFY_API_KEY}"},
                              data={f"{k}_column": k for k in ("first_name", "last_name", "address",

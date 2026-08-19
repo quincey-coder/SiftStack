@@ -1093,7 +1093,7 @@
      "phase": 1,
      "status": "live",
      "source": "src/buyer_sweep.py",
-     "gotcha": "THE HARPER MOVE. When an LLC's mailing address is a residence, reverse-look up that address and take the human owner as the principal. Live run resolved 175 of 193 sales and unmasked TN Super Props to Jonathan Harper, Braden Family to Joshua Braden."
+     "gotcha": "THE HARPER MOVE. When an LLC's mailing address is a residence, reverse-look up that address and take the human owner as the principal. Live run resolved 175 of 193 sales and unmasked TN Super Props to [principal A], Braden Family to [principal B]."
     },
     {
      "id": "disposkip",

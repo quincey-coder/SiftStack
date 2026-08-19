@@ -10,10 +10,10 @@ a developer account, or a credit card to get value out of this on day one.
 
 ```bash
 # macOS / Linux
-curl -fsSL https://raw.githubusercontent.com/DataSift-Ty-Personal/SiftStack/main/install.py | python3 -
+curl -fsSL https://raw.githubusercontent.com/quincey-coder/SiftStack/main/install.py | python3 -
 
 # Windows PowerShell
-irm https://raw.githubusercontent.com/DataSift-Ty-Personal/SiftStack/main/install.py | python -
+irm https://raw.githubusercontent.com/quincey-coder/SiftStack/main/install.py | python -
 ```
 
 Python 3.9 or newer, standard library only. No clone, no `pip install`, no
@@ -96,7 +96,7 @@ Faster and more thorough, and every one of them has a no-API alternative.
 Copy the example and fill in only what you want. Everything is optional.
 
 ```bash
-curl -fsSL -o .env.skills.example https://raw.githubusercontent.com/DataSift-Ty-Personal/SiftStack/main/.env.skills.example
+curl -fsSL -o .env.skills.example https://raw.githubusercontent.com/quincey-coder/SiftStack/main/.env.skills.example
 cp .env.skills.example .env
 ```
 
@@ -114,7 +114,7 @@ list.
 
 Describe the task. Do not name the skill.
 
-- "Run comps on 123 Main St, Knoxville TN 37914" triggers the comping stack.
+- "Run comps on 1234 E 12th St, Austin TX 78702" triggers the comping stack.
 - "Estimate the rehab on this, three bed one bath, 1,100 square feet, full gut"
   triggers `rehab-estimator`.
 - "Who should I hire next and what do I pay them" triggers `team-hiring`.

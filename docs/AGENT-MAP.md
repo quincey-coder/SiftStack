@@ -990,7 +990,7 @@ Deed-level sweep of who actually buys in a zip, ranked by fit.
 
 **Touches.** SiftMap, Zillow /search, Enformion BusinessV2
 
-> **The trap this exists to avoid.** THE HARPER MOVE. When an LLC's mailing address is a residence, reverse-look up that address and take the human owner as the principal. Live run resolved 175 of 193 sales and unmasked TN Super Props to Jonathan Harper, Braden Family to Joshua Braden.
+> **The trap this exists to avoid.** THE HARPER MOVE. When an LLC's mailing address is a residence, reverse-look up that address and take the human owner as the principal. Live run resolved 175 of 193 sales and unmasked TN Super Props to [principal A], Braden Family to [principal B].
 
 #### Dispo Skiptrace
 

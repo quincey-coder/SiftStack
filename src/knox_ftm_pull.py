@@ -41,7 +41,7 @@ EXTRA_COLUMNS = [
 ]
 OUT_COLUMNS = DATASIFT_COLUMNS + EXTRA_COLUMNS
 
-_API = r"C:\Users\Tyrus\OneDrive\Desktop\Deal Room Coaching Call\_api"
+_API = os.getenv("DEALROOM_API_PATH", "")
 if os.path.isdir(_API):
     sys.path.insert(0, _API)
     sys.path.insert(0, os.path.join(_API, "clients"))

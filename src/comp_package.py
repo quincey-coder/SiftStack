@@ -24,6 +24,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import csv
 import glob
 import logging
@@ -280,8 +281,8 @@ def build_workbook(subject: dict, sold: list[MarketListing], active: list[Market
 def main() -> int:
     ap = argparse.ArgumentParser(description="Build a boundary-filtered comp package workbook")
     ap.add_argument("--address", required=True)
-    ap.add_argument("--city", default="Knoxville")
-    ap.add_argument("--state", default="TN")
+    ap.add_argument("--city", default="Austin")
+    ap.add_argument("--state", default="TX")
     ap.add_argument("--zip", dest="zip_code", required=True)
     ap.add_argument("--beds", type=int, help="Override (county card beats Zillow)")
     ap.add_argument("--baths", type=float)
@@ -293,6 +294,19 @@ def main() -> int:
     ap.add_argument("--out", help="Output .xlsx path")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
+
+    # Non-disclosure fence (2026-08-19): this module comps off Zillow SOLD
+    # PRICES, which non-disclosure states (TX among them) do not publish —
+    # verified live: 0/41 priced solds in 78723/76541/78664 vs 41/41 in
+    # Knoxville. Running it there returns thin/empty comps that read as "no
+    # comps in this pocket". Use comp_analyzer + triangulation.py (CAD card +
+    # Zestimate) for those markets instead.
+    _NON_DISCLOSURE = {"TX", "ID", "KS", "LA", "MS", "MT", "NM", "ND", "UT", "WY", "MO", "AK"}
+    if args.state.upper() in _NON_DISCLOSURE and not os.getenv("ALLOW_SOLD_COMPS_ANYWAY"):
+        ap.error(
+            f"{args.state} is a NON-DISCLOSURE state: sold prices are not public, "
+            "so sold-price comping cannot work there. Use comp_analyzer / "
+            "triangulation.py (set ALLOW_SOLD_COMPS_ANYWAY=1 to override).")
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(levelname)s %(message)s")

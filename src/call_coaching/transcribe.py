@@ -23,6 +23,7 @@ Output per call:
 """
 from __future__ import annotations
 
+import os
 import argparse
 import base64
 import concurrent.futures
@@ -44,15 +45,15 @@ WORKERS = 4
 # make first-touch cold calls, so a "follow-up sounding" call is still a cold
 # call (per Ty, 2026-07-07). Keys are lowercase caller names.
 CALLER_ROLES = {
-    "tinaa george": "cold_call",
-    "adriana mondragon": "cold_call",
+    name.strip().lower(): "cold_call"
+    for name in os.getenv("COACHING_CALLER_ROSTER", "").split(",") if name.strip()
 }
 
 # Departed team members (per Ty, 2026-07-07): their historical calls are never
 # queued for coaching review. Lowercase caller names.
 EXCLUDED_CALLERS = {
-    "javier marroquin",
-    "john yunque",
+    name.strip().lower()
+    for name in os.getenv("COACHING_EXCLUDED_CALLERS", "").split(",") if name.strip()
 }
 
 TRANSCRIBE_PROMPT = """Transcribe this real estate investment phone call.

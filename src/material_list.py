@@ -1091,7 +1091,7 @@ def build_master_workbook(prices: dict, meta: dict, out_path: str):
 def main() -> int:
     ap = argparse.ArgumentParser(description="Tiered material list priced from Home Depot")
     ap.add_argument("--address", default="158 Old State Rd")
-    ap.add_argument("--zip", dest="zip_code", default="37914")
+    ap.add_argument("--zip", dest="zip_code", required=True, help="Target ZIP. NOTE: the locked master price list is 37914 (Knoxville); ""sku_pricing refuses other ZIPs until a local list is captured.")
     ap.add_argument("--sqft", type=int, default=1946)
     ap.add_argument("--beds", type=int, default=3, help="FINISHED config")
     ap.add_argument("--baths", type=float, default=2.0, help="FINISHED config")

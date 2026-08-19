@@ -34,7 +34,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 
-_API_CLIENTS = Path(r"C:\Users\Tyrus\OneDrive\Desktop\Deal Room Coaching Call\_api\clients")
+_API_CLIENTS = Path(os.getenv("DEALROOM_API_PATH", ""))
 sys.path.insert(0, str(_API_CLIENTS))
 
 import config  # noqa: E402
@@ -196,8 +196,8 @@ def _unmask_principals(client, ranked_entities: list[dict], args) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description="SiftMap deed-level buyer sweep for a zip")
     ap.add_argument("--zip", dest="zip_code", required=True)
-    ap.add_argument("--city", default="Knoxville")
-    ap.add_argument("--state", default="TN")
+    ap.add_argument("--city", default="Austin")
+    ap.add_argument("--state", default="TX")
     ap.add_argument("--months", type=int, default=18)
     ap.add_argument("--min-price", type=int, default=25000)
     ap.add_argument("--max-price", type=int, default=170000)

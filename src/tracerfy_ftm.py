@@ -57,7 +57,7 @@ def main():
             print(f"  skip (bad name): {addr!r} owner={owner!r}")
             continue
         n = NoticeData(owner_name=owner, address=addr, city=(r.get("city") or "").strip(),
-                       state=(r.get("state") or "TN").strip(), zip=(r.get("zip") or "").strip(),
+                       state=(r.get("state") or "TX").strip(), zip=(r.get("zip") or "").strip(),
                        notice_type="foreclosure", county=(r.get("county") or "").strip())
         notices.append(n)
         picked.append((addr, owner))

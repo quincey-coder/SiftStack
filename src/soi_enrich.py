@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 
 os.environ.setdefault("REISIFT_ACCOUNT", "datasift-apikey")
-sys.path.insert(0, r"C:\Users\Tyrus\OneDrive\Desktop\Deal Room Coaching Call\_api\clients")
+sys.path.insert(0, os.getenv("DEALROOM_API_PATH", ""))
 
 STATE_PATH = Path("output/soi_enrich_state.json")
 

@@ -163,12 +163,12 @@ def _ctx(spec):
     return {
         "m": m, "b": b, "p": p, "ln": ln, "members": members,
         "entity": b["entity"],
-        "formation": b.get("formation", "a Tennessee limited liability company"),
+        "formation": b.get("formation", "a Texas limited liability company"),
         "signer": b.get("signer") or "[SIGNER NAME]",
         "lender": spec.get("lender_name") or "[LENDER LEGAL NAME]",
         "date": spec.get("date", "[DATE]"),
         "agent": spec.get("closing_agent") or "[CLOSING ATTORNEY / TITLE COMPANY]",
-        "county": p.get("county", "Knox"),
+        "county": p.get("county", "Travis"),
         "is_flip": spec.get("deal_type", "flip").lower() == "flip",
     }
 
@@ -296,7 +296,7 @@ def doc_note(spec, out: Path):
     d = _doc()
     _h1(d, "Promissory Note")
     _p(d, f"Principal Amount: {_money(m['loan'])}          Date: {c['date']}          "
-          f"Place: {c['county']} County, Tennessee",
+          f"Place: {c['county']} County, Texas",
        bold=True, align=WD_ALIGN_PARAGRAPH.CENTER)
     d.add_paragraph()
     _p(d, f"FOR VALUE RECEIVED, the undersigned, {c['entity']}, {c['formation']} "
@@ -310,8 +310,8 @@ def doc_note(spec, out: Path):
     _h2(d, "1. Security")
     _p(d, f"This Note is secured by a Deed of Trust of even date granting Lender a first "
           f"lien on the real property commonly known as {p['full_address']}, "
-          f"{c['county']} County, Tennessee (the \"Property\"), to be recorded in the "
-          f"Register of Deeds of that county.")
+          f"{c['county']} County, Texas (the \"Property\"), to be recorded in the "
+          f"County Clerk (Official Public Records) of that county.")
 
     _h2(d, "2. Payment")
     _p(d, f"No monthly payments of principal or interest are required. The entire unpaid "
@@ -375,7 +375,7 @@ def doc_note(spec, out: Path):
           "modification of this Note is binding unless in writing and signed by both "
           "parties. If any provision is held unenforceable, the remainder stays in full "
           "force. This Note shall be governed by and construed in accordance with the "
-          "laws of the State of Tennessee.")
+          "laws of the State of Texas.")
 
     d.add_paragraph()
     _p(d, "BORROWER:", bold=True)
@@ -427,7 +427,7 @@ def doc_guarantee(spec, out: Path):
 
     _h2(d, "5. Governing Law")
     _p(d, "This Guaranty shall be governed by and construed in accordance with the laws "
-          "of the State of Tennessee.")
+          "of the State of Texas.")
 
     for member in c["members"]:
         _sig(d, "Guarantor", f"{member}, individually")
@@ -480,13 +480,13 @@ def doc_closing(spec, out: Path):
     _field(d, "Default", "Full amount owed including interest at point of default, with "
                          "immediate liquidation of the property and the personal "
                          "guarantee covering any shortfall")
-    _field(d, "Governing law", "Tennessee")
+    _field(d, "Governing law", "Texas")
 
     _h2(d, "Documents to prepare")
     for i, item in enumerate([
-        f"Deed of Trust on your standard Tennessee form, granting Lender a first lien "
+        f"Deed of Trust on your standard Texas form, granting Lender a first lien "
         f"on the Property, in recordable form, to be recorded with the {c['county']} "
-        f"County Register of Deeds on closing day.",
+        f"County County Clerk (Official Public Records) on closing day.",
         "Lender's title insurance policy in favor of Lender in the amount of the loan, "
         "with no exceptions other than those approved in writing by Lender.",
         "Settlement statement showing the loan proceeds, the purchase, and all costs.",
@@ -609,7 +609,7 @@ def doc_investor(spec, out: Path):
     _field(d, "Estimated payoff", _money(m["payoff"]))
     _field(d, "Secured by", "First lien, deed of trust, plus a personal guarantee from "
                             "every member of the company")
-    _field(d, "Recorded", f"{c['county']} County Register of Deeds, Book ____ "
+    _field(d, "Recorded", f"{c['county']} County County Clerk (Official Public Records), Book ____ "
                           f"Page ____ Instrument ____")
     _field(d, "Title policy number", "______________________")
     _field(d, "Insurance carrier and policy number", "______________________")
@@ -663,7 +663,7 @@ def doc_release(spec, out: Path):
         "Write PAID IN FULL across the face of the original Promissory Note, sign and "
         "date it, and return the original to us.",
         f"Execute the Release or Satisfaction of Deed of Trust prepared by the closing "
-        f"attorney so it can be recorded with the {c['county']} County Register of Deeds.",
+        f"attorney so it can be recorded with the {c['county']} County County Clerk (Official Public Records).",
         "Confirm in writing that the obligation is satisfied and that you have no "
         "further claim against the property.",
     ], 1):

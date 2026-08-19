@@ -7,7 +7,7 @@ only the people we actually decided to mail, and it appends a stats block on the
 right so each row carries its own record context.
 
 Who survives into the file, by situation (see obituary_campaign.py):
-  estate_*           the heirs, spouse and children, by TN intestacy
+  estate_*           the heirs, spouse and children, by TX intestacy
   widowed_owner      the Subject row (the living owner) plus the adult children
   owner_parent_died  the Subject row only, nothing passed to anybody
   living_owner       the Subject row plus adult children
@@ -137,10 +137,10 @@ def main():
             if not row["Property Address Full"]:
                 row["Property Address"] = prop
                 row["Property City"] = p.get("property_city", "")
-                row["Property State"] = "TN"
+                row["Property State"] = "TX"
                 row["Property Zip"] = p.get("property_zip", "")
                 row["Property Address Full"] = ", ".join(
-                    x for x in [prop, p.get("property_city"), "TN", p.get("property_zip")] if x)
+                    x for x in [prop, p.get("property_city"), "TX", p.get("property_zip")] if x)
 
             phones = [row[f"Phone {i} number"] for i in range(1, 9) if row[f"Phone {i} number"]]
             emails = [row[f"Email {i}"] for i in range(1, 18) if row[f"Email {i}"]]

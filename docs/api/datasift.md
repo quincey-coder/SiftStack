@@ -46,7 +46,7 @@ plus four it already had.
 ### 1. Tags must be an array
 
 A comma string does not split. It creates one tag literally named
-`"Courthouse Data, code_violation, Knox"`.
+`"Courthouse Data, code_violation, travis"`.
 
 ```json
 "tags": ["Courthouse Data", "code_violation", "Knox"]

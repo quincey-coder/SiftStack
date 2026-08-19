@@ -129,7 +129,7 @@ def field_index(api: Api) -> dict:
 def build_property(row: dict) -> dict:
     addr = {"street": row["Property Street Address"],
             "city": row.get("Property City") or "",
-            "state": row.get("Property State") or "TN",
+            "state": row.get("Property State") or "TX",
             "postal_code": row.get("Property ZIP Code") or ""}
     mail = {"street": row.get("Mailing Street Address") or addr["street"],
             "city": row.get("Mailing City") or addr["city"],

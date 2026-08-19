@@ -21,14 +21,15 @@ import argparse
 import asyncio
 import csv
 import random
+import os
 import sys
 import urllib.request
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-SS = Path(r"c:\Users\Tyrus\OneDrive\SiftStack")
-API = Path(r"c:\Users\Tyrus\OneDrive\Desktop\Deal Room Coaching Call\_api")
+SS = Path(os.getenv("SIFTSTACK_ROOT", str(Path(__file__).resolve().parents[1])))
+API = Path(os.getenv("DEALROOM_API_PATH", ""))
 sys.path.insert(0, str(SS / "src"))
 sys.path.insert(0, str(API))
 from playwright.async_api import async_playwright  # noqa: E402
@@ -44,7 +45,7 @@ except Exception:  # pragma: no cover
 try:
     from mms_schedule import tz_for  # noqa: E402  (area-code -> IANA tz for the quiet-hours guard)
 except Exception:
-    def tz_for(_n): return "America/New_York"
+    def tz_for(_n): return "America/Chicago"
 
 BASE = "https://phone.smrt.studio"
 STATE = SS / "smrtphone_state.json"

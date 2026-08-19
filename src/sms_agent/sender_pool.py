@@ -86,7 +86,7 @@ def timezone_for(phone: str) -> ZoneInfo:
         return ZoneInfo("America/Anchorage")
     if ac in _HAWAII:
         return ZoneInfo("Pacific/Honolulu")
-    return ZoneInfo("America/New_York")
+    return ZoneInfo("America/Chicago")
 
 
 def within_quiet_hours(phone: str, at: Optional[datetime] = None) -> bool:

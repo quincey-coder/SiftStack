@@ -46,7 +46,7 @@ from openpyxl.utils import get_column_letter
 # ── account wiring ────────────────────────────────────────────────────
 
 CLIENTS = Path(
-    r"C:\Users\Tyrus\OneDrive\Desktop\Deal Room Coaching Call\_api\clients"
+    os.getenv("DEALROOM_API_PATH", "")
 )
 BASE = "https://apiv2.reisift.io"
 OBIT_LIST_TITLE = "Obituary"
@@ -952,7 +952,7 @@ def build_workbook(qualified, excluded, meta, out: Path, min_months: int,
         ["Timing in the probate cycle", W_TIMING,
          "Months since death: under 6 scores 0.75, 6 to 9 scores 0.95, 9 to 15 scores 1.00, "
          "15 to 24 scores 0.80, over 24 scores 0.60. Plus 0.15 if probate is open and 0.10 if "
-         "the personal representative is named. Tennessee vests real property in the heirs at "
+         "the personal representative is named. Texas vests real property in the heirs at "
          "death (T.C.A. 31-2-103) and the creditor window is 4 months, so months 6 to 15 is "
          "when a decedent home is both legally sellable and emotionally ready to be sold."],
         ["Low saturation", W_SATURATION,

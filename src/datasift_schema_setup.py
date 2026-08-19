@@ -22,7 +22,7 @@ import argparse
 import os
 import sys
 
-_API = r"C:\Users\Tyrus\OneDrive\Desktop\Deal Room Coaching Call\_api"
+_API = os.getenv("DEALROOM_API_PATH", "")
 sys.path.insert(0, _API)
 sys.path.insert(0, os.path.join(_API, "clients"))
 os.environ.setdefault("REISIFT_ACCOUNT", "datasift-apikey")

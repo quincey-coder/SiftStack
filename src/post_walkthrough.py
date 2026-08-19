@@ -65,7 +65,7 @@ logger = logging.getLogger(__name__)
 
 NAVY, BLUE, GREEN, GOLD, RED, GREY = "0A1130", "316AFF", "1B9E5A", "B8860B", "C0392B", "666666"
 
-_API_CLIENTS = Path(r"C:\Users\Tyrus\OneDrive\Desktop\Deal Room Coaching Call\_api\clients")
+_API_CLIENTS = Path(os.getenv("DEALROOM_API_PATH", ""))
 
 # Deal-math constants. Kept here (not buried in the sheet builders) so the
 # Sources block can print them and the team can argue with them in one place.
@@ -2469,8 +2469,8 @@ WALKTHROUGH_TEMPLATE = {
 def main() -> int:
     ap = argparse.ArgumentParser(description="Build the post-walkthrough deal workbook")
     ap.add_argument("--address", help="Subject street address")
-    ap.add_argument("--city", default="Knoxville")
-    ap.add_argument("--state", default="TN")
+    ap.add_argument("--city", default="Austin")
+    ap.add_argument("--state", default="TX")
     ap.add_argument("--zip", dest="zip_code", default="")
     ap.add_argument("--beds", type=int, help="County card override (beats Zillow and Sift)")
     ap.add_argument("--baths", type=float)

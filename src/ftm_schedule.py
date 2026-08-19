@@ -21,7 +21,7 @@ fires in the middle of the night half the time.
 Configuration (all env vars):
   FTM_SCHEDULE          comma-separated HH:MM in business time (default "06:30")
   FTM_SCHEDULE_DAYS     comma-separated weekday names or "all" (default "all")
-  BUSINESS_TIMEZONE     default "America/New_York"
+  BUSINESS_TIMEZONE     default "America/Chicago"
   FTM_ARGS              extra ftm_runner args, e.g. "--commit --stages notices"
   FTM_RUN_ON_BOOT       "1" to fire once at startup (useful for a first deploy)
   FTM_JITTER_SECONDS    random 0..N delay before each run (default 0)

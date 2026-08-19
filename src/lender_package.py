@@ -737,7 +737,7 @@ def sheet_investment(wb, spec):
     for lab, val in [
         ("Collateral", f"{p['full_address']}, parcel {p.get('parcel_id','')}"),
         ("Lien position", spec["loan"].get("lien", "First lien, deed of trust")),
-        ("Recorded", f"{p.get('county','Knox')} County Register of Deeds, closing day"),
+        ("Recorded", f"{p.get('county','Travis')} County County Clerk (Official Public Records), closing day"),
         ("Title insurance", "Lender's policy in your name for the full loan amount, "
                             "paid out of the loan"),
         ("Hazard insurance", "In force before funds disburse, with you named as "
@@ -798,7 +798,7 @@ def sheet_terms(wb, spec):
         ("Date", spec.get("date", "")),
         ("Lender", spec.get("lender_name", "[LENDER LEGAL NAME]")),
         ("Borrower", f"{b['entity']}, "
-                     f"{b.get('formation','a Tennessee limited liability company')}"),
+                     f"{b.get('formation','a Texas limited liability company')}"),
         ("Guarantors", ", ".join(members) + ", each individually"),
         ("Property", f"{p['full_address']} (parcel {p.get('parcel_id','')})"),
     ]:
@@ -826,8 +826,8 @@ def sheet_terms(wb, spec):
         ("Prepayment", "Allowed at any time with no penalty, subject to the guaranteed "
                        "minimum above", None, False),
         ("Security", f"{ln.get('lien','First lien, deed of trust')} on "
-                     f"{p['short_address']}, recorded in {p.get('county','Knox')} "
-                     f"County, Tennessee", None, False),
+                     f"{p['short_address']}, recorded in {p.get('county','Travis')} "
+                     f"County, Texas", None, False),
         ("Additional security", "Personal guarantee from every member of the company, "
                                 "plus the hazard policy naming the lender as mortgagee "
                                 "and loss payee", None, False),
@@ -841,7 +841,7 @@ def sheet_terms(wb, spec):
         ("Default", ln.get("default_terms", ""), None, False),
         ("Reporting", "Written update every two weeks, and you may inspect the property "
                       "at any time without notice", None, False),
-        ("Governing law", "State of Tennessee", None, False),
+        ("Governing law", "State of Texas", None, False),
         ("Open until", spec.get("term_sheet_expiry", "14 days from the date above"),
          None, False),
     ]:
