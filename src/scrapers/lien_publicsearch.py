@@ -493,14 +493,12 @@ class _PublicSearchLienScraper:
                         await dump_page(page, f"{self.COUNTY.lower()}_lien_no_doctypes")
                         continue  # retry once, then the loop exit raises below
 
-                    # Dates: fill then press Escape to close any date-picker overlay.
-                    try:
-                        await page.fill("#recordedDateRange-start", _date_str(from_date))
-                        await page.keyboard.press("Escape")
-                        await page.fill("#recordedDateRange-end", _date_str(to_date))
-                        await page.keyboard.press("Escape")
-                    except Exception as e:
-                        logger.warning("%s: could not set date range: %s", label, e)
+                    # Dates: verified apply (read-back + native-setter fallback)
+                    # — never click Search on dates the DOM doesn't hold.
+                    from scrapers.publicsearch_common import apply_dates
+                    if not await apply_dates(page, from_date, to_date, label):
+                        await dump_page(page, f"{self.COUNTY.lower()}_lien_dates_never_took")
+                        continue  # retry once, then the loop exit raises below
 
                     await _dismiss_popups(page)
                     await page.get_by_role("button", name="Search", exact=True).click()

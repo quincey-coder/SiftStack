@@ -106,14 +106,68 @@ async def verify_window_applied(
     return True, evidence
 
 
-async def refill_dates(page: Page, from_date: datetime, to_date: datetime) -> bool:
-    """Re-fill the recordedDateRange inputs (retry path after a failed verify)."""
-    try:
-        await page.fill("#recordedDateRange-start", from_date.strftime("%m/%d/%Y"))
-        await page.keyboard.press("Escape")
-        await page.fill("#recordedDateRange-end", to_date.strftime("%m/%d/%Y"))
-        await page.keyboard.press("Escape")
-        return True
-    except Exception as e:
-        logger.warning("could not re-fill date range: %s", e)
-        return False
+async def apply_dates(
+    page: Page, from_date: datetime, to_date: datetime, label: str = "publicsearch"
+) -> bool:
+    """Set the recordedDateRange inputs and VERIFY the values actually took.
+
+    The cloud failure mode this exists for (Bell, 2026-08-16..19): page.fill
+    reported success but the React controlled input later re-rendered EMPTY —
+    hydration on a slow proxy connection wipes the value — so the search ran
+    unfiltered (163K results for a 1-day window) on BOTH retry attempts, four
+    days straight. The same flow works first-try on a fast local session,
+    which is why the fill can never be trusted without reading the DOM back.
+
+    Attempt 1 is a normal fill; attempts 2-3 use the React native-setter +
+    event-dispatch pattern (the documented workaround when a controlled input
+    swallows Playwright's fill). Returns False only when the read-back never
+    matches — callers must NOT click Search in that case.
+    """
+    want = [from_date.strftime("%m/%d/%Y"), to_date.strftime("%m/%d/%Y")]
+    for attempt in range(3):
+        try:
+            if attempt == 0:
+                await page.fill("#recordedDateRange-start", want[0])
+                await page.keyboard.press("Escape")
+                await page.fill("#recordedDateRange-end", want[1])
+                await page.keyboard.press("Escape")
+            else:
+                await page.evaluate(
+                    """([start, end]) => {
+                        const set = (id, val) => {
+                            const el = document.querySelector(id);
+                            if (!el) return;
+                            const setter = Object.getOwnPropertyDescriptor(
+                                window.HTMLInputElement.prototype, 'value').set;
+                            setter.call(el, val);
+                            el.dispatchEvent(new Event('input', {bubbles: true}));
+                            el.dispatchEvent(new Event('change', {bubbles: true}));
+                            el.dispatchEvent(new Event('blur', {bubbles: true}));
+                        };
+                        set('#recordedDateRange-start', start);
+                        set('#recordedDateRange-end', end);
+                    }""",
+                    want,
+                )
+                await page.keyboard.press("Escape")
+            # Let any hydration/re-render land, THEN read back what the DOM
+            # actually holds — that is the only trustworthy signal.
+            await page.wait_for_timeout(1200)
+            got = await page.evaluate(
+                "() => [document.querySelector('#recordedDateRange-start')?.value || '',"
+                " document.querySelector('#recordedDateRange-end')?.value || '']"
+            )
+            if list(got) == want:
+                if attempt:
+                    logger.info(
+                        "%s: date range took on attempt %d (native setter)",
+                        label, attempt + 1,
+                    )
+                return True
+            logger.warning(
+                "%s: date inputs read back %r, wanted %r (attempt %d/3)",
+                label, got, want, attempt + 1,
+            )
+        except Exception as e:
+            logger.warning("%s: date fill attempt %d failed: %s", label, attempt + 1, e)
+    return False
