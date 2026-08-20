@@ -54,3 +54,15 @@ seen_ids.json
 Logan Fullmer Transcripts/
 McKlane Bobbitt Transcripts/
 Curative Title Playbook/
+
+# Vendored upstream library + toolchain (2026-08-20) — never part of the Actor
+skills/
+plugins/
+dist/
+tools/
+install.py
+archive/
+Skills for REI/
+fly.toml
+fly.ftm.toml
+.github/
