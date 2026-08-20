@@ -348,7 +348,7 @@ class _PublicSearchLisPendensScraper:
                 # (Williamson Tyler) challenges endlessly and what heats the
                 # GovOS anti-bot on the second publicsearch session per run.
                 # No-op locally (SCRAPER_PROXY_URL unset).
-                **_proxy_kwargs(),
+                **_proxy_kwargs(fresh_session=True),
                 user_agent=(
                     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"

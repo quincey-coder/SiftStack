@@ -211,7 +211,7 @@ async def pass_cloudflare(page: Page, timeout_ms: int = 45000) -> bool:
     return False
 
 
-def proxy_kwargs(env_var: str = "SCRAPER_PROXY_URL") -> dict:
+def proxy_kwargs(env_var: str = "SCRAPER_PROXY_URL", fresh_session: bool = False) -> dict:
     """Playwright ``new_context(**proxy_kwargs())`` — route the browser through a
     proxy when one is configured, else no-op.
 
@@ -234,6 +234,23 @@ def proxy_kwargs(env_var: str = "SCRAPER_PROXY_URL") -> dict:
     proxy = {"server": server}
     if p.username:
         proxy["username"] = unquote(p.username)
+    # fresh_session: pin a UNIQUE Apify proxy session (= distinct exit IP) for
+    # this browser context. Without it every scraper shares the one URL from
+    # main.py — one exit IP — and the GovOS/AWS-WAF anti-bots punish the
+    # SECOND session from the same IP (Bell lis pendens failing ~2 min after
+    # Bell lien succeeded on it, QA 2026-08-19). The Travis tccsearch scrapers
+    # deliberately do NOT use this: their cf_clearance cookie is tied to a
+    # sticky IP.
+    if fresh_session and proxy.get("username") and "apify" in (p.hostname or ""):
+        import re as _re
+        import uuid as _uuid
+        sid = _uuid.uuid4().hex[:12]
+        uname = proxy["username"]
+        if "session-" in uname:
+            uname = _re.sub(r"session-[^,]*", f"session-{sid}", uname)
+        else:
+            uname += f",session-{sid}"
+        proxy["username"] = uname
     if p.password:
         proxy["password"] = unquote(p.password)
     logger.info("Routing browser via proxy %s (user %s…)",

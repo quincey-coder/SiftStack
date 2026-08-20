@@ -165,7 +165,7 @@ class WilliamsonTylerLienScraper:
                 # (Williamson Tyler) challenges endlessly and what heats the
                 # GovOS anti-bot on the second publicsearch session per run.
                 # No-op locally (SCRAPER_PROXY_URL unset).
-                **_proxy_kwargs(),
+                **_proxy_kwargs(fresh_session=True),
                 user_agent=tc.USER_AGENT,
                 viewport={"width": 1400, "height": 1300},
                 ignore_https_errors=True,
