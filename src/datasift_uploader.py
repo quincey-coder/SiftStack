@@ -768,12 +768,26 @@ async def _select_all_records(page: Page) -> bool:
 
         await _screenshot(page, "records_selected_header")
 
-        # After checking the header checkbox, a "Select All X records" banner may appear
-        select_all_link = page.locator('text="Select all"')
-        if await select_all_link.count() > 0:
-            await select_all_link.first.click()
-            await page.wait_for_timeout(1000)
-            logger.debug("Clicked 'Select all' records link")
+        # After selecting the visible rows, a "Select all N records" banner
+        # offers to extend the selection to EVERY record matching the filter —
+        # essential because the table paginates and the row-click fallback only
+        # reaches page 1 (found 2026-08-20: a 29-record list got only 9-10
+        # rows enriched/skip-traced; the old exact-text locator 'Select all'
+        # never matched the banner's actual text "Select all 29 records").
+        try:
+            select_all_link = page.get_by_text(
+                re.compile(r"select all\b", re.IGNORECASE)
+            )
+            if await select_all_link.count() > 0:
+                await select_all_link.first.click()
+                await page.wait_for_timeout(1000)
+                logger.info("Clicked 'Select all N records' banner — selection "
+                            "extended beyond page 1")
+            else:
+                logger.info("No 'Select all N records' banner found — selection "
+                            "covers the visible page only")
+        except Exception as e:
+            logger.warning("'Select all' banner click failed: %s", e)
 
         # Verify: check if Manage or Send To buttons are now visible
         manage_visible = await page.locator('button:has-text("Manage")').count() > 0
