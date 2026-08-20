@@ -12,7 +12,7 @@ Buyer Types:
 Data sources:
   - Our own scraped/enriched CSV records (transaction patterns)
   - Entity research (existing entity_researcher.py)
-  - Skip trace (existing tracerfy_skip_tracer.py)
+  - Skip trace (existing directskip_batch.py)
 
 Usage:
   python src/main.py buyer-prospect --counties Travis,Bell,Williamson --months-back 18

@@ -40,7 +40,6 @@ SMARTY_AUTH_TOKEN = os.getenv("SMARTY_AUTH_TOKEN", "")
 OPENWEBNINJA_API_KEY = os.getenv("OPENWEBNINJA_API_KEY", "")  # Zillow property enrichment
 SERPER_API_KEY = os.getenv("SERPER_API_KEY", "")              # Serper.dev Google Search API
 FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY", "")        # Firecrawl JS-rendered scraping
-TRACERFY_API_KEY = os.getenv("TRACERFY_API_KEY", "")          # Tracerfy skip tracing
 TRESTLE_API_KEY = os.getenv("TRESTLE_API_KEY", "")            # Trestle phone validation
 # Litigator risk check runs on EVERY Trestle query by default (operator preference).
 # Set TRESTLE_ADD_LITIGATOR=0 to disable globally; --no-litigator disables per-run.
@@ -152,12 +151,12 @@ MAX_RETRIES = 3
 # ── Per-Run Spending Caps (USD) ────────────────────────────────────────
 # Hard limits to prevent API cost runaway. When hit, the relevant step stops
 # making more calls and logs a warning. Override via env vars if needed.
-MAX_TRACERFY_COST_USD = float(os.getenv("MAX_TRACERFY_COST_USD", "100.0"))
 MAX_ZILLOW_COST_USD = float(os.getenv("MAX_ZILLOW_COST_USD", "100.0"))
-# DirectSkip bills per HIT (a no-match is free). batch_search never spends past
-# this cap. Default is deliberately low — a batch must opt into more via --max-cost.
+# DirectSkip bills per HIT (a no-match is free). Every DirectSkip spender —
+# batch_search, directskip_batch, the obituary enricher's DM-address lookups —
+# stops before spend can pass this cap. Default is deliberately low; a bigger
+# run must opt into more via --max-cost / MAX_DIRECTSKIP_COST_USD.
 MAX_DIRECTSKIP_COST_USD = float(os.getenv("MAX_DIRECTSKIP_COST_USD", "5.0"))
-TRACERFY_COST_PER_RECORD = 0.02  # batch endpoint pricing
 DIRECTSKIP_COST_PER_HIT = float(os.getenv("DIRECTSKIP_COST_PER_HIT", "0.10"))  # per matched record
 ZILLOW_COST_PER_LOOKUP = 0.01    # OpenWeb Ninja pricing after free tier
 

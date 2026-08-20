@@ -1,4 +1,4 @@
-# Skip trace: SmartSkip, Tracerfy, Enformion
+# Skip trace: SmartSkip, DirectSkip, Enformion
 
 Three providers with different jobs. Using the wrong one for a job is the most
 common and most expensive mistake here.
@@ -6,7 +6,7 @@ common and most expensive mistake here.
 | Provider | Good at | Cost | Do not use for |
 |---|---|---|---|
 | SmartSkip | Relatives **with their phone numbers**, in one batch | $0.15 per hit | Death data. It is wrong about death |
-| Tracerfy | Cheap gap fill on a known person | $0.02 per record | Entities. Consumer only |
+| DirectSkip | Gap fill + cross-check on a known person | $0.10 per hit, no-match free | Entities. Consumer only. Not from Apify (IP-allowlisted) |
 | Enformion | LLC and trust principals | about $0.10 per match | The relatives graph. It whiffs half the time |
 
 ## The measured comparison that set this order
@@ -80,37 +80,39 @@ written by someone who knew the family.
 
 ---
 
-## Tracerfy
+## DirectSkip
 
-Cheap batch gap fill. Use it for relatives SmartSkip named but left phoneless,
-which is roughly 7 percent.
+Single-record synchronous gap fill and cross-check (replaced the retired
+Tracerfy, 2026-08-20). Use it for relatives SmartSkip named but left phoneless,
+which is roughly 7 percent, and as the second vendor in the orchestrator merge.
 
 ### Contract
 
-Multipart CSV upload with a Bearer token.
+`POST https://api0.directskip.com/v2/search_contact.php` — JSON body,
+`api_key` **in the body**, one person per call. Full client in
+`src/directskip.py`; the pipeline batch layer is `src/directskip_batch.py`.
 
-**The `mail_*` columns are required or the request 400s.** Even when you have
-no mailing address, the columns have to be present. Send them empty rather than
-omitting them.
+**The caller's public IP must be allowlisted** with support@directskip.com.
+Apify has no static egress IP, so cloud runs can never authenticate — run
+DirectSkip from the fixed-IP operator box (or via the portal fallback, which is
+cookie-auth and not IP-bound).
 
-### Phones come back flat, not as an array
+### Money
 
-This surprises everyone once. There is no `phones` list. The fields are flat:
+Pay-per-hit: a matched record bills $0.10, a **no-match bills nothing**
+(verified live). Every spender in the repo meters against
+`MAX_DIRECTSKIP_COST_USD` and stops before the cap.
 
-```
-primary_phone
-mobile_1, mobile_2, ...
-landline_1, landline_2, ...
-```
+### ResultCode is a trust boundary
 
-Parse the flat names. Code that looks for `phones[]` finds nothing and reports
-zero results on a batch that worked.
+`CI` = a real match. `AB1`/`AB2` = an **address-only** match that returns a
+DIFFERENT person than the input — never treat that person as the owner, never
+fill a dial slot, never take their mailing address as the DM's.
 
-### The deceased flag lives on the other endpoint
+### The deceased flag is an observation
 
-The `deceased` boolean is on the **instant lookup** `persons[]` response, not
-on the $0.02 batch path. Batch gives you no death signal. There is no date of
-death on either.
+DirectSkip's `Deceased` flag never sets `owner_deceased` — the research layer
+decides death. There is no date of death in any response.
 
 ---
 
@@ -166,7 +168,7 @@ trusting the graph.
 
 ## Cost per record, end to end
 
-The v5 chain: SmartSkip $0.15, Tracerfy gap fill about $0.02, obituary and web
+The v5 chain: SmartSkip $0.15, DirectSkip gap fill $0.10 per hit, obituary and web
 research free, Trestle scoring about $0.015 per number.
 
 **About $0.24 per record.** The retired Enformion-first path was about $1.18.

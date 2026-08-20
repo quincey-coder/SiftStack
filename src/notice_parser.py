@@ -280,7 +280,7 @@ class NoticeData:
     entity_research_confidence: str = ""   # "high", "medium", "low"
     # PDF report link (Google Drive URL, populated by report_generator)
     report_url: str = ""
-    # Tracerfy skip trace — phones + emails (populated by tracerfy_skip_tracer)
+    # Skip trace — phones + emails (populated by directskip_batch / smartskip)
     primary_phone: str = ""
     mobile_1: str = ""
     mobile_2: str = ""

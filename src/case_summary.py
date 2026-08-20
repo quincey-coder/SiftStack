@@ -193,7 +193,7 @@ def build_next_steps(notice: NoticeData) -> list[str]:
     if dm_name and not (notice.decision_maker_street or "").strip():
         steps.append(
             f"Obtain a verified mailing address for {dm_name} "
-            "(Tracerfy / people-search waterfall) before mail merge."
+            "(DirectSkip / people-search waterfall) before mail merge."
         )
 
     # 3. Confidence / verification

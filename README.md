@@ -153,7 +153,7 @@ These apply to every scheduled run.
 | `SMARTY_AUTH_ID` / `TOKEN` | [Smarty](https://smarty.com) | 250 free/month | USPS validation, geocoding, vacancy |
 | `OPENWEBNINJA_API_KEY` | [OpenWeb Ninja](https://openwebninja.com) | 100 free/month | Zestimate, MLS, equity |
 | `ANTHROPIC_API_KEY` | [Anthropic](https://console.anthropic.com) | ~$0.001/record | LLM parsing, obituary search |
-| `TRACERFY_API_KEY` | [Tracerfy](https://tracerfy.com) | $0.02/record | Phones, emails, mailing addresses |
+| `DIRECTSKIP_API_KEY` | [DirectSkip](https://directskip.com) | $0.10/hit (no-match free) | Phones, emails, mailing addresses, relatives |
 | `TRESTLE_API_KEY` | [Trestle](https://trestleiq.com) | $0.015/phone | Phone scoring (5-tier dial priority) |
 
 ### DataSift + Notifications (required for full pipeline)
@@ -251,7 +251,7 @@ src/
 ├── obituary_enricher.py     # Deceased detection + heir identification
 ├── ancestry_enricher.py     # Ancestry.com SSDI automation
 ├── entity_researcher.py     # LLC/Corp person extraction
-├── tracerfy_skip_tracer.py  # Batch skip trace (phones + emails)
+├── directskip_batch.py      # Batch skip trace (phones + emails)
 ├── phone_validator.py       # Trestle 5-tier scoring
 ├── data_formatter.py        # CSV dedup + export
 ├── datasift_formatter.py    # 41-column DataSift CSV builder
@@ -295,7 +295,7 @@ Running daily in one county (Knox, TN — ~20-40 new notices/day):
 | Smarty | Free | 250 lookups/month covers daily runs |
 | OpenWeb Ninja | Free | 100 lookups/month covers most records |
 | Anthropic (Haiku) | ~$2 | LLM parsing + obituary search |
-| Tracerfy | ~$20 | Skip trace @ $0.02/record |
+| DirectSkip | ~$20 | Skip trace @ $0.10/hit (no-match free) |
 | Trestle | ~$15 | Phone scoring @ $0.015/phone |
 | **Total** | **~$40/month** | Full pipeline, one county |
 

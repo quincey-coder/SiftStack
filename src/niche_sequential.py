@@ -44,7 +44,7 @@ PRESETS = [
         "name": "00. Needs Skip Traced",
         "description": "New records without phone data — route to skip trace",
         "filter": {"has_phone": False, "has_tag": "Courthouse Data"},
-        "action": "Run Tracerfy batch skip trace → phone validate via Trestle",
+        "action": "Run DirectSkip skip trace → phone validate via Trestle",
     },
     {
         "number": "01",

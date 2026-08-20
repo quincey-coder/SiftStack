@@ -98,7 +98,7 @@ def row_to_notice(row: dict) -> NoticeData:
     n.owner_zip = (row.get("Mailing ZIP Code") or "").strip()
     n.mailing_address = n.owner_street
 
-    # Phones / emails (preserve Tracerfy results so re-enrichment doesn't lose them)
+    # Phones / emails (preserve skip-trace results so re-enrichment doesn't lose them)
     n.primary_phone = row.get("Phone 1", "")
     n.mobile_1 = row.get("Phone 2", "")
     n.mobile_2 = row.get("Phone 3", "")

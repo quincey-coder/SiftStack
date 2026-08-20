@@ -37,7 +37,7 @@ DEPTH_NAMES = {
 }
 
 DEPTH_DESCRIPTIONS = {
-    1: "Multi-provider skip trace waterfall: Tracerfy → DataSift → Trestle phone scoring",
+    1: "Multi-provider skip trace waterfall: DirectSkip → DataSift → Trestle phone scoring",
     2: "Deed chain analysis, middle initial verification, estate flags, installment detection",
     3: "Obituary + ancestry search, family tree construction, heir decision-maker ranking",
     4: "PACER court records, title cloud detection, multi-generational heirs, attorney referral",
@@ -151,9 +151,9 @@ async def _run_level_1(notice: NoticeData, result: ProspectResult) -> None:
     if phones == 0:
         # SmartSkip is the primary engine: it returns relatives WITH phones in one
         # batch row, which is what an ownerless/phoneless record actually needs.
-        # Tracerfy is the gap-fill for relatives SmartSkip named but left phoneless.
+        # DirectSkip is the gap-fill for relatives SmartSkip named but left phoneless.
         result.recommended_action = (
-            "Run SmartSkip bulk trace (src/smartskip.py submit), then Tracerfy gap-fill"
+            "Run SmartSkip bulk trace (src/smartskip.py submit), then DirectSkip gap-fill"
         )
     else:
         result.recommended_action = "Score phones via Trestle"

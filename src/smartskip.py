@@ -14,7 +14,7 @@ phones). Enformion **BusinessV2** is retained separately for entity owners, whic
 SmartSkip cannot trace at all (it needs a first and last name).
 
 Stack position:
-    SmartSkip (relatives + phones)  ->  Tracerfy (gap-fill the ~7% phoneless)
+    SmartSkip (relatives + phones)  ->  DirectSkip (gap-fill the ~7% phoneless)
       ->  obituary/web research (MANDATORY: date of death + true relationships)
       ->  Trestle (dial tiers)
 
@@ -202,15 +202,27 @@ class SmartSkipClient:
         self.orders_file.write_text(json.dumps(orders, indent=2), encoding="utf-8")
 
     # ── lifecycle (all free except pay) ──
-    def upload(self, csv_path: str | Path) -> dict:
-        """Step 1 — upload the CSV. Returns {bulkSkipId, parsed}."""
+    def upload(self, csv_path: str | Path, tries: int = 3) -> dict:
+        """Step 1 — upload the CSV. Returns {bulkSkipId, parsed}.
+
+        Retried: on 2026-08-20 the API returned a transient 400 "File is empty"
+        for a well-formed 1-row CSV that uploaded fine minutes later (verified
+        by re-uploading the byte-identical file). Upload is FREE and an unpaid
+        bulkSkipId is inert server-side, so retrying costs nothing.
+        """
         csv_path = Path(csv_path)
-        with csv_path.open("rb") as fh:
-            resp = self._call("POST", "/bulk-skip/mapping",
-                              files={"file": (csv_path.name, fh, "text/csv")})
-        if resp.status_code not in (200, 201):
-            raise SmartSkipError(f"upload failed ({resp.status_code}): {resp.text[:300]}")
-        return resp.json()
+        last = ""
+        for attempt in range(tries):
+            if attempt:
+                time.sleep(3 * attempt)
+            with csv_path.open("rb") as fh:
+                resp = self._call("POST", "/bulk-skip/mapping",
+                                  files={"file": (csv_path.name, fh, "text/csv")})
+            if resp.status_code in (200, 201):
+                return resp.json()
+            last = f"upload failed ({resp.status_code}): {resp.text[:300]}"
+            logger.warning("SmartSkip %s (attempt %d/%d)", last, attempt + 1, tries)
+        raise SmartSkipError(last)
 
     def fields(self) -> dict:
         """Step 2 — the required/optional field catalogue."""

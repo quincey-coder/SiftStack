@@ -83,17 +83,24 @@
             "default": false,
             "editor": "checkbox"
         },
-        "enable_tracerfy": {
-            "title": "Enable Tracerfy Batch Skip Trace",
+        "enable_directskip": {
+            "title": "Enable DirectSkip Skip Trace",
             "type": "boolean",
-            "description": "Run Tracerfy on deep-prospecting candidates (deceased owners / heir maps / DMs). Requires tracerfy_api_key with credits.",
+            "description": "Run DirectSkip on deep-prospecting candidates (deceased owners / heir maps / DMs). Requires directskip_api_key. NOTE: the DirectSkip API is IP-allowlisted and Apify has no static egress IP — cloud runs will fail auth; run DirectSkip from the operator box (skip_orchestrator) instead.",
+            "default": false,
+            "editor": "checkbox"
+        },
+        "enable_tracerfy": {
+            "title": "[deprecated] Enable Skip Trace (legacy toggle name)",
+            "type": "boolean",
+            "description": "Legacy alias for enable_directskip, kept so old schedule runInputs still validate. Tracerfy was retired 2026-08-20.",
             "default": false,
             "editor": "checkbox"
         },
         "enable_trestle": {
             "title": "Enable Trestle Phone Tier Scoring",
             "type": "boolean",
-            "description": "Score every discovered phone (DM #1 + heirs) with Trestle's 5-tier dial priority. Requires trestle_api_key and --enable-tracerfy.",
+            "description": "Score every discovered phone (DM #1 + heirs) with Trestle's 5-tier dial priority. Requires trestle_api_key and enable_directskip.",
             "default": false,
             "editor": "checkbox"
         },
@@ -392,10 +399,17 @@
             "editor": "textfield",
             "isSecret": true
         },
-        "tracerfy_api_key": {
-            "title": "Tracerfy API Key",
+        "directskip_api_key": {
+            "title": "DirectSkip API Key",
             "type": "string",
-            "description": "Batch skip-trace service. Required only if enable_tracerfy is true.",
+            "description": "Single-record skip-trace service ($0.10/hit, no-match free). Required only if enable_directskip is true. The API is IP-allowlisted — it will NOT authenticate from Apify.",
+            "editor": "textfield",
+            "isSecret": true
+        },
+        "tracerfy_api_key": {
+            "title": "[deprecated] Tracerfy API Key",
+            "type": "string",
+            "description": "Retired 2026-08-20 — ignored. Kept only so old schedule runInputs still validate.",
             "editor": "textfield",
             "isSecret": true
         },

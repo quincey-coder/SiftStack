@@ -18,7 +18,8 @@ GATES (hard, each one counted and reported on the Excluded sheet):
   - already sold (status sold, or an MLS sale recorded after the death)
   - upside down (debt swallowing the equity)
   - do-not-mail / opt-out
-  - outside the buy box (non single family, or value over MAX_VALUE)
+  - not single family (there is NO value ceiling since 2026-08-20: expensive-zip
+    teardowns are deals; records over $700k are flagged, not dropped)
 
 Usage:
   python src/obituary_opportunity.py --pull                    # refresh the cache
@@ -58,7 +59,13 @@ NAVY, BLUE, GREEN, GOLD, RED = "0A1130", "316AFF", "1B9E5A", "B8860B", "CC0000"
 # ── model constants ───────────────────────────────────────────────────
 
 MIN_OBIT_MONTHS = 3      # Ty's rule: give probate time to open
-MAX_VALUE = 700_000      # buy box ceiling
+# 2026-08-20 owner decision: the value CEILING no longer gates records out
+# (was: hard-excluded everything over $700k, which dropped 128 records — median
+# $828k — concentrated in 78704/78703/78731/78746, where a $1.2M record built
+# in 1938 is a teardown/lot-value play, not a retail house). High-value records
+# now stay in the ranking and instead carry a Must-verify flag telling the
+# operator to underwrite on lot value. MAX_VALUE is kept as the flag line.
+MAX_VALUE = 700_000      # classic buy box line — flags above this, no longer gates
 MIN_VALUE = 1
 
 # Weights are set from the measured distribution of THIS list, not from intuition.
@@ -403,8 +410,7 @@ def gate(r: dict, today: date, min_months: int) -> str | None:
         return "Do not mail / opted out"
     if r["estimate_value"] is None:
         return "No value on the record (cannot underwrite)"
-    if r["estimate_value"] > MAX_VALUE:
-        return f"Over buy box: value ${r['estimate_value']:,.0f} > ${MAX_VALUE:,.0f}"
+    # No value ceiling (2026-08-20): expensive-zip teardowns are deals; see MAX_VALUE note.
     if r["estimate_value"] < MIN_VALUE:
         return "No value on the record (cannot underwrite)"
     if not r["is_sfr"]:
@@ -554,9 +560,11 @@ def score_saturation(r):
 
 
 def score_timing(r, today):
-    """Where the estate sits in the probate cycle. TN vests real property in the
-    heirs at death and the creditor window is 4 months, so months 6-15 is when a
-    decedent home is both legally sellable and emotionally ready to be sold."""
+    """Where the estate sits in the probate cycle. Texas vests title in the heirs
+    at death (Tex. Estates Code 101.001, subject to administration), so months
+    6-15 is when a decedent home is both legally sellable and emotionally ready
+    to be sold. (Curve carried from the original TN build; the vesting principle
+    is the same in both states.)"""
     months = (today - r["anchor_date"]).days / 30.44
     if months < 6:
         base = 0.75
@@ -629,6 +637,11 @@ def flags(r, today):
     if (r["status"] or "").strip().lower() in IN_PROGRESS_STATUSES:
         out.append(f"Already in your pipeline at status '{r['status']}': pick up the existing "
                    f"thread, do not hand it fresh budget as a new lead")
+    if (r["estimate_value"] or 0) > MAX_VALUE:
+        age = f", built {r['year_built']:.0f}" if r["year_built"] else ""
+        out.append(f"Above the classic ${MAX_VALUE/1000:.0f}k buy box "
+                   f"(${r['estimate_value']:,.0f}{age}): only a deal as a teardown/"
+                   f"land play — underwrite on lot value, not the house")
     if r["incomplete"]:
         out.append("Incomplete record: address or owner data is partial")
     if r["dnc"]:
@@ -636,10 +649,28 @@ def flags(r, today):
     return out
 
 
-# Thresholds are set from the observed score distribution on ty+2 (p50 51.8,
-# p95 59.1, max 68.5), not from a round number. A is roughly the top 4%: the
-# short list a lean budget can actually work by hand.
-TIER_A, TIER_B, TIER_C = 60.0, 54.0, 46.0
+# Thresholds are set from the observed score distribution of the account being
+# ranked, not from a round number. A is roughly the top 4%: the short list a
+# lean budget can actually work by hand. B ends at ~p80, C at ~p20 (D = the
+# bottom fifth), mirroring the shape of the original ty+2 calibration.
+#
+# RECALIBRATED 2026-08-20 for the SiftStack account (was 60.0 / 54.0 / 46.0,
+# from ty+2's distribution: p50 51.8, p95 59.1, max 68.5). This account's 718
+# qualified records measure p50 43.9, p80 46.6, p96 49.7, max 55.4 — Ty's
+# cutoffs sat almost entirely ABOVE our maximum, yielding zero Tier A. Two
+# reasons the scores run lower here, both structural, neither a data error:
+#   - dataflik investor_score / realtor_score are absent on ALL records
+#     (0/718), so 14 of Fit's 22 points never fire on this account.
+#   - hard distress is even rarer here (5/718 = 0.7% vs ~3% on ty+2).
+# If the account gains dataflik scoring or the list composition shifts, rerun
+# the percentile measurement and re-anchor; do not tune these by hand.
+#
+# RE-ANCHORED 2026-08-20 (same day, second pass): removing the $700k buy-box
+# gate returned 127 high-value records to the pool (n 718 -> 845), so the
+# percentiles were re-measured on the full set: p96 49.4, p80 46.5, p20 39.2
+# (was 49.7 / 46.6 / 39.0 on the capped pool — the newcomers blend into the
+# existing spread rather than stacking the top).
+TIER_A, TIER_B, TIER_C = 49.4, 46.5, 39.2
 
 
 def tier(score):
@@ -797,7 +828,7 @@ def build_workbook(qualified, excluded, meta, out: Path, min_months: int,
     ws = wb.active
     ws.title = "1 Overview"
     _title(ws, "Obituary opportunity ranking",
-           f"ty+2 account, obituary list, run {today.isoformat()}"
+           f"SiftStack DataSift account, obituary list, run {today.isoformat()}"
            + (f", data pulled {meta['pulled']}" if meta.get("pulled") else ""))
     _widths(ws, [34, 96])
 
@@ -849,7 +880,7 @@ def build_workbook(qualified, excluded, meta, out: Path, min_months: int,
         ["Mail the whole obituary list", f"${all_mail:,.0f}"],
         [f"Mail only the top {len(top)}", f"${top_mail:,.0f}"],
         ["Deep prospect the same top records",
-         f"${dp_cost:,.0f} at $0.24 each (SmartSkip, Tracerfy gap-fill, obituary research, "
+         f"${dp_cost:,.0f} at $0.24 each (SmartSkip, DirectSkip gap-fill, obituary research, "
          f"Trestle tiers)"],
         ["What that buys",
          f"${all_mail - top_mail - dp_cost:,.0f} freed, spent on records where you already "
@@ -921,11 +952,21 @@ def build_workbook(qualified, excluded, meta, out: Path, min_months: int,
     _rows(ws, 5, [
         ["How the weights were set", "",
          "From the measured distribution of this list, not from intuition. A first pass "
-         "weighted equity 30 and saturation 20 and produced eleven distinct scores across the "
-         "top forty records, because on this list equity and quietness are near-constants: "
-         "63% of qualified records are free and clear and 99% carry no auction-track list at "
-         "all. Those two facts are why the list is worth working, but they cannot rank it. "
-         "The weights below put the load on the variables that actually vary."],
+         "weighted equity 30 and saturation 20 and produced almost no separation, because on "
+         "this list equity and quietness are near-constants: 60% of qualified records are "
+         "free and clear and 99.9% carry no auction-track list at all (measured on this "
+         "account 2026-08-20). Those two facts are why the list is worth working, but they "
+         "cannot rank it. The weights below put the load on the variables that actually vary."],
+        ["Recalibration 2026-08-20", "",
+         "Tier cutoffs re-anchored to THIS account's score distribution (A 49.7 / B 46.6 / "
+         "C 39.0, previously 60 / 54 / 46 from the original ty+2 build). The old cutoffs sat "
+         "above this list's maximum score (55.4) and produced zero Tier A. Anchors: A = 96th "
+         "percentile (top ~4%, the hand-work short list), B = 80th, C = 20th. Also noted: "
+         "dataflik investor and realtor scores are absent on every record here (0 of 718), so "
+         "14 of the Fit component's 22 points never fire on this account — ranking load falls "
+         "on distress, equity, timing and house age. The percentile anchoring absorbs that "
+         "automatically; if dataflik scoring ever lands on this account, re-measure and "
+         "re-anchor rather than reusing these numbers."],
         ["", "", ""],
         ["Distress and pressure", W_DISTRESS,
          "Additive, capped at the weight. Tax delinquency 9 (years behind or dollars owed, "
@@ -952,9 +993,11 @@ def build_workbook(qualified, excluded, meta, out: Path, min_months: int,
         ["Timing in the probate cycle", W_TIMING,
          "Months since death: under 6 scores 0.75, 6 to 9 scores 0.95, 9 to 15 scores 1.00, "
          "15 to 24 scores 0.80, over 24 scores 0.60. Plus 0.15 if probate is open and 0.10 if "
-         "the personal representative is named. Texas vests real property in the heirs at "
-         "death (T.C.A. 31-2-103) and the creditor window is 4 months, so months 6 to 15 is "
-         "when a decedent home is both legally sellable and emotionally ready to be sold."],
+         "the personal representative is named. Texas vests title in the heirs at the moment "
+         "of death (Tex. Estates Code 101.001, subject to administration), so months 6 to 15 "
+         "is when a decedent home is both legally sellable and emotionally ready to be sold. "
+         "(Corrected 2026-08-20: this note previously cited the Tennessee statute from the "
+         "original build; the curve itself is unchanged and holds for Texas.)"],
         ["Low saturation", W_SATURATION,
          "Starts at full marks and subtracts competition. On an auction-track list (notice of "
          "default, lis pendens, foreclosure, tax sale, trustee deed, auction, REO) costs 4 for "
@@ -974,22 +1017,29 @@ def build_workbook(qualified, excluded, meta, out: Path, min_months: int,
         ["Gates (hard exclusions)", "",
          f"No obituary or death date. Under {min_months} months since death (Ty's rule: give "
          "probate time to open). Already sold, or an MLS sale recorded after the death. Upside "
-         "down. Do not mail or opted out. No value on the record. Value over "
-         f"${MAX_VALUE:,.0f}. Not single family."],
+         "down. Do not mail or opted out. No value on the record. Not single family. "
+         f"NOTE 2026-08-20: the ${MAX_VALUE:,.0f} value ceiling was removed by owner decision "
+         "— it was dropping 128 records (median $828k) concentrated in expensive central-"
+         "Austin zips (78704, 78703, 78731, 78746) where an old house at a high price is a "
+         "teardown/lot-value deal. Those records now rank normally and carry a Must-verify "
+         "flag to underwrite on lot value rather than the house."],
         ["Date anchor", "",
          "A hand-entered Death Date or Date of Death beats the aggregator's obituary "
-         "publication date when both exist, because the research pass verified it. On this run "
-         "no record carried a hand-entered date, so every months-since figure comes from the "
-         "aggregator's obituary publication date and is a proxy for the true date of death."],
+         "publication date when both exist, because the research pass verified it. On this "
+         "account (measured 2026-08-20) only 1 of 718 qualified records carries a hand-entered "
+         "date, so months-since figures come almost entirely from the obituary publication "
+         "date and are a proxy for the true date of death."],
         ["Known limits, read these", "",
-         "Equity percent and value are dataflik estimates, not appraisals, so treat the "
-         "ranking as a call order and not as underwriting. The obituary flag only started "
-         "flowing 2025-12, so nothing here is older than about 8 months and the 15+ month "
-         "bands are empty by construction. Zero records on this account have a probate open "
-         "date, a decedent name or a resolved heir, so the research layer is entirely ahead of "
-         "you and the timing bonus never fires. Above all: whether the person who died is the "
-         "owner of record is NOT verifiable from CRM data, which is why every row carries a "
-         "Must verify note."],
+         "Estimate value and equity are CRM estimates, not appraisals, so treat the ranking "
+         "as a call order and not as underwriting. Measured on this account 2026-08-20: the "
+         "list reaches back over 10 years (median 5.7 months since death, max 127), so unlike "
+         "the original build the 15+ month bands are populated and the oldest records carry "
+         "real staleness risk — the estate may have settled without an MLS sale our gate can "
+         "see. Zero records have a probate open date and zero have resolved heirs (11 carry a "
+         "decedent name), so the research layer is almost entirely ahead of you and the "
+         "timing bonus rarely fires. Above all: whether the person who died is the owner of "
+         "record is NOT verifiable from CRM data, which is why every row carries a Must "
+         "verify note."],
     ])
     ws.freeze_panes = "A5"
 

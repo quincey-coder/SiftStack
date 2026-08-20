@@ -2,7 +2,7 @@
 
 Runs Daniel H. Williams through:
   1. Obituary enrichment (signing chain + heir addresses)
-  2. Tracerfy batch skip trace (real API, ~$0.06)
+  2. DirectSkip batch skip trace (real API, $0.10/hit)
   3. Trestle phone validation (real API, ~$0.08-0.23)
 
 Usage:
@@ -19,7 +19,7 @@ logger = logging.getLogger("e2e_test")
 
 from notice_parser import NoticeData
 from obituary_enricher import enrich_obituary_data
-from tracerfy_skip_tracer import batch_skip_trace
+from directskip_batch import batch_skip_trace
 from phone_validator import clean_phone, process_phones, DEFAULT_TIERS, assign_tier
 import config as cfg
 
@@ -60,20 +60,20 @@ print(f"  Decision maker: {notice.decision_maker_name} ({notice.decision_maker_r
 print(f"  Signing chain:  {notice.signing_chain_count} heirs — {notice.signing_chain_names}")
 print()
 
-# ── Step 2: Tracerfy batch skip trace ───────────────────────────────────
+# ── Step 2: DirectSkip batch skip trace ─────────────────────────────────
 print("=" * 70)
-print("STEP 2: Tracerfy Batch Skip Trace (real API)")
+print("STEP 2: DirectSkip Batch Skip Trace (real API)")
 print("=" * 70)
-if not cfg.TRACERFY_API_KEY:
-    print("  SKIP — TRACERFY_API_KEY not set")
-    tracerfy_stats = {"submitted": 0, "matched": 0, "phones_found": 0, "emails_found": 0, "cost": 0}
+if not cfg.DIRECTSKIP_API_KEY:
+    print("  SKIP — DIRECTSKIP_API_KEY not set")
+    directskip_stats = {"submitted": 0, "matched": 0, "phones_found": 0, "emails_found": 0, "cost": 0}
 else:
-    tracerfy_stats = batch_skip_trace([notice], max_signing_traces=5)
-    print(f"  Submitted: {tracerfy_stats['submitted']} contacts")
-    print(f"  Matched:   {tracerfy_stats['matched']}")
-    print(f"  Phones:    {tracerfy_stats['phones_found']}")
-    print(f"  Emails:    {tracerfy_stats['emails_found']}")
-    print(f"  Cost:      ${tracerfy_stats['cost']:.2f}")
+    directskip_stats = batch_skip_trace([notice], max_signing_traces=5)
+    print(f"  Submitted: {directskip_stats['submitted']} contacts")
+    print(f"  Matched:   {directskip_stats['matched']}")
+    print(f"  Phones:    {directskip_stats['phones_found']}")
+    print(f"  Emails:    {directskip_stats['emails_found']}")
+    print(f"  Cost:      ${directskip_stats['cost']:.2f}")
 print()
 
 # ── Step 3: Collect all phones for Trestle validation ───────────────────
@@ -226,10 +226,10 @@ print()
 print("=" * 70)
 print("COST SUMMARY")
 print("=" * 70)
-print(f"  Tracerfy skip trace:   ${tracerfy_stats.get('cost', 0):.2f} ({tracerfy_stats.get('submitted', 0)} contacts)")
+print(f"  DirectSkip skip trace: ${directskip_stats.get('cost', 0):.2f} ({directskip_stats.get('submitted', 0)} contacts)")
 print(f"  Trestle validation:    ${trestle_cost:.2f} ({len(unique_phones)} phones)")
 print(f"  Haiku API (obituary):  ~$0.01")
-total = tracerfy_stats.get('cost', 0) + trestle_cost + 0.01
+total = directskip_stats.get('cost', 0) + trestle_cost + 0.01
 print(f"  TOTAL:                 ~${total:.2f}")
 print()
 

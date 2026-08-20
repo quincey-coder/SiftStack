@@ -1,7 +1,7 @@
-"""Test Tracerfy skip trace + DataSift upload with phone/email columns.
+"""Test DirectSkip skip trace + DataSift upload with phone/email columns.
 
 1. Creates a few test NoticeData records
-2. Runs Tracerfy batch skip trace on them
+2. Runs DirectSkip batch skip trace on them (LIVE — bills $0.10 per hit)
 3. Generates DataSift CSV with phone/email columns
 4. Uploads to DataSift and checks column mapping
 """
@@ -16,7 +16,7 @@ load_dotenv()
 sys.path.insert(0, "src")
 
 from notice_parser import NoticeData
-from tracerfy_skip_tracer import batch_skip_trace
+from directskip_batch import batch_skip_trace
 from datasift_formatter import DATASIFT_COLUMNS, _build_row
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -48,8 +48,8 @@ notices = [
     ),
 ]
 
-# Step 1: Run Tracerfy batch skip trace
-print("\n=== STEP 1: Tracerfy Batch Skip Trace ===")
+# Step 1: Run DirectSkip batch skip trace
+print("\n=== STEP 1: DirectSkip Batch Skip Trace ===")
 stats = batch_skip_trace(notices)
 print(f"\nStats: {stats}")
 
@@ -69,7 +69,7 @@ for n in notices:
 
 # Step 3: Generate DataSift CSV
 print("\n=== STEP 3: Generate DataSift CSV ===")
-csv_path = Path("output/test_tracerfy_upload.csv")
+csv_path = Path("output/test_directskip_upload.csv")
 csv_path.parent.mkdir(exist_ok=True)
 with open(csv_path, "w", newline="", encoding="utf-8") as f:
     writer = csv.DictWriter(f, fieldnames=DATASIFT_COLUMNS)

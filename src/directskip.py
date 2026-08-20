@@ -3,9 +3,10 @@
 DirectSkip returns a traced owner PLUS their relatives (each with phone numbers)
 for one property in a single synchronous lookup. Unlike SmartSkip's batch
 submit/pay/download lifecycle, the DirectSkip API is one HTTP POST per person,
-so this client follows the stateless per-record shape of ``tracerfy_skip_tracer``
-/ ``phone_validator`` (static key, per-call, hard cost cap) rather than the
-stateful ``SmartSkipClient``.
+so this client follows the stateless per-record shape of ``phone_validator``
+(static key, per-call, hard cost cap) rather than the stateful
+``SmartSkipClient``. The pipeline batch layer over this client lives in
+``directskip_batch.py``.
 
 Two transports, one normalized output (``DirectSkipRecord``):
   * **API** (default) — ``POST https://api0.directskip.com/v2/search_contact.php``.

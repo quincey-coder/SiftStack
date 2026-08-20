@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 **SiftStack** — Full-stack real estate investing operations platform built around DataSift.ai CRM. Covers the entire REI business lifecycle:
 
 1. **Data Acquisition:** County clerk websites (Travis, Bell, Williamson), Odyssey court portals, MVBA Law Firm tax sale PDFs, Travis County Tax Office CSV, scanned PDF import, courthouse terminal photo import (probate, eviction, code violations, divorce), Dropbox auto-polling
-2. **Enrichment Pipeline:** 10+ steps — Smarty address standardization, Zillow property data, TCAD/BCAD/WCAD appraisal district lookups, obituary/heir research, Ancestry.com SSDI, Tracerfy skip trace, Trestle phone scoring, entity research, ZIP code filtering
+2. **Enrichment Pipeline:** 10+ steps — Smarty address standardization, Zillow property data, TCAD/BCAD/WCAD appraisal district lookups, obituary/heir research, Ancestry.com SSDI, DirectSkip skip trace, Trestle phone scoring, entity research, ZIP code filtering
 3. **Deal Analysis:** Comparable sales (Two-Bucket ARV), rehab estimation (4-tier room-by-room), deal analyzer (MAO/ROI/financing scenarios)
 4. **Market Intelligence:** Zip code scoring, Market Finder reports, cash buyer list building, investor portfolio analysis
 5. **CRM Automation:** DataSift upload, 26 TCA sequence templates, 12 niche sequential marketing presets, filter preset management, SiftMap sold property tagging
@@ -64,7 +64,7 @@ All source files are in `src/` and imports assume `src/` is the working director
 `input.json` (gitignored, holds secrets) is kept in sync with the production
 Apify schedule's runInput. The CLI reads it as its defaults layer, so a bare
 `python src/main.py daily` resolves enrichment toggles (obituary, ancestry,
-Zillow, entity research, Tracerfy/Trestle, split-by-county, Slack) to EXACTLY
+Zillow, entity research, DirectSkip/Trestle, split-by-county, Slack) to EXACTLY
 what the scheduled cloud run does. Precedence: **explicit CLI flag >
 input.json > built-in opt-in default**. `--skip-obituary`/`--skip-ancestry`/
 `--skip-zillow`/`--fast` force things OFF over input.json; without an
@@ -400,13 +400,14 @@ death. Upstream measured it against the Enformion Person Search on 12 identical
 owners: Enformion returned zero relatives on **6 of 12**, SmartSkip hit 12/12;
 100 owners / 682 relatives cost **$15.90 vs $78.20** (4.9x).
 
-Stack: SmartSkip ($0.15/hit) → Tracerfy ($0.02, gap-fill the ~7% of relatives
-left phoneless) → obituary/web research (**mandatory**, free) → Trestle
-($0.015/number). About $0.24 per record.
+Stack: SmartSkip ($0.15/hit) → DirectSkip ($0.10/hit, no-match free — gap-fill
+the ~7% of relatives left phoneless; replaced Tracerfy 2026-08-20) →
+obituary/web research (**mandatory**, free) → Trestle ($0.015/number). About
+$0.25 per record.
 
 - **Enformion's Person Search is retired; BusinessV2 is RETAINED** for entity
   owners only (`src/enformion_business.py`) — SmartSkip needs a first and last
-  name, and Tracerfy is consumer-only, so LLCs/trusts/estates have no other path.
+  name, and DirectSkip is consumer-only, so LLCs/trusts/estates have no other path.
   BusinessV2 returns actual SOS corp filings, so it is *grounded*, unlike
   `entity_researcher`'s DuckDuckGo+LLM inference — prefer it, keep the LLM path
   as fallback. Registered agents are **flagged, not dropped** (`is_registered_agent`):
@@ -458,7 +459,7 @@ payment guards were already verified offline against both export layouts.
 
 DirectSkip is a second skip-trace vendor, wired the SmartSkip way (operator-run
 CLI, NOT in the pipeline), but it is **single-record and synchronous**, so the
-client follows the stateless `tracerfy`/`phone_validator` shape, not
+client follows the stateless `phone_validator` shape, not
 `SmartSkipClient`'s batch lifecycle. It reuses SmartSkip's hygiene + heir-map
 helpers by import — no divergent copies.
 
@@ -507,8 +508,9 @@ multi-provider run* from an export. Operator CLI, NOT wired into `main.py`; does
 NOT upload (DataSift API is read-only — the CSV goes through the wizard).
 
 - **Flow:** `load_datasift_export` (read-only; maps DataSift export headers →
-  `NoticeData`, flags entities out) → `estimate` (free rundown) → `run` (DirectSkip
-  per-record sync, then SmartSkip bulk, then Trestle-score every unique number) →
+  `NoticeData`, flags entities out) → `estimate` (free rundown) → `run` (SmartSkip
+  bulk FIRST — primary vendor, owner preference 2026-08-20 — then DirectSkip
+  per-record sync as the cross-check, then Trestle-score every unique number) →
   `merge_record` → tier-eviction to the phone cap → `write_upload_csv`.
 - **Merge with provenance** (the point of this module): every `MergedPhone` carries
   a `providers` set, so the Notes label each number `[Dial First 92] [SmartSkip+DirectSkip]`.
@@ -549,6 +551,70 @@ NOT upload (DataSift API is read-only — the CSV goes through the wizard).
   SmartSkip 3/3 (first live run — charged the card), Trestle 66 numbers, $1.74. Merged
   output showed `[Dial First 100] [SmartSkip+DirectSkip]`, SmartSkip relationships
   (child/in-law), DirectSkip-only relatives in the discrepancies block, all title-cased.
+
+## SKU-grounded rehab materials (Austin 78704) — captured 2026-08-20
+
+`rehab_estimator` prices the MATERIAL side of each category from a locked list
+of real Home Depot SKUs local to **zip 78704**, instead of the blended national
+cost tables. Labor never comes from the list; the engine keeps its labor tables
+and the regional multiplier applies **to labor only**. Locked prices are already
+Austin-local, so multiplying them by the 0.95 Austin factor would double-discount
+materials — `sku_pricing` exists partly to enforce that.
+
+- **Capture:** `python src/material_list.py --master --zip 78704 --lock` →
+  `data/master_materials_locked_78704.{json,csv}` + `Master_Material_List.xlsx`.
+  94 SerpApi `home_depot` searches (`delivery_zip` = local store pricing). The
+  key is **SerpApi** (`serpapi.com`), read from `SERPAPI_KEY` *or* `SERPAPIKEY`.
+  **This is NOT Serper.dev** (`SERPER_API_KEY`, `google.serper.dev`, used by
+  `obituary_enricher`) — unrelated vendors, non-interchangeable keys.
+- **Coverage:** `SKU_REGIONS = ("austin","travis","williamson")` — one Austin
+  Home Depot metro. **Bell is deliberately excluded** (Killeen/Temple is a
+  separate metro 60 mi north) and stays on the engine tables until
+  `--master --zip 76541 --lock` captures its own list. Tier 4 is off-list by
+  definition. A wrong-ZIP lock file is rejected, not silently used.
+- **Degrades safely.** Missing file, wrong ZIP, uncovered region, tier 4, or any
+  single missing SKU → that whole category falls back to the engine table,
+  loudly. Output is then byte-identical to `use_locked_materials=False`.
+  `estimate.materials_source` stamps which basis was used.
+
+### Hard-won during the capture (2026-08-20)
+
+- **`hd_sort=top_sellers` silently returns the store's GENERIC top sellers when
+  a query does not map to a category.** `"outdoor wall light"` returned
+  retaining-wall block and joint compound; `"interior door knob"` returned caulk
+  and shiplap; `"30 in range hood"` returned ovens. All 5 affected keys scored
+  **zero** relevance-regex matches. Dropping the sort recovered 22/22/16 correct
+  in-band products. `pull_prices` now falls back to relevance sort **only** when
+  top-sellers yields nothing, and records the basis per key (`"sort"` in the
+  cache). top_sellers stays the default — "median in-band top-seller" is the
+  documented pricing basis and it works for 89 of 94 keys.
+- **The relevance regex is the quality gate, so it must pin the SIZE.**
+  `pt_2x8`'s regex was `2 in\. x 8 in\.` with no length, which would have
+  priced a **2x8x16 at $27.18 into a row labelled "PT 2x8x12"** — a ~35% unit
+  error, silently. Regexes now require the length. A blank row beats a
+  wrong-size substitution.
+- **The cache checkpoints every 5 searches** (`CHECKPOINT_EVERY`, atomic
+  temp-file swap). It previously wrote only after all 94 finished, so any
+  timeout/crash burned every paid search and left `--cached` nothing to resume
+  from. `--cached` refetches only keys absent from the cache, which is what made
+  the 17-key and 5-key backfills cost 17 and 10 searches instead of 94 each.
+- **SerpApi read-timeouts arrive in waves** (23 in the first pass; the client
+  retries 3x with backoff). They are **not billed** — 109 searches delivered
+  94 keys and the account charged only for delivered results. Budget by
+  delivered keys, not attempts. A full capture takes ~1.5 h wall-clock because
+  of this, so run it detached, never inside a tool timeout.
+- **Baskets are FIXED quantities, not sqft-scaled** — Kitchen, baths and HVAC
+  cost the same for a 900 sf and a 4,000 sf house. This is inherited upstream
+  behaviour and the **engine tables have the identical property**, so it is not
+  a regression introduced by SKU grounding; it is a shared limitation. Only
+  flooring/paint/roof/windows scale. Retune `sku_pricing`'s basket quantities
+  (6 base + 6 wall cabinets, 2 countertop sections, 35 sf backsplash, 45 sf bath
+  floor) before trusting a large-house estimate.
+- **Deltas vs the engine tables** (1,500 sf 3/2, built 1960, Austin): tier 1
+  materials **+$3,759** (engine under-priced budget SKUs), tier 2 **-$9,307**,
+  tier 3 **-$29,204**. Grand totals move +11.7% / -9.5% / -20.3%. The tier-2/3
+  drops are partly real Austin pricing and partly the fixed-basket issue above —
+  treat tier 3 with suspicion until the quantities are retuned.
 
 ## Key Domain Rules
 
@@ -734,7 +800,7 @@ Courthouse probate records have decedent name + PR/executor name but NO property
 **Probate Preset** (obituary enricher):
 - Triggers when court record has PR name + decedent name (no address required) — prevents wrong obituary from overriding court-named executor
 - Sets DM = the named PR/executor directly, skips obituary search entirely
-- Then runs DM address lookup (CAD → People Search → Tracerfy)
+- Then runs DM address lookup (CAD → People Search → DirectSkip)
 
 **DOD Sanity Check** (obituary enricher):
 - Rejects obituary matches where DOD is > 3 years before the notice filing date (`MAX_DOD_GAP_YEARS = 3`)

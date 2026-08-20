@@ -51,7 +51,7 @@ class PipelineOptions:
     skip_heir_verification: bool = False
     max_heir_depth: int = 2
     skip_dm_address: bool = False
-    tracerfy_tier1: bool = False
+    directskip_tier1: bool = False
     obituary_workers: int = 4
     # Absolute time.monotonic() deadline past which the obituary step stops
     # starting new work and lets remaining records flow through unenriched.
@@ -692,7 +692,7 @@ def run_enrichment_pipeline(
         logger.info("── Step 8a: Condo Filter (skipped) ──")
 
     # ── Step 8b: MLS Status Filter ────────────────────────────────────
-    # Remove records already listed/sold so downstream obituary + Tracerfy
+    # Remove records already listed/sold so downstream obituary + DirectSkip
     # + Trestle + DataSift upload don't burn budget on non-investable props.
     if not opts.skip_mls_filter:
         logger.info("── Step 8b: MLS Status Filter ──")
@@ -748,7 +748,7 @@ def run_enrichment_pipeline(
                     skip_heir_verification=opts.skip_heir_verification,
                     max_heir_depth=opts.max_heir_depth,
                     skip_dm_address=opts.skip_dm_address,
-                    tracerfy_tier1=getattr(opts, "tracerfy_tier1", False),
+                    directskip_tier1=getattr(opts, "directskip_tier1", False),
                     skip_ancestry=opts.skip_ancestry,
                     workers=getattr(opts, "obituary_workers", 4),
                     deadline=getattr(opts, "obituary_deadline", None),

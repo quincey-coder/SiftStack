@@ -2099,7 +2099,7 @@ def sheet_outreach(wb, pack):
     subject, inp, walk = pack["subject"], pack["exits"]["inputs"], pack["walk"]
     _title(ws, f"{subject['short_address']} - Dispo Outreach Sheet (ready to dial)",
            f"Built {datetime.now():%m/%d/%Y}. Sources: Enformion BusinessV2 + Person Search, "
-           "Tracerfy batch, web cross-check. Every number Trestle scored.")
+           "DirectSkip, web cross-check. Every number Trestle scored.")
     _header(ws, 4, ["Buyer / Entity", "Contact person", "Phone (Trestle score, tier)", "Email",
                     "Mailing address", "Why them / angle", "Confidence"])
 

@@ -558,7 +558,7 @@ Resolves heirs and required signers via SmartSkip, then confirms against publish
 **Does.**
 
 - SmartSkip batch returns relatives AND their phones in one row
-- Tracerfy gap-fills the roughly 7% of relatives left phoneless
+- DirectSkip gap-fills the roughly 7% of relatives left phoneless
 - Mandatory free obituary and web research supplies DOD and true relationships
 - Trestle scores every number into dial tiers
 
@@ -568,7 +568,7 @@ Resolves heirs and required signers via SmartSkip, then confirms against publish
 
 **Outputs.** Heir map, Master dial sheet, Branded PDF pack
 
-**Touches.** SmartSkip, Tracerfy, Trestle IQ, Scrapfly
+**Touches.** SmartSkip, DirectSkip, Trestle IQ, Scrapfly
 
 > **The trap this exists to avoid.** SmartSkip is WRONG about death. It returned Deceased=false for a man who died with a published funeral-home obituary, and it has no DOD column at all. 63% of relationship labels come back generic. The obituary layer is what makes it trustworthy. Cost is $0.24 per record, 4.9x cheaper than the retired Enformion path.
 
@@ -594,11 +594,11 @@ Unmasks the human behind an LLC, trust, or corporation.
 
 > **The trap this exists to avoid.** Entities cannot be name-traced. 35 of 321 vacant owners were LLCs or trusts, so filter them out of the consumer skip-trace batch up front or you burn the spend. The v1 BusinessSearch type is access-denied; only BusinessV2 works.
 
-#### Tracerfy Skip Trace
+#### DirectSkip Skip Trace
 
-`src/tracerfy_skip_tracer.py, src/tracerfy_ftm.py` &middot; phase 1 &middot; live
+`src/directskip_batch.py, src/directskip_ftm.py` &middot; phase 1 &middot; live
 
-Cheap batch phone and email fill at about two cents a record.
+Phone and email fill at ten cents a hit (a no-match is free).
 
 **Trigger.** Any record or relative missing contact data.
 
@@ -611,9 +611,9 @@ Cheap batch phone and email fill at about two cents a record.
 
 **Outputs.** Phone numbers, Emails
 
-**Touches.** Tracerfy
+**Touches.** DirectSkip
 
-> **The trap this exists to avoid.** DataSift MERGES phones rather than replacing them, so Tracerfy and Enformion accumulate. Run them sequentially, then re-score and re-tag. One live run went from 109 to 302 phones across 33 records.
+> **The trap this exists to avoid.** DataSift MERGES phones rather than replacing them, so DirectSkip and Enformion accumulate. Run them sequentially, then re-score and re-tag. One live run went from 109 to 302 phones across 33 records.
 
 #### Phone Validator
 
@@ -1003,7 +1003,7 @@ Three-source waterfall with a built-in audit matrix showing which source missed.
 **Does.**
 
 - Source 1 Enformion person search, address-anchored
-- Source 2 Tracerfy batch at two cents a record
+- Source 2 DirectSkip at ten cents a hit, no-match free
 - Source 3 web people-search cross-check, merged in manually
 - Dedupes the union, Trestle-scores every unique number
 
@@ -1013,9 +1013,9 @@ Three-source waterfall with a built-in audit matrix showing which source missed.
 
 **Outputs.** Cross-confirmed contact list, Per-contact source audit
 
-**Touches.** Enformion, Tracerfy, Trestle IQ
+**Touches.** Enformion, DirectSkip, Trestle IQ
 
-> **The trap this exists to avoid.** The audit matrix answers the question everyone forgets to ask: did we skip-trace this landline at BOTH Tracerfy and Enformion? Single-source numbers get flagged so you know what you are actually dialing.
+> **The trap this exists to avoid.** The audit matrix answers the question everyone forgets to ask: did we skip-trace this landline at BOTH DirectSkip and Enformion? Single-source numbers get flagged so you know what you are actually dialing.
 
 #### Buyer Prospector
 
@@ -1893,7 +1893,7 @@ Attaches the Realtor AI score to each confirmed homeowner.
 **Identity & Contact**
 
 - SmartSkip
-- Tracerfy
+- DirectSkip
 - Enformion BusinessV2
 - Trestle IQ
 - Obituary sources

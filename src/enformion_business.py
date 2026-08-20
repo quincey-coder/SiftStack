@@ -2,7 +2,7 @@
 
 This is the ONE piece of Enformion that Deep Prospecting v5 retains. The
 Enformion *Person* search is retired (see ``smartskip``), but entity owners have
-no other path: SmartSkip requires a first and last name, and Tracerfy is
+no other path: SmartSkip requires a first and last name, and DirectSkip is
 consumer-only, so every LLC / trust / estate is invisible to the heir engine.
 Entities are a real share of a distressed pull, not an edge case.
 

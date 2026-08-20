@@ -344,7 +344,7 @@ def _upload_forensics_reports_to_drive(no_drive: bool = False) -> int:
 async def actor_main() -> None:
     """Run as an Apify Actor — full automated pipeline.
 
-    Scrape → Dedup → Enrich → Tracerfy (opt) → PDFs → DataSift CSVs →
+    Scrape → Dedup → Enrich → DirectSkip (opt) → PDFs → DataSift CSVs →
     Drive upload → Slack Notification. Mirrors `_run_scrape_pipeline()`
     (the CLI path) feature-for-feature, reading toggles from Actor input.
 
@@ -397,7 +397,7 @@ async def actor_main() -> None:
             "OPENWEBNINJA_API_KEY": actor_input.get("openwebninja_api_key", ""),
             "SERPER_API_KEY": actor_input.get("serper_api_key", ""),
             "FIRECRAWL_API_KEY": actor_input.get("firecrawl_api_key", ""),
-            "TRACERFY_API_KEY": actor_input.get("tracerfy_api_key", ""),
+            "DIRECTSKIP_API_KEY": actor_input.get("directskip_api_key", ""),
             "DATASIFT_EMAIL": actor_input.get("datasift_email", ""),
             "DATASIFT_PASSWORD": actor_input.get("datasift_password", ""),
             "SLACK_WEBHOOK_URL": actor_input.get("slack_webhook_url", ""),
@@ -461,17 +461,22 @@ async def actor_main() -> None:
         # ── Enrichment flags (mirror CLI) ──
         enable_obituary = bool(actor_input.get("enable_obituary", False))
         enable_ancestry = bool(actor_input.get("enable_ancestry", False))
-        enable_tracerfy = bool(actor_input.get("enable_tracerfy", False))
+        # `enable_tracerfy` is the legacy toggle name kept for old schedule
+        # runInputs — same switch, DirectSkip is the vendor now.
+        enable_directskip = bool(actor_input.get(
+            "enable_directskip", actor_input.get("enable_tracerfy", False)))
         enable_trestle = bool(actor_input.get("enable_trestle", False))
-        # enable_tracerfy=false must mean NO Tracerfy calls at all — but the
-        # obituary enricher's inline tier-3 + Phase C batch DM-address lookups
-        # gate on key PRESENCE (cfg.TRACERFY_API_KEY), not this toggle. Any
-        # input that carries the key secret would fire them (seen live
-        # 2026-07-22: Phase C 400s on a run with enable_tracerfy off). Blank
-        # the key so every Tracerfy path is dead when the toggle is off.
-        if not enable_tracerfy:
-            config.TRACERFY_API_KEY = ""
-            os.environ.pop("TRACERFY_API_KEY", None)
+        # enable_directskip=false must mean NO DirectSkip calls at all — but the
+        # obituary enricher's inline tier-3 + Phase C DM-address lookups gate on
+        # key PRESENCE (cfg.DIRECTSKIP_API_KEY), not this toggle. Any input that
+        # carries the key secret would fire them (the same silent-spend class as
+        # the 2026-07-22 Tracerfy Phase C incident). Blank the key so every
+        # DirectSkip path is dead when the toggle is off. (Note: the DirectSkip
+        # API is IP-allowlisted and Apify has no static egress IP, so cloud
+        # calls fail auth anyway — this keeps them from even being attempted.)
+        if not enable_directskip:
+            config.DIRECTSKIP_API_KEY = ""
+            os.environ.pop("DIRECTSKIP_API_KEY", None)
         research_entities = bool(actor_input.get("research_entities", False))
         keep_government = bool(actor_input.get("keep_government_records", False))
         keep_listed = bool(actor_input.get("keep_listed", False))
@@ -771,7 +776,7 @@ async def actor_main() -> None:
                 skip_heir_verification=skip_heir_verification,
                 max_heir_depth=max_heir_depth,
                 skip_dm_address=skip_dm_address,
-                tracerfy_tier1=False,
+                directskip_tier1=False,
                 obituary_workers=obituary_workers,
                 obituary_deadline=obituary_deadline,
                 skip_zip_filter=skip_zip_filter,
@@ -842,38 +847,42 @@ async def actor_main() -> None:
 
             total = len(notices)
 
-            # ── Tracerfy (opt-in) ──
-            tracerfy_stats: dict = {}
+            # ── DirectSkip (opt-in) ──
+            directskip_stats: dict = {}
             tiers_map: dict = {}
-            if enable_tracerfy and config.TRACERFY_API_KEY:
-                dp_for_tracerfy = [
+            if enable_directskip and config.DIRECTSKIP_API_KEY:
+                dp_for_directskip = [
                     n for n in notices
                     if n.owner_deceased == "yes" or n.heir_map_json or n.decision_maker_name
                 ]
-                if dp_for_tracerfy:
+                if dp_for_directskip:
                     Actor.log.info(
-                        "Tracerfy: running on %d DP candidates (%d basic records skipped)",
-                        len(dp_for_tracerfy), total - len(dp_for_tracerfy),
+                        "DirectSkip: running on %d DP candidates (%d basic records skipped)",
+                        len(dp_for_directskip), total - len(dp_for_directskip),
                     )
                     try:
-                        from tracerfy_skip_tracer import batch_skip_trace
-                        tracerfy_stats = batch_skip_trace(dp_for_tracerfy)
-                        if tracerfy_stats.get("credits_exhausted"):
-                            Actor.log.error("TRACERFY OUT OF CREDITS — skip trace disabled this run")
+                        from directskip_batch import batch_skip_trace
+                        directskip_stats = batch_skip_trace(dp_for_directskip)
+                        if directskip_stats.get("auth_failed"):
+                            Actor.log.error(
+                                "DIRECTSKIP AUTH FAILED — the API is IP-allowlisted and "
+                                "Apify has no static egress IP; run DirectSkip from the "
+                                "operator box (skip_orchestrator) instead."
+                            )
                         Actor.log.info(
-                            "Tracerfy: %d/%d matched, %d phones, %d emails, $%.2f",
-                            tracerfy_stats.get("matched", 0),
-                            tracerfy_stats.get("submitted", 0),
-                            tracerfy_stats.get("phones_found", 0),
-                            tracerfy_stats.get("emails_found", 0),
-                            tracerfy_stats.get("cost", 0.0),
+                            "DirectSkip: %d/%d matched, %d phones, %d emails, $%.2f",
+                            directskip_stats.get("matched", 0),
+                            directskip_stats.get("submitted", 0),
+                            directskip_stats.get("phones_found", 0),
+                            directskip_stats.get("emails_found", 0),
+                            directskip_stats.get("cost", 0.0),
                         )
                     except Exception as e:
-                        Actor.log.warning("Tracerfy skip trace failed: %s — continuing", e)
+                        Actor.log.warning("DirectSkip skip trace failed: %s — continuing", e)
                 else:
-                    Actor.log.info("Tracerfy: no DP candidates — skipped")
+                    Actor.log.info("DirectSkip: no DP candidates — skipped")
 
-                # Trestle tier scoring (only after Tracerfy — needs phones)
+                # Trestle tier scoring (only after DirectSkip — needs phones)
                 if enable_trestle and config.TRESTLE_API_KEY:
                     dp_cands = [
                         n for n in notices
@@ -1292,8 +1301,8 @@ async def actor_main() -> None:
                     _llm_usage["calls"], _llm_usage["input_tokens"],
                     _llm_usage["output_tokens"], _llm_usage["by_model"],
                 )
-            if tracerfy_stats and tracerfy_stats.get("cost", 0) > 0:
-                cost_breakdown["Tracerfy"] = round(tracerfy_stats["cost"], 2)
+            if directskip_stats and directskip_stats.get("cost", 0) > 0:
+                cost_breakdown["DirectSkip"] = round(directskip_stats["cost"], 2)
             smarty_count = sum(1 for n in notices if n.dpv_match_code)
             if smarty_count > 250:
                 cost_breakdown["Smarty"] = round((smarty_count - 250) * 0.01, 2)
@@ -1550,7 +1559,7 @@ def _run_pdf_import(args) -> None:
         skip_heir_verification=args.skip_heir_verification,
         max_heir_depth=args.max_heir_depth,
         skip_dm_address=args.skip_dm_address,
-        tracerfy_tier1=getattr(args, "tracerfy_tier1", False),
+        directskip_tier1=getattr(args, "directskip_tier1", False),
         obituary_workers=getattr(args, "obituary_workers", 4),
         source_label=f"PDF import ({pdf_path.name})",
     )
@@ -1627,7 +1636,7 @@ def _run_photo_import(args) -> None:
         skip_heir_verification=args.skip_heir_verification,
         max_heir_depth=args.max_heir_depth,
         skip_dm_address=args.skip_dm_address,
-        tracerfy_tier1=getattr(args, "tracerfy_tier1", False),
+        directskip_tier1=getattr(args, "directskip_tier1", False),
         obituary_workers=getattr(args, "obituary_workers", 4),
         source_label=f"Photo import ({folder.name})",
     )
@@ -1728,7 +1737,7 @@ def _run_csv_import(args) -> None:
         skip_heir_verification=args.skip_heir_verification,
         max_heir_depth=args.max_heir_depth,
         skip_dm_address=args.skip_dm_address,
-        tracerfy_tier1=getattr(args, "tracerfy_tier1", False),
+        directskip_tier1=getattr(args, "directskip_tier1", False),
         obituary_workers=getattr(args, "obituary_workers", 4),
         source_label=f"CSV import ({primary_name})",
     )
@@ -2197,24 +2206,22 @@ def cli_main() -> None:
         help="Max recursion depth for heir verification (default: 2)",
     )
     parser.add_argument(
-        "--tracerfy-tier1",
+        "--directskip-tier1",
         action="store_true",
-        help="Use Tracerfy as primary DM address lookup ($0.02/record)",
+        help="Use DirectSkip as primary DM address lookup ($0.10/hit, no-match free)",
     )
     parser.add_argument(
-        "--skip-tracerfy",
+        "--enable-directskip",
+        "--enable-tracerfy",  # legacy alias (Tracerfy retired 2026-08-20)
+        dest="enable_directskip",
         action="store_true",
-        help="[deprecated no-op — Tracerfy is off by default] Skip Tracerfy batch skip trace",
-    )
-    parser.add_argument(
-        "--enable-tracerfy",
-        action="store_true",
-        help="Opt into Tracerfy batch skip trace (phones + emails) on DP candidates (off by default)",
+        help="Opt into DirectSkip skip trace (phones + emails) on DP candidates "
+             "(off by default; needs DIRECTSKIP_API_KEY + this machine's IP allowlisted)",
     )
     parser.add_argument(
         "--enable-trestle",
         action="store_true",
-        help="Opt into Trestle per-phone tier scoring (requires --enable-tracerfy, off by default)",
+        help="Opt into Trestle per-phone tier scoring (requires --enable-directskip, off by default)",
     )
     parser.add_argument(
         "--llm-backend",
@@ -2236,7 +2243,7 @@ def cli_main() -> None:
     parser.add_argument(
         "--fast",
         action="store_true",
-        help="Skeleton pipeline: skip Zillow + Obituary + Ancestry + Tracerfy. "
+        help="Skeleton pipeline: skip Zillow + Obituary + Ancestry + DirectSkip. "
              "Produces a mailable CSV with property/owner data only (no Zestimate, no deceased detection, no phone lookup). "
              "Typical incremental daily run finishes in 2-5 minutes.",
     )
@@ -2484,12 +2491,13 @@ def cli_main() -> None:
 
     args = parser.parse_args()
 
-    # Expand --fast into the four component skip flags
+    # Expand --fast into the component skip flags (DirectSkip is opt-in, so
+    # --fast simply guarantees the opt-in stays off)
     if getattr(args, "fast", False):
         args.skip_zillow = True
         args.skip_obituary = True
         args.skip_ancestry = True
-        args.skip_tracerfy = True
+        args.enable_directskip = False
 
     # ── Local/cloud parity: input.json mirrors the Apify schedule input ──
     # input.json is kept in sync with the production schedule's runInput
@@ -2507,8 +2515,9 @@ def cli_main() -> None:
             args.enable_obituary = True
         if _inp.get("enable_ancestry") and not getattr(args, "skip_ancestry", False):
             args.enable_ancestry = True
-        if _inp.get("enable_tracerfy"):
-            args.enable_tracerfy = True
+        if ((_inp.get("enable_directskip") or _inp.get("enable_tracerfy"))
+                and not getattr(args, "fast", False)):
+            args.enable_directskip = True
         if _inp.get("enable_trestle"):
             args.enable_trestle = True
         if _inp.get("research_entities"):
@@ -2529,13 +2538,13 @@ def cli_main() -> None:
     else:
         args.skip_zillow = bool(_inp.get("skip_zillow", True)) if _inp else True
 
-    # Tracerfy is opt-in — but the obituary enricher's inline tier-3 and
-    # Phase C batch DM-address lookups fire on key PRESENCE (a .env key),
-    # not the flag. Blank the key so no Tracerfy path runs without opt-in
+    # DirectSkip is opt-in — but the obituary enricher's inline tier-3 and
+    # Phase C DM-address lookups fire on key PRESENCE (a .env key), not the
+    # flag. Blank the key so no DirectSkip path runs without opt-in
     # (mirrors the Actor-input handling).
-    if not getattr(args, "enable_tracerfy", False):
-        config.TRACERFY_API_KEY = ""
-        os.environ.pop("TRACERFY_API_KEY", None)
+    if not getattr(args, "enable_directskip", False):
+        config.DIRECTSKIP_API_KEY = ""
+        os.environ.pop("DIRECTSKIP_API_KEY", None)
 
     # Apply LLM backend override from CLI flag
     if hasattr(args, "llm_backend") and args.llm_backend:
@@ -2549,7 +2558,7 @@ def cli_main() -> None:
     setup_logging(args.verbose)
 
     if getattr(args, "fast", False):
-        logging.info("── --fast mode: skipping Zillow, Obituary, Ancestry, Tracerfy ──")
+        logging.info("── --fast mode: skipping Zillow, Obituary, Ancestry, DirectSkip ──")
 
     # ── Preflight health checks ──────────────────────────────────────
     preflight_failures = _preflight_check(args.mode)
@@ -2999,7 +3008,7 @@ def _run_scrape_pipeline(args, targets) -> None:
         skip_heir_verification=args.skip_heir_verification,
         max_heir_depth=args.max_heir_depth,
         skip_dm_address=args.skip_dm_address,
-        tracerfy_tier1=getattr(args, "tracerfy_tier1", False),
+        directskip_tier1=getattr(args, "directskip_tier1", False),
         obituary_workers=getattr(args, "obituary_workers", 4),
         skip_zip_filter=getattr(args, "skip_zip_filter", False),
         skip_condo_filter=getattr(args, "skip_condo_filter", False),
@@ -3039,38 +3048,38 @@ def _run_scrape_pipeline(args, targets) -> None:
         _finalize_health(0)
         sys.exit(0)
 
-    # Tracerfy batch skip trace — only on DP candidates (deceased owners,
+    # DirectSkip skip trace — only on DP candidates (deceased owners,
     # heir maps, decision makers). Basic living-owner records get skip traced
     # for free inside DataSift's unlimited plan.
     tiers_map: dict = {}
-    tracerfy_stats: dict = {}
-    if getattr(args, "enable_tracerfy", False):
+    directskip_stats: dict = {}
+    if getattr(args, "enable_directskip", False):
         import config as cfg
-        if cfg.TRACERFY_API_KEY:
-            from tracerfy_skip_tracer import batch_skip_trace
-            dp_for_tracerfy = [
+        if cfg.DIRECTSKIP_API_KEY:
+            from directskip_batch import batch_skip_trace
+            dp_for_directskip = [
                 n for n in notices
                 if n.owner_deceased == "yes" or n.heir_map_json or n.decision_maker_name
             ]
-            if dp_for_tracerfy:
+            if dp_for_directskip:
                 logging.info(
-                    "Tracerfy: running on %d DP candidates (%d basic records skipped)",
-                    len(dp_for_tracerfy), len(notices) - len(dp_for_tracerfy),
+                    "DirectSkip: running on %d DP candidates (%d basic records skipped)",
+                    len(dp_for_directskip), len(notices) - len(dp_for_directskip),
                 )
-                tracerfy_stats = batch_skip_trace(dp_for_tracerfy)
-                if tracerfy_stats.get("credits_exhausted"):
+                directskip_stats = batch_skip_trace(dp_for_directskip)
+                if directskip_stats.get("auth_failed"):
                     logging.error(
-                        "TRACERFY OUT OF CREDITS — skip trace disabled for this run. "
-                        "Add credits at https://tracerfy.com/billing to resume phone/email lookups."
+                        "DIRECTSKIP AUTH FAILED — check DIRECTSKIP_API_KEY and that this "
+                        "machine's public IP is allowlisted with support@directskip.com."
                     )
                 logging.info(
-                    "Tracerfy: %d/%d matched, %d phones, %d emails, $%.2f",
-                    tracerfy_stats.get("matched", 0), tracerfy_stats.get("submitted", 0),
-                    tracerfy_stats.get("phones_found", 0), tracerfy_stats.get("emails_found", 0),
-                    tracerfy_stats.get("cost", 0.0),
+                    "DirectSkip: %d/%d matched, %d phones, %d emails, $%.2f",
+                    directskip_stats.get("matched", 0), directskip_stats.get("submitted", 0),
+                    directskip_stats.get("phones_found", 0), directskip_stats.get("emails_found", 0),
+                    directskip_stats.get("cost", 0.0),
                 )
             else:
-                logging.info("Tracerfy: no DP candidates — skipped (0 deceased/DM records)")
+                logging.info("DirectSkip: no DP candidates — skipped (0 deceased/DM records)")
             # Score every phone (DM #1 + all heirs) — writes per-heir phone_scores
             # into heir_map_json so DataSift Notes and PDFs can surface tier badges.
             if getattr(args, "enable_trestle", False) and cfg.TRESTLE_API_KEY:

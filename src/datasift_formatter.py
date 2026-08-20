@@ -37,7 +37,7 @@ DATASIFT_COLUMNS = [
     "Mailing City",
     "Mailing State",
     "Mailing ZIP Code",
-    # ── Phone/Email (Tracerfy skip trace, mapped to DataSift built-in) ──
+    # ── Phone/Email (DirectSkip skip trace, mapped to DataSift built-in) ──
     "Phone 1",
     "Phone 2",
     "Phone 3",
@@ -1260,7 +1260,7 @@ def _build_row(notice: NoticeData, notes_override: str | None = None) -> dict:
         "Mailing City": contact["city"],
         "Mailing State": contact["state"],
         "Mailing ZIP Code": _zip5(contact["zip"]),
-        # ── Phone/Email (Tracerfy → DataSift generic Phone N format) ──
+        # ── Phone/Email (DirectSkip → DataSift generic Phone N format) ──
         "Phone 1": notice.primary_phone,
         "Phone 2": notice.mobile_1,
         "Phone 3": notice.mobile_2,

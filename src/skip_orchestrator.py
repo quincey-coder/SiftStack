@@ -712,15 +712,20 @@ def run(notices, max_cost: float, confirm: bool = False,
 
     spent = 0.0
     ds_records, ss_records = {}, {}
-    if run_directskip:
-        ds_records, ds_spent = _run_directskip(eligible, budget=max_cost)
-        spent += ds_spent
+    # Provider order (owner preference, 2026-08-20): SmartSkip runs FIRST — it
+    # is the primary vendor (grounded relatives WITH relationships), DirectSkip
+    # second as the per-record cross-check. Was DirectSkip-first. If SmartSkip
+    # fails, the run still degrades to DirectSkip-only exactly as before;
+    # DirectSkip's budget is what remains under the ceiling after SmartSkip.
     if run_smartskip:
         try:
             ss_records = _run_smartskip(eligible, confirm, tmp_dir / "smartskip_input.csv")
             spent += len(eligible) * SS_COST   # bulk bills all calculated rows
         except (smartskip.SmartSkipError, OrchestratorError) as e:
             logger.error("SmartSkip failed (%s) - continuing DirectSkip-only.", e)
+    if run_directskip:
+        ds_records, ds_spent = _run_directskip(eligible, budget=max(max_cost - spent, 0.0))
+        spent += ds_spent
 
     merged = [merge_record(n, ss_records.get(_addr_key(getattr(n, "address", ""))),
                            ds_records.get(_addr_key(getattr(n, "address", ""))))

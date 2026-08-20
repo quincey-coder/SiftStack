@@ -179,7 +179,7 @@ SPEC_TEMPLATE = {
     "pitch": {"rows": [["30-SECOND PITCH", ""], ["Script", "..."]]},
     "sources": {"rows": [["Comps", "OpenWeb Ninja Zillow /search"],
                          ["Buyers", "SiftMap deed sweep"],
-                         ["Skip trace", "Enformion + Tracerfy + web, Trestle scored"]]},
+                         ["Skip trace", "Enformion + DirectSkip + web, Trestle scored"]]},
 }
 
 

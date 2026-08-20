@@ -1,41 +1,49 @@
-"""Tracerfy batch skip trace — phones + emails for all records.
+"""DirectSkip batch skip trace — phones + emails for all records.
 
-Submits all records to POST /v1/api/trace/ (batch endpoint, $0.02/record),
-polls for results, and populates NoticeData phone/email fields.
-Runs as a separate pipeline step before DataSift CSV generation.
+Runs one synchronous DirectSkip lookup per contact ($0.10/hit, a no-match is
+FREE) and populates NoticeData phone/email fields. Runs as a separate pipeline
+step before DataSift CSV generation. This replaced the retired Tracerfy batch
+tracer (2026-08-20) — same contract, better data (DirectSkip returns the
+matched person's relatives too, though this pipeline step only takes the
+subject's own phones/emails; the relative graph belongs to the operator-run
+skip_orchestrator / deep-prospecting flows).
 
 Signing chain support: traces ALL signing-authority heirs (not just DM #1)
 so the user has full contact info for every heir who must sign to close a deal.
+
+Trust boundaries (see src/directskip.py):
+  * ResultCode AB1/AB2 = address-only match returning a DIFFERENT person —
+    those phones NEVER fill anyone's dial slots.
+  * The vendor Deceased flag is an observation, never a verdict.
+  * DirectSkip's API is IP-allowlisted — it works from the fixed-IP operator
+    box, NOT from Apify (no static egress IP). An auth failure aborts the
+    batch loudly (stats["auth_failed"]) instead of burning time per record.
 """
 
-import csv
-import io
 import json
 import logging
 import re
 import time
-
-import requests
 
 import config as cfg
 from notice_parser import NoticeData
 
 logger = logging.getLogger(__name__)
 
-# Tracerfy batch response phone/email fields
+# NoticeData phone/email slots (unchanged from the Tracerfy era — these are the
+# NoticeData contract that datasift_formatter reads).
 PHONE_FIELDS = [
     "primary_phone", "mobile_1", "mobile_2", "mobile_3", "mobile_4",
     "mobile_5", "landline_1", "landline_2", "landline_3",
 ]
 EMAIL_FIELDS = ["email_1", "email_2", "email_3", "email_4", "email_5"]
 
-TRACERFY_TRACE_URL = "https://tracerfy.com/v1/api/trace/"
-TRACERFY_QUEUE_URL = "https://tracerfy.com/v1/api/queue/"
+_MOBILE_FIELDS = ["mobile_1", "mobile_2", "mobile_3", "mobile_4", "mobile_5"]
+_LANDLINE_FIELDS = ["landline_1", "landline_2", "landline_3"]
 
-# A LIST response from the queue endpoint is a partial, growing result set.
-# Require it to hold steady this many consecutive polls (5s each) before
-# treating it as final, so a slow record is not silently dropped.
-STABLE_POLLS_REQUIRED = 4
+# Abort the batch after this many consecutive hard failures — an un-allowlisted
+# IP or dead key fails every call identically; no point burning the whole loop.
+MAX_CONSECUTIVE_FAILURES = 3
 
 
 # A situs street with no leading house number means vacant land.
@@ -102,8 +110,7 @@ def _get_contacts_for_trace(
         # Deceased owner with no DM identified → there is no valid LIVING contact
         # to trace. owner_name here is the decedent (the CAD owner-of-record), so
         # skip-tracing it would (a) spend credits on a dead person and (b) produce
-        # phones that can't attach to any contact (the deceased branch in
-        # _match_results never writes them). Leave the record for heir research.
+        # phones that can't attach to any contact. Leave the record for heir research.
         return []
     else:
         # Living owner — single contact
@@ -202,7 +209,7 @@ def _lookup_missing_heir_addresses(
 
         try:
             addr = _lookup_dm_address(
-                heir_name, city_hint, api_key or "", tracerfy_tier1=False,
+                heir_name, city_hint, api_key or "", directskip_tier1=False,
             )
         except Exception as e:
             logger.debug("Heir address lookup failed for %s: %s", heir_name, e)
@@ -229,23 +236,27 @@ def batch_skip_trace(
     max_signing_traces: int = 5,
     lookup_heir_addresses: bool = True,
     address_lookup_api_key: str | None = None,
+    max_cost: float | None = None,
 ) -> dict:
-    """Run Tracerfy batch skip trace on all records.
+    """Run DirectSkip skip trace on all records (one API call per contact).
 
-    Submits a single batch CSV to POST /v1/api/trace/, polls for results,
-    and populates phone/email fields on each NoticeData object.
-
-    For deceased owners, traces ALL signing-authority heirs (up to max_signing_traces
-    per property). DM #1's phones go to flat NoticeData fields; other heirs'
-    phones/emails are stored in their heir_map_json entry.
+    For deceased owners, traces ALL signing-authority heirs (up to
+    max_signing_traces per property). DM #1's phones go to flat NoticeData
+    fields; other heirs' phones/emails are stored in their heir_map_json entry.
 
     When lookup_heir_addresses is True, signing-authority heirs without a known
     mailing address get one looked up (TX CAD → people search) before the trace
-    so Tracerfy has enough info to return phones. Uses ANTHROPIC_API_KEY (or the
-    explicit override) for LLM-based extraction from people-search pages.
+    so DirectSkip has enough info to return a confident match. Uses
+    ANTHROPIC_API_KEY (or the explicit override) for LLM-based extraction from
+    people-search pages.
+
+    MONEY: DirectSkip bills $DIRECTSKIP_COST_PER_HIT per MATCH; a no-match is
+    free. The loop stops before any call that could push spend past the cap
+    (max_cost, default cfg.MAX_DIRECTSKIP_COST_USD).
 
     Returns stats dict: {total, submitted, matched, phones_found, emails_found,
-                         cost, signing_heirs_traced, heir_addresses_filled}.
+                         cost, signing_heirs_traced, heir_addresses_filled,
+                         cost_capped, auth_failed}.
     """
     stats = {
         "total": len(notices),
@@ -256,16 +267,24 @@ def batch_skip_trace(
         "cost": 0.0,
         "signing_heirs_traced": 0,
         "heir_addresses_filled": 0,
-        "credits_exhausted": False,
+        "cost_capped": False,
+        "auth_failed": False,
     }
 
-    if not cfg.TRACERFY_API_KEY:
-        logger.warning("Tracerfy API key not set — skipping batch skip trace")
+    if not cfg.DIRECTSKIP_API_KEY:
+        logger.warning("DirectSkip API key not set — skipping batch skip trace")
         return stats
+
+    from directskip import (
+        BATCH_CALL_DELAY, COST_PER_HIT, DirectSkipClient, DirectSkipError,
+        parse_api_response,
+    )
+
+    cap = float(cfg.MAX_DIRECTSKIP_COST_USD if max_cost is None else max_cost)
 
     # Fill missing heir addresses BEFORE building the trace batch — otherwise
     # those heirs get silently dropped at the `if not heir.get("street")` check
-    # in _get_contacts_for_trace and never get Tracerfy phones.
+    # in _get_contacts_for_trace and never get DirectSkip phones.
     if lookup_heir_addresses:
         llm_key = address_lookup_api_key or getattr(cfg, "ANTHROPIC_API_KEY", "") or None
         for notice in notices:
@@ -283,7 +302,6 @@ def batch_skip_trace(
     # Multiple entries per notice for signing-authority heirs
     lookup_map: list[tuple[NoticeData, str, str, str, str, str, str]] = []
     for notice in notices:
-        # Skip records that already have phone data (DM #1)
         contacts = _get_contacts_for_trace(notice, max_signing_traces)
         for i, (first, last, address, city, zip_code, heir_key) in enumerate(contacts):
             # Skip DM #1 if already has phones
@@ -295,155 +313,130 @@ def batch_skip_trace(
             lookup_map.append((notice, first, last, address, city, zip_code, heir_key))
 
     if not lookup_map:
-        logger.info("Tracerfy: no records to skip-trace (all have phones or no valid names)")
+        logger.info("DirectSkip: no records to skip-trace (all have phones or no valid names)")
         return stats
 
-    # ── Spending cap enforcement ─────────────────────────────────────────
-    # Truncate batch if it would exceed MAX_TRACERFY_COST_USD.
-    estimated_cost = len(lookup_map) * cfg.TRACERFY_COST_PER_RECORD
-    if estimated_cost > cfg.MAX_TRACERFY_COST_USD:
-        max_records = int(cfg.MAX_TRACERFY_COST_USD / cfg.TRACERFY_COST_PER_RECORD)
-        logger.warning(
-            "Tracerfy batch would cost $%.2f, exceeding cap of $%.2f. "
-            "Truncating from %d to %d records. Increase MAX_TRACERFY_COST_USD to skip more.",
-            estimated_cost, cfg.MAX_TRACERFY_COST_USD,
-            len(lookup_map), max_records,
-        )
-        lookup_map = lookup_map[:max_records]
-        stats["cost_capped"] = True
-        stats["records_skipped_due_to_cap"] = stats.get("records_skipped_due_to_cap", 0) + (estimated_cost / cfg.TRACERFY_COST_PER_RECORD - max_records)
-
-    stats["submitted"] = len(lookup_map)
     stats["signing_heirs_traced"] = sum(
         1 for n, _, _, _, _, _, hk in lookup_map
         if n.decision_maker_name and hk != n.decision_maker_name
     )
-    logger.info("Tracerfy batch: submitting %d contacts (%d notices, %d signing heirs) — $%.2f",
+    logger.info("DirectSkip batch: %d contacts (%d notices, %d signing heirs) — "
+                "worst case $%.2f at $%.2f/hit, cap $%.2f",
                 len(lookup_map),
                 len(set(id(n) for n, *_ in lookup_map)),
                 stats["signing_heirs_traced"],
-                len(lookup_map) * cfg.TRACERFY_COST_PER_RECORD)
+                len(lookup_map) * COST_PER_HIT, COST_PER_HIT, cap)
 
-    # Build in-memory CSV
-    csv_buffer = io.StringIO()
-    writer = csv.writer(csv_buffer)
-    writer.writerow(["first_name", "last_name", "address", "city", "state",
-                     "zip", "mail_address", "mail_city", "mail_state"])
-    for notice_ref, first, last, address, city, zip_code, _ in lookup_map:
-        state = notice_ref.state or "TX"
-        writer.writerow([first, last, address, city, state, zip_code, "", "", ""])
-    csv_content = csv_buffer.getvalue()
-    csv_buffer.close()
+    client = DirectSkipClient()
+    consecutive_failures = 0
 
-    try:
-        # Submit batch trace job
-        resp = requests.post(
-            TRACERFY_TRACE_URL,
-            headers={"Authorization": f"Bearer {cfg.TRACERFY_API_KEY}"},
-            data={
-                "first_name_column": "first_name",
-                "last_name_column": "last_name",
-                "address_column": "address",
-                "city_column": "city",
-                "state_column": "state",
-                "zip_column": "zip",
-                "mail_address_column": "mail_address",
-                "mail_city_column": "mail_city",
-                "mail_state_column": "mail_state",
-                "mailing_zip_column": "zip",
-            },
-            files={"csv_file": ("skip_trace_batch.csv", csv_content, "text/csv")},
-            timeout=30,
-        )
-        if resp.status_code == 402:
-            # Credits exhausted — surface explicitly so the pipeline summary
-            # shows this as an account issue rather than a silent 0-match.
-            stats["credits_exhausted"] = True
-            logger.error(
-                "Tracerfy batch 402 — INSUFFICIENT CREDITS. Response: %s",
-                resp.text[:500],
+    for notice, first, last, address, city, zip_code, heir_key in lookup_map:
+        if round(stats["cost"] + COST_PER_HIT, 2) > cap:
+            stats["cost_capped"] = True
+            logger.warning(
+                "DirectSkip: cost cap $%.2f reached after %d hit(s) — stopping. "
+                "Raise MAX_DIRECTSKIP_COST_USD (or max_cost) to trace more.",
+                cap, stats["matched"],
             )
-            return stats
-        if resp.status_code != 200:
-            logger.warning("Tracerfy batch %d response: %s",
-                           resp.status_code, resp.text[:500])
-        resp.raise_for_status()
-        queue_data = resp.json()
-        queue_id = queue_data.get("queue_id")
-        if not queue_id:
-            logger.warning("Tracerfy batch returned no queue_id")
-            return stats
+            break
 
-        est_wait = queue_data.get("estimated_wait_seconds", "unknown")
-        logger.info("  Tracerfy batch job %s submitted (est. %ss)", queue_id, est_wait)
-
-        # Poll for results (up to 5 minutes)
-        last_count = -1
-        stable_polls = 0
-        for attempt in range(60):
-            time.sleep(5)
-            result_resp = requests.get(
-                f"{TRACERFY_QUEUE_URL}{queue_id}",
-                headers={"Authorization": f"Bearer {cfg.TRACERFY_API_KEY}"},
-                timeout=15,
+        stats["submitted"] += 1
+        try:
+            data = client.search_contact(
+                first=first, last=last,
+                mailing_address=address, mailing_city=city,
+                mailing_state=notice.state or "TX", mailing_zip=zip_code,
+                property_address=notice.address or "",
+                property_city=notice.city or "",
+                property_state=notice.state or "TX",
+                property_zip=notice.zip or "",
             )
-            result_resp.raise_for_status()
-            result_data = result_resp.json()
+        except DirectSkipError as e:
+            consecutive_failures += 1
+            msg = str(e)
+            if ("No DirectSkip API key" in msg or "status.error" in msg
+                    or consecutive_failures >= MAX_CONSECUTIVE_FAILURES):
+                stats["auth_failed"] = True
+                logger.error(
+                    "DirectSkip batch ABORTED after %d failure(s): %s "
+                    "(is this machine's IP allowlisted with support@directskip.com? "
+                    "The API does not work from Apify — no static egress IP.)",
+                    consecutive_failures, msg,
+                )
+                break
+            logger.warning("DirectSkip lookup failed for %s %s: %s — continuing",
+                           first, last, msg)
+            continue
+        consecutive_failures = 0
 
-            # Handle both response formats
-            if isinstance(result_data, list):
-                # A LIST response is a PARTIAL result set while the batch is
-                # still running — it grows as records finish. Accepting the
-                # first one seen discarded most of a fully-billed batch: a live
-                # 23-contact run took the 5-second poll, matched 2, and returned
-                # "2/23 matched" while the completed job actually held 16
-                # records with phones. Wait for the count to reach the submitted
-                # total, or to stop growing across two consecutive polls.
-                records = result_data
-                if len(records) < stats["submitted"] and len(records) != last_count:
-                    last_count = len(records)
-                    stable_polls = 0
-                    if attempt % 6 == 5:
-                        logger.info("  Tracerfy batch filling in: %d/%d records (%ds)...",
-                                    len(records), stats["submitted"], (attempt + 1) * 5)
-                    continue
-                if len(records) < stats["submitted"]:
-                    stable_polls += 1
-                    if stable_polls < STABLE_POLLS_REQUIRED:
-                        continue
-                    logger.info("  Tracerfy batch settled at %d/%d records "
-                                "(unchanged for %ds) — accepting as final",
-                                len(records), stats["submitted"],
-                                STABLE_POLLS_REQUIRED * 5)
-            elif isinstance(result_data, dict):
-                status = result_data.get("status", "")
-                if status == "failed":
-                    logger.warning("Tracerfy batch job %s failed", queue_id)
-                    return stats
-                if status != "completed":
-                    if attempt % 6 == 5:
-                        logger.info("  Tracerfy batch still processing (%ds)...",
-                                    (attempt + 1) * 5)
-                    continue
-                records = result_data.get("records", [])
-            else:
-                continue
+        record = parse_api_response(data)
+        if record.no_match:
+            continue  # free — no charge on a miss
+        stats["cost"] = round(stats["cost"] + COST_PER_HIT, 2)
 
-            # Match results back to notices
-            _match_results(records, lookup_map, stats)
-            stats["cost"] = stats["submitted"] * 0.02
-            logger.info("  Tracerfy batch complete: %d/%d matched, %d phones, %d emails, $%.2f",
-                        stats["matched"], stats["submitted"],
-                        stats["phones_found"], stats["emails_found"], stats["cost"])
-            return stats
+        if record.address_only_match:
+            # AB1/AB2 — the matched person is NOT who we asked for. Their
+            # phones must never land on this contact. Billed, but unusable.
+            logger.info("    %s %s: address-only match (%s) — discarded",
+                        first, last, record.result_code)
+            continue
 
-        logger.warning("Tracerfy batch job %s timed out after 5 min", queue_id)
-        stats["cost"] = stats["submitted"] * 0.02  # Still charged
-        return stats
+        phones = [p["number"] for p in record.subject_phones if p.get("type") == "mobile"]
+        phones += [p["number"] for p in record.subject_phones if p.get("type") != "mobile"]
+        emails = list(record.subject_emails)
+        if not phones and not emails:
+            continue
 
-    except Exception as e:
-        logger.warning("Tracerfy batch skip trace failed: %s", e)
-        return stats
+        # Is this the primary DM (#1) / living owner?
+        is_primary = (
+            notice.decision_maker_name
+            and heir_key.lower() == notice.decision_maker_name.strip().lower()
+        ) or notice.owner_deceased != "yes"
+
+        if is_primary and not notice.primary_phone:
+            _fill_flat_slots(notice, record.subject_phones, emails)
+            if record.deceased_flag and hasattr(notice, "smartskip_deceased_flag"):
+                # Observation only — never sets owner_deceased (research decides).
+                notice.smartskip_deceased_flag = "yes"
+        elif not is_primary:
+            _store_heir_phones(notice, heir_key, phones, emails)
+
+        stats["matched"] += 1
+        stats["phones_found"] += len(phones)
+        stats["emails_found"] += len(emails)
+        logger.info("    %s %s: %d phones, %d emails%s",
+                    first, last, len(phones), len(emails),
+                    " (signing heir)" if not is_primary else "")
+        if BATCH_CALL_DELAY:
+            time.sleep(BATCH_CALL_DELAY)
+
+    logger.info("  DirectSkip batch complete: %d/%d matched, %d phones, %d emails, $%.2f",
+                stats["matched"], stats["submitted"],
+                stats["phones_found"], stats["emails_found"], stats["cost"])
+    return stats
+
+
+def _fill_flat_slots(notice: NoticeData, typed_phones: list[dict],
+                     emails: list[str]) -> None:
+    """Write the subject's phones/emails onto the flat NoticeData slots.
+
+    Mobiles land in mobile_1..5, landlines/other in landline_1..3, and the
+    best number (mobile-first) becomes primary_phone.
+    """
+    mobiles = [p["number"] for p in typed_phones if p.get("type") == "mobile"]
+    others = [p["number"] for p in typed_phones if p.get("type") != "mobile"]
+    ordered = mobiles or others
+    if ordered and not notice.primary_phone:
+        notice.primary_phone = ordered[0]
+    for field, number in zip(_MOBILE_FIELDS, mobiles):
+        if not getattr(notice, field, ""):
+            setattr(notice, field, number)
+    for field, number in zip(_LANDLINE_FIELDS, others):
+        if not getattr(notice, field, ""):
+            setattr(notice, field, number)
+    for field, email in zip(EMAIL_FIELDS, emails):
+        if not getattr(notice, field, ""):
+            setattr(notice, field, email)
 
 
 def _heir_has_phones(notice: NoticeData, heir_key: str) -> bool:
@@ -458,69 +451,6 @@ def _heir_has_phones(notice: NoticeData, heir_key: str) -> bool:
     except (json.JSONDecodeError, TypeError):
         pass
     return False
-
-
-def _match_results(records: list, lookup_map: list, stats: dict) -> None:
-    """Match Tracerfy batch response records back to NoticeData objects.
-
-    DM #1's phones/emails go to flat NoticeData fields (backward compat).
-    Other signing heirs' phones/emails go into their heir_map_json entry.
-    """
-    for rec in records:
-        if not isinstance(rec, dict):
-            continue
-
-        rec_first = (rec.get("first_name") or "").strip().lower()
-        rec_last = (rec.get("last_name") or "").strip().lower()
-        if not rec_first or not rec_last:
-            continue
-
-        # Find matching entry in lookup_map
-        for notice, first, last, address, city, zip_code, heir_key in lookup_map:
-            if first.lower() != rec_first or last.lower() != rec_last:
-                continue
-
-            # Extract phones and emails from response
-            phones = []
-            for field in PHONE_FIELDS:
-                value = (rec.get(field) or "").strip()
-                if value:
-                    phones.append(value)
-
-            emails = []
-            for field in EMAIL_FIELDS:
-                value = (rec.get(field) or "").strip()
-                if value:
-                    emails.append(value)
-
-            if not phones and not emails:
-                break
-
-            # Is this the primary DM (#1)?
-            is_primary = (
-                notice.decision_maker_name
-                and heir_key.lower() == notice.decision_maker_name.strip().lower()
-            ) or notice.owner_deceased != "yes"
-
-            if is_primary and not notice.primary_phone:
-                # Populate flat NoticeData phone/email fields (backward compat)
-                for i, field in enumerate(PHONE_FIELDS):
-                    if i < len(phones):
-                        setattr(notice, field, phones[i])
-                for i, field in enumerate(EMAIL_FIELDS):
-                    if i < len(emails):
-                        setattr(notice, field, emails[i])
-            elif not is_primary:
-                # Store on the heir's entry in heir_map_json
-                _store_heir_phones(notice, heir_key, phones, emails)
-
-            stats["matched"] += 1
-            stats["phones_found"] += len(phones)
-            stats["emails_found"] += len(emails)
-            logger.info("    %s %s: %d phones, %d emails%s",
-                        first, last, len(phones), len(emails),
-                        " (signing heir)" if not is_primary else "")
-            break
 
 
 def _store_heir_phones(

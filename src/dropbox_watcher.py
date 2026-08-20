@@ -316,18 +316,18 @@ def run_watcher(
                         write_csv(notices, filename=filename)
                         logger.info("Output: %s (%d records)", filename, len(notices))
 
-                        # Tracerfy skip trace
-                        if config.TRACERFY_API_KEY:
+                        # DirectSkip skip trace
+                        if config.DIRECTSKIP_API_KEY:
                             try:
-                                from tracerfy_skip_tracer import batch_skip_trace
+                                from directskip_batch import batch_skip_trace
                                 stats = batch_skip_trace(notices)
                                 logger.info(
-                                    "Tracerfy: %d/%d matched, %d phones",
+                                    "DirectSkip: %d/%d matched, %d phones",
                                     stats["matched"], stats["submitted"],
                                     stats["phones_found"],
                                 )
                             except Exception as e:
-                                logger.warning("Tracerfy failed: %s — continuing", e)
+                                logger.warning("DirectSkip failed: %s — continuing", e)
 
                         # DataSift upload
                         upload_result = None

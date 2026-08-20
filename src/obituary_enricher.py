@@ -1618,210 +1618,148 @@ def _lookup_dm_address_serper_firecrawl(
     return None
 
 
-def _lookup_dm_address_tracerfy(name: str, city: str,
-                                 address: str = "", zip_code: str = "") -> dict | None:
-    """Look up DM mailing address via Tracerfy Instant Trace API.
+def _directskip_confirmed_address(data: dict) -> dict | None:
+    """Pull the confirmed mailing address out of a raw DirectSkip response.
 
-    Uses POST /v1/api/trace/lookup/ (synchronous, single-record).
-    Cost: 5 credits ($0.10) per hit, 0 on miss. Rate limit: 500 RPM.
+    Returns {street, city, state, zip} or None. AB1/AB2 result codes are an
+    ADDRESS-ONLY match that returns a DIFFERENT person than the input — that
+    person's mailing address is NOT the DM's, so those are rejected.
+    """
+    from directskip import _result_code_str
+
+    if _result_code_str(data.get("result_code")) in ("AB1", "AB2"):
+        return None
+    contacts = data.get("contacts") or []
+    if not contacts:
+        return None
+    conf = (contacts[0] or {}).get("confirmed_address") or []
+    c = conf[0] if isinstance(conf, list) and conf else conf
+    if not isinstance(c, dict):
+        return None
+    street = (c.get("address") or "").strip()
+    if not street:
+        return None
+    return {
+        "street": street,
+        "city": (c.get("city") or "").strip(),
+        "state": (c.get("state") or "TX").strip(),
+        "zip": (c.get("zip") or "").strip(),
+    }
+
+
+def _lookup_dm_address_directskip(name: str, city: str,
+                                  address: str = "", zip_code: str = "") -> dict | None:
+    """Look up DM mailing address via a DirectSkip single lookup.
+
+    Synchronous, single-record. $0.10 per HIT (any match bills, even one
+    without a usable address); a no-match is free. The API is IP-allowlisted —
+    it only works from the registered operator box, never from Apify.
     """
     import config as cfg
 
-    if not cfg.TRACERFY_API_KEY:
+    if not cfg.DIRECTSKIP_API_KEY:
         return None
 
     # Split name into first/last
     parts = name.strip().split()
     if len(parts) < 2:
         return None
-    first_name = parts[0]
-    last_name = parts[-1]
 
     try:
-        resp = requests.post(
-            "https://tracerfy.com/v1/api/trace/lookup/",
-            headers={
-                "Authorization": f"Bearer {cfg.TRACERFY_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "address": address or "",
-                "city": city or "",
-                "state": "TX",
-                "zip": zip_code or "",
-                "find_owner": False,
-                "first_name": first_name,
-                "last_name": last_name,
-            },
-            timeout=30,
+        from directskip import DirectSkipClient
+        data = DirectSkipClient().search_contact(
+            first=parts[0], last=parts[-1],
+            mailing_address="", mailing_city=city or "",
+            mailing_state="TX", mailing_zip="",
+            property_address=address or "", property_city=city or "",
+            property_state="TX", property_zip=zip_code or "",
         )
-        if resp.status_code == 402:
-            # Only surface this as WARNING once per run; subsequent calls
-            # in the same process will still hit 402 and repeat the message.
-            logger.warning(
-                "Tracerfy instant 402 for %s — INSUFFICIENT CREDITS: %s",
-                name, resp.text[:200],
-            )
-        elif resp.status_code != 200:
-            logger.debug("Tracerfy instant %d for %s: %s",
-                         resp.status_code, name, resp.text[:500])
-        resp.raise_for_status()
-        data = resp.json()
-
-        if not data.get("hit") or not data.get("persons"):
-            return None
-
-        person = data["persons"][0]
-        mail = person.get("mailing_address") or {}
-        street = (mail.get("street") or "").strip()
-        if street:
-            return {
-                "street": street,
-                "city": (mail.get("city") or "").strip(),
-                "state": (mail.get("state") or "TX").strip(),
-                "zip": (mail.get("zip") or "").strip(),
-            }
-        return None
+        return _directskip_confirmed_address(data)
     except Exception as e:
-        logger.debug("Tracerfy instant lookup failed for %s: %s", name, e)
+        logger.debug("DirectSkip address lookup failed for %s: %s", name, e)
         return None
 
 
-def _batch_tracerfy_lookup(notices: list) -> None:
-    """Batch skip-trace all notices that still need a DM mailing address.
+def _batch_directskip_lookup(notices: list) -> None:
+    """Skip-trace all notices that still need a DM mailing address (Phase C).
 
-    Submits a single CSV with all DM names to Tracerfy, polls for results,
-    and updates NoticeData fields in-place. Much faster than per-record calls.
+    DirectSkip is single-record/synchronous, so this is a per-DM loop rather
+    than a queued CSV batch. Any MATCH bills $DIRECTSKIP_COST_PER_HIT (even one
+    without a usable address; a no-match is free), so spend is metered against
+    MAX_DIRECTSKIP_COST_USD and the loop stops before it can pass the cap.
+    Updates NoticeData fields in-place.
     """
     import config as cfg
-    import csv as csv_mod
-    import io
 
-    if not cfg.TRACERFY_API_KEY or not notices:
+    if not cfg.DIRECTSKIP_API_KEY or not notices:
         return
 
-    # Build batch CSV — Tracerfy requires address data for skip tracing
-    csv_buffer = io.StringIO()
-    writer = csv_mod.writer(csv_buffer)
-    writer.writerow(["first_name", "last_name", "address", "city", "state",
-                      "zip", "mail_address", "mail_city", "mail_state"])
+    from directskip import DirectSkipClient, DirectSkipError
 
-    lookup_map: list[tuple] = []  # [(notice, first_name, last_name), ...]
+    cost_per_hit = float(getattr(cfg, "DIRECTSKIP_COST_PER_HIT", 0.10))
+    cap = float(getattr(cfg, "MAX_DIRECTSKIP_COST_USD", 5.0))
+    client = DirectSkipClient()
+    spent, submitted, matched, failures = 0.0, 0, 0, 0
+
     for n in notices:
         parts = n.decision_maker_name.strip().split()
         if len(parts) < 2:
             continue
-        first_name = parts[0]
-        last_name = parts[-1]
-        # Use property address as the known address for skip tracing
-        addr = n.address.strip()
-        city_hint = n.city.strip() or "Austin"
-        zip_code = n.zip.strip()
-        writer.writerow([first_name, last_name, addr, city_hint, "TX",
-                         zip_code, "", "", ""])
-        lookup_map.append((n, first_name, last_name))
-
-    if not lookup_map:
-        return
-
-    csv_content = csv_buffer.getvalue()
-    csv_buffer.close()
-
-    try:
-        resp = requests.post(
-            "https://tracerfy.com/v1/api/trace/",
-            headers={"Authorization": f"Bearer {cfg.TRACERFY_API_KEY}"},
-            data={
-                "first_name_column": "first_name",
-                "last_name_column": "last_name",
-                "address_column": "address",
-                "city_column": "city",
-                "state_column": "state",
-                "zip_column": "zip",
-                "mail_address_column": "mail_address",
-                "mail_city_column": "mail_city",
-                "mail_state_column": "mail_state",
-            },
-            files={"csv_file": ("dm_batch.csv", csv_content, "text/csv")},
-            timeout=30,
-        )
-        if resp.status_code != 200:
-            logger.debug("Tracerfy batch %d response: %s",
-                         resp.status_code, resp.text[:500])
-        resp.raise_for_status()
-        queue_data = resp.json()
-        queue_id = queue_data.get("queue_id")
-        if not queue_id:
-            logger.warning("Tracerfy batch returned no queue_id")
-            return
-
-        logger.info("  Tracerfy batch job %s submitted (%d records)", queue_id, len(lookup_map))
-
-        # Poll for results — batch jobs take longer
-        # GET /queue/:id may return a list (records) or dict (status wrapper)
-        for _attempt in range(30):
-            time.sleep(5)
-            result_resp = requests.get(
-                f"https://tracerfy.com/v1/api/queue/{queue_id}",
-                headers={"Authorization": f"Bearer {cfg.TRACERFY_API_KEY}"},
-                timeout=15,
+        if round(spent + cost_per_hit, 2) > cap:
+            logger.warning(
+                "  DirectSkip Phase C: cost cap $%.2f reached after %d hit(s) — "
+                "stopping (raise MAX_DIRECTSKIP_COST_USD to look up more DMs).",
+                cap, matched,
             )
-            result_resp.raise_for_status()
-            result_data = result_resp.json()
+            break
 
-            # Handle both response formats
-            if isinstance(result_data, list):
-                records = result_data
-            elif isinstance(result_data, dict):
-                status = result_data.get("status", "")
-                if status == "failed":
-                    logger.warning("Tracerfy batch job %s failed", queue_id)
-                    return
-                if status != "completed":
-                    continue  # still pending
-                records = result_data.get("records", [])
-            else:
-                continue
+        submitted += 1
+        try:
+            data = client.search_contact(
+                first=parts[0], last=parts[-1],
+                mailing_address="", mailing_city=n.city.strip() or "Austin",
+                mailing_state="TX", mailing_zip="",
+                property_address=n.address.strip(), property_city=n.city.strip() or "Austin",
+                property_state="TX", property_zip=n.zip.strip(),
+            )
+        except DirectSkipError as e:
+            failures += 1
+            if failures >= 3 or "status.error" in str(e):
+                logger.error("  DirectSkip Phase C aborted: %s (IP not allowlisted? "
+                             "The API never works from Apify)", e)
+                return
+            logger.debug("DirectSkip Phase C lookup failed for %s: %s",
+                         n.decision_maker_name, e)
+            continue
+        failures = 0
 
-            matched = 0
-            for rec in records:
-                if not isinstance(rec, dict):
-                    continue
-                street = (rec.get("mail_address") or "").strip()
-                if not street:
-                    continue
-                # Match back to notice by first+last name
-                rec_first = (rec.get("first_name") or "").strip().lower()
-                rec_last = (rec.get("last_name") or "").strip().lower()
-                for notice, first, last in lookup_map:
-                    if (first.lower() == rec_first
-                            and last.lower() == rec_last
-                            and not notice.decision_maker_street):
-                        notice.decision_maker_street = street
-                        notice.decision_maker_city = (rec.get("mail_city") or "").strip()
-                        notice.decision_maker_state = (rec.get("mail_state") or "TX").strip()
-                        notice.decision_maker_zip = (rec.get("mail_zip") or "").strip()
-                        matched += 1
-                        logger.info(
-                            "    Tracerfy batch: %s -> %s, %s %s",
-                            notice.decision_maker_name, street,
-                            notice.decision_maker_city, notice.decision_maker_state,
-                        )
-                        break
-            logger.info("  Tracerfy batch complete: %d/%d matched", matched, len(lookup_map))
-            return
+        # Any match bills, whether or not it carries a usable address.
+        if data.get("contacts"):
+            spent = round(spent + cost_per_hit, 2)
+        result = _directskip_confirmed_address(data)
+        if result and not n.decision_maker_street:
+            n.decision_maker_street = result["street"]
+            n.decision_maker_city = result["city"]
+            n.decision_maker_state = result.get("state") or "TX"
+            n.decision_maker_zip = result.get("zip", "")
+            matched += 1
+            logger.info(
+                "    DirectSkip Phase C: %s -> %s, %s %s",
+                n.decision_maker_name, result["street"],
+                n.decision_maker_city, n.decision_maker_state,
+            )
+        time.sleep(0.5)
 
-        logger.warning("Tracerfy batch job %s timed out after 150s", queue_id)
-    except Exception as e:
-        logger.warning("Tracerfy batch lookup failed: %s", e)
+    logger.info("  DirectSkip Phase C complete: %d/%d matched (~$%.2f)",
+                matched, submitted, spent)
 
 
 def _lookup_dm_address(
-    name: str, city: str, api_key: str, tracerfy_tier1: bool = False,
+    name: str, city: str, api_key: str, directskip_tier1: bool = False,
 ) -> dict:
     """Look up decision-maker's mailing address using tiered sources.
 
-    Tier 0 (opt-in): Tracerfy skip tracing (paid, highest hit rate)
+    Tier 0 (opt-in): DirectSkip skip tracing (paid, highest hit rate)
     Tier 1: TX CAD lookup (not yet implemented)
     Tier 2: Serper.dev + Firecrawl + LLM (cheap, national)
     Tier 2b: DuckDuckGo fallback (free, unreliable -- used when Serper not configured)
@@ -1833,17 +1771,17 @@ def _lookup_dm_address(
     if not name or not name.strip():
         return result
 
-    # Tier 0 (opt-in): Tracerfy as primary lookup
-    if tracerfy_tier1:
+    # Tier 0 (opt-in): DirectSkip as primary lookup
+    if directskip_tier1:
         import config as cfg
-        if cfg.TRACERFY_API_KEY:
-            tf_result = _lookup_dm_address_tracerfy(
+        if cfg.DIRECTSKIP_API_KEY:
+            ds_result = _lookup_dm_address_directskip(
                 name, city or "Austin", address="", zip_code=""
             )
-            if tf_result and tf_result.get("street"):
-                result.update(tf_result)
-                result["source"] = "tracerfy_tier1"
-                logger.info("    Tier 0 (Tracerfy): %s, %s",
+            if ds_result and ds_result.get("street"):
+                result.update(ds_result)
+                result["source"] = "directskip_tier1"
+                logger.info("    Tier 0 (DirectSkip): %s, %s",
                             result["street"], result["city"])
                 return result
 
@@ -2906,7 +2844,7 @@ def enrich_obituary_data(
     skip_heir_verification: bool = False,
     max_heir_depth: int = 2,
     skip_dm_address: bool = False,
-    tracerfy_tier1: bool = False,
+    directskip_tier1: bool = False,
     skip_ancestry: bool = False,
     workers: int = 4,
     deadline: float | None = None,
@@ -3267,7 +3205,7 @@ def enrich_obituary_data(
     no_dm_possible_count = 0
     estate_fallback_count = 0
     dm_addr_sources = {"tx_cad": 0, "people_search": 0,
-                       "ddg_people_search": 0, "inline_tracerfy": 0, "batch_tracerfy": 0}
+                       "ddg_people_search": 0, "inline_directskip": 0, "batch_directskip": 0}
 
     # Phase B is per-record independent — each iteration mutates only its own
     # notice, and every shared primitive it calls is thread-safe (llm_client is
@@ -3670,7 +3608,7 @@ def enrich_obituary_data(
                     j, len(matches), dm_name, dm_city_hint or "unknown",
                 )
                 addr = _lookup_dm_address(dm_name, dm_city_hint, api_key,
-                                          tracerfy_tier1=tracerfy_tier1)
+                                          directskip_tier1=directskip_tier1)
                 if addr.get("street"):
                     dm.update(addr)
                     source = addr.get("source", "unknown")
@@ -3685,20 +3623,20 @@ def enrich_obituary_data(
                     )
                     continue
 
-                # Tier 3 inline: Tracerfy when all preceding tiers missed
-                if cfg.TRACERFY_API_KEY:
-                    tracerfy_result = _lookup_dm_address_tracerfy(
+                # Tier 3 inline: DirectSkip when all preceding tiers missed
+                if cfg.DIRECTSKIP_API_KEY:
+                    ds_result = _lookup_dm_address_directskip(
                         dm_name, dm_city_hint or city,
                         address=notice.address, zip_code=notice.zip,
                     )
-                    if tracerfy_result and tracerfy_result.get("street"):
-                        dm.update(tracerfy_result)
-                        dm_addr_sources["inline_tracerfy"] = (
-                            dm_addr_sources.get("inline_tracerfy", 0) + 1
+                    if ds_result and ds_result.get("street"):
+                        dm.update(ds_result)
+                        dm_addr_sources["inline_directskip"] = (
+                            dm_addr_sources.get("inline_directskip", 0) + 1
                         )
                         logger.info(
-                            "  [%d/%d] Inline Tracerfy found address for %s: %s",
-                            j, len(matches), dm_name, tracerfy_result["street"],
+                            "  [%d/%d] Inline DirectSkip found address for %s: %s",
+                            j, len(matches), dm_name, ds_result["street"],
                         )
                         continue
 
@@ -3763,22 +3701,22 @@ def enrich_obituary_data(
             time.monotonic() - _t0, pb_skipped, len(matches),
         )
 
-    # ── Phase C: Batch Tracerfy for remaining DMs without addresses ──
+    # ── Phase C: Batch DirectSkip for remaining DMs without addresses ──
     import config as cfg
-    if not skip_dm_address and cfg.TRACERFY_API_KEY and not _deadline_reached():
+    if not skip_dm_address and cfg.DIRECTSKIP_API_KEY and not _deadline_reached():
         dm_needs_addr = [
             n for n in notices
             if n.decision_maker_name and not n.decision_maker_street
         ]
         if dm_needs_addr:
             logger.info(
-                "Phase C: Batch Tracerfy skip trace for %d DMs without addresses...",
+                "Phase C: DirectSkip skip trace for %d DMs without addresses...",
                 len(dm_needs_addr),
             )
             before_count = sum(1 for n in dm_needs_addr if n.decision_maker_street)
-            _batch_tracerfy_lookup(dm_needs_addr)
+            _batch_directskip_lookup(dm_needs_addr)
             batch_found = sum(1 for n in dm_needs_addr if n.decision_maker_street) - before_count
-            dm_addr_sources["batch_tracerfy"] += batch_found
+            dm_addr_sources["batch_directskip"] += batch_found
 
     # ── Summary ───────────────────────────────────────────────────────
 

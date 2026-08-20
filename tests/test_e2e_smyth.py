@@ -10,7 +10,7 @@ logger = logging.getLogger("e2e_smyth")
 
 from notice_parser import NoticeData
 from obituary_enricher import enrich_obituary_data
-from tracerfy_skip_tracer import batch_skip_trace
+from directskip_batch import batch_skip_trace
 from phone_validator import clean_phone, process_phones, DEFAULT_TIERS, assign_tier
 from report_generator import generate_record_pdf
 import config as cfg
@@ -245,116 +245,24 @@ Return ONLY valid JSON."""}],
             print("  Could not parse family data from search results")
 print()
 
-# ── Step 2: Tracerfy Instant Trace (single lookup, $0.10) ───────────────
+# ── Step 2: DirectSkip trace (single lookups, $0.10/hit, no-match free) ──
 print("=" * 70)
-print("STEP 2: Tracerfy Instant Trace (real API — $0.10/hit)")
+print("STEP 2: DirectSkip Skip Trace (real API — $0.10/hit)")
 print("=" * 70)
-tracerfy_stats = {"submitted": 1, "matched": 0, "phones_found": 0, "emails_found": 0, "cost": 0}
+directskip_stats = {"submitted": 1, "matched": 0, "phones_found": 0, "emails_found": 0, "cost": 0}
 
-if not cfg.TRACERFY_API_KEY:
-    print("  SKIP — TRACERFY_API_KEY not set")
+if not cfg.DIRECTSKIP_API_KEY:
+    print("  SKIP — DIRECTSKIP_API_KEY not set")
 else:
-    import requests as http_req
-    PHONE_FIELDS_T = [
-        "primary_phone", "mobile_1", "mobile_2", "mobile_3", "mobile_4",
-        "mobile_5", "landline_1", "landline_2", "landline_3",
-    ]
-    EMAIL_FIELDS_T = ["email_1", "email_2", "email_3", "email_4", "email_5"]
-
-    # Also trace signing chain heirs if deceased
-    trace_targets = [("Scott", "Smyth", notice.address, notice.city, notice.state, notice.zip, notice.owner_name)]
-
-    if notice.owner_deceased == "yes" and notice.heir_map_json:
-        heirs = json.loads(notice.heir_map_json)
-        for h in heirs:
-            if h.get("signing_authority") and h.get("status") != "deceased":
-                parts = h["name"].strip().split()
-                if len(parts) >= 2:
-                    trace_targets.append((
-                        parts[0], parts[-1],
-                        h.get("street", notice.address),
-                        h.get("city", notice.city),
-                        h.get("state", notice.state),
-                        h.get("zip", notice.zip),
-                        h["name"],
-                    ))
-
-    tracerfy_stats["submitted"] = len(trace_targets)
-    for first, last, addr, city_t, state_t, zip_t, full_name in trace_targets:
-        try:
-            resp = http_req.post(
-                "https://tracerfy.com/v1/api/trace/lookup/",
-                headers={
-                    "Authorization": f"Bearer {cfg.TRACERFY_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "first_name": first,
-                    "last_name": last,
-                    "address": addr,
-                    "city": city_t,
-                    "state": state_t,
-                    "zip": zip_t,
-                    "find_owner": False,
-                },
-                timeout=30,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-
-            if data.get("hit") and data.get("persons"):
-                person = data["persons"][0]
-                tracerfy_stats["matched"] += 1
-
-                # Extract phones
-                phones = []
-                for pf in PHONE_FIELDS_T:
-                    val = (person.get(pf) or "").strip()
-                    if val:
-                        phones.append(val)
-                tracerfy_stats["phones_found"] += len(phones)
-
-                # Extract emails
-                emails = []
-                for ef in EMAIL_FIELDS_T:
-                    val = (person.get(ef) or "").strip()
-                    if val:
-                        emails.append(val)
-                tracerfy_stats["emails_found"] += len(emails)
-
-                # Is this the main subject or an heir?
-                if full_name == notice.owner_name or notice.owner_deceased != "yes":
-                    # Populate flat fields
-                    for i, pf in enumerate(PHONE_FIELDS_T):
-                        if i < len(phones):
-                            setattr(notice, pf, phones[i])
-                    for i, ef in enumerate(EMAIL_FIELDS_T):
-                        if i < len(emails):
-                            setattr(notice, ef, emails[i])
-
-                    # Also grab mailing address from Tracerfy
-                    mail = person.get("mailing_address") or {}
-                    if mail.get("street"):
-                        print(f"  Mailing address: {mail.get('street')}, {mail.get('city')}, {mail.get('state')} {mail.get('zip')}")
-                else:
-                    # Store on heir in heir_map_json
-                    if notice.heir_map_json:
-                        heirs = json.loads(notice.heir_map_json)
-                        for h in heirs:
-                            if h.get("name", "").lower() == full_name.lower():
-                                h["phones"] = phones
-                                h["emails"] = emails
-                                break
-                        notice.heir_map_json = json.dumps(heirs, ensure_ascii=False)
-
-                print(f"  HIT: {full_name} -> {len(phones)} phones, {len(emails)} emails")
-            else:
-                print(f"  MISS: {full_name} (no match)")
-        except Exception as e:
-            print(f"  ERROR tracing {full_name}: {e}")
-
-    tracerfy_stats["cost"] = tracerfy_stats["matched"] * 0.10
-    print(f"  Cost: ${tracerfy_stats['cost']:.2f} ({tracerfy_stats['matched']} hits x $0.10)")
+    # Traces the owner + all signing-authority heirs, fills flat slots for the
+    # primary and heir_map_json entries for the rest — the exact pipeline path.
+    directskip_stats = batch_skip_trace([notice], max_signing_traces=5,
+                                        lookup_heir_addresses=False)
+    print(f"  Submitted: {directskip_stats['submitted']} contacts")
+    print(f"  Matched:   {directskip_stats['matched']}")
+    print(f"  Phones:    {directskip_stats['phones_found']}")
+    print(f"  Emails:    {directskip_stats['emails_found']}")
+    print(f"  Cost: ${directskip_stats['cost']:.2f} ({directskip_stats['matched']} hits x $0.10)")
 print()
 
 # ── Step 3: Collect all phones for Trestle ──────────────────────────────
@@ -519,10 +427,10 @@ print()
 print("=" * 70)
 print("COST SUMMARY")
 print("=" * 70)
-print(f"  Tracerfy skip trace:   ${tracerfy_stats.get('cost', 0):.2f} ({tracerfy_stats.get('submitted', 0)} contacts)")
+print(f"  DirectSkip skip trace: ${directskip_stats.get('cost', 0):.2f} ({directskip_stats.get('submitted', 0)} contacts)")
 print(f"  Trestle validation:    ${trestle_cost:.2f} ({len(unique_phones)} phones)")
 print(f"  Haiku API (obituary):  ~$0.01")
-total_cost = tracerfy_stats.get('cost', 0) + trestle_cost + 0.01
+total_cost = directskip_stats.get('cost', 0) + trestle_cost + 0.01
 print(f"  TOTAL:                 ~${total_cost:.2f}")
 print()
 

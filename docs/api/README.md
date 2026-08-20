@@ -33,7 +33,7 @@ Where a file records a specific instance of one of these, it says so.
 |---|---|---|
 | [openwebninja-zillow.md](openwebninja-zillow.md) | Property search, sold comps, listing data | `comp-package`, `deal-analyzer` |
 | [trestle.md](trestle.md) | Phone intelligence and scoring | `phone-validator` |
-| [skip-trace.md](skip-trace.md) | SmartSkip, Tracerfy, Enformion | `deep-prospecting-v5` |
+| [skip-trace.md](skip-trace.md) | SmartSkip, DirectSkip, Enformion | `deep-prospecting-v5` |
 | [datasift.md](datasift.md) | DataSift / REISift, both API surfaces | `kpi-engine`, uploads, the CRM stack |
 | [smrtphone.md](smrtphone.md) | SMS send, call logs, recordings, webhooks | the coach skills, the SMS agent |
 | [county-data.md](county-data.md) | Assessor, recorder and court portals | `first-market-county-data`, `probate-property-finder` |

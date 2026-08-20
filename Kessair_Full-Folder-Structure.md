@@ -109,7 +109,7 @@ _NAMING             the naming card kept in each file-heavy folder
 📂 02_Campaigns/                         → one folder per campaign
    └── 📂 2026-07_Probate-SMS/           → 00_List · 01_Creative-&-Scripts · 02_Results · 03_Opt-Outs
        └── _NAMING → YYYY-MM_<Channel-Niche>_<List|Script|Results>
-📂 03_Skip-Trace-&-Enrichment/           → Tracerfy / Trestle outputs, phone-tier reports
+📂 03_Skip-Trace-&-Enrichment/           → DirectSkip / Trestle outputs, phone-tier reports
 📂 04_Market-Intelligence/               → Market Finder exports, ZIP scoring, market reports
 📂 05_Buyer-Lists/                       → cash-buyer research (Bell master, etc.)
 📂 06_Creative-Assets/                   → campaign creative

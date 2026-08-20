@@ -57,7 +57,7 @@ optional = [
     "SMARTY_AUTH_ID", "SMARTY_AUTH_TOKEN",
     "OPENWEBNINJA_API_KEY", "ANTHROPIC_API_KEY",
     "SERPER_API_KEY", "FIRECRAWL_API_KEY",
-    "TRACERFY_API_KEY", "TRESTLE_API_KEY",
+    "DIRECTSKIP_API_KEY", "TRESTLE_API_KEY",
     "SLACK_WEBHOOK_URL",
     "DROPBOX_APP_KEY", "DROPBOX_APP_SECRET", "DROPBOX_REFRESH_TOKEN",
     "GOOGLE_DRIVE_FOLDER_ID", "GOOGLE_SERVICE_ACCOUNT_KEY",
@@ -236,24 +236,37 @@ def test_trestle():
 check("Trestle phone intel", test_trestle)
 
 
-# ── TRACERFY ────────────────────────────────────────────────────────
-print(f"\n{BOLD}{CYAN}9. Tracerfy (skip trace){RESET}")
+# ── DIRECTSKIP ──────────────────────────────────────────────────────
+print(f"\n{BOLD}{CYAN}9. DirectSkip (skip trace){RESET}")
 
-def test_tracerfy():
+def test_directskip():
+    # A deliberate no-match search verifies key + IP allowlist and bills $0
+    # (verified live 2026-08-17: a no-match is free). status.error non-empty
+    # means a bad key or an un-allowlisted IP (Apify always fails this — the
+    # API only works from the registered operator box).
     import requests
-    key = env("TRACERFY_API_KEY")
-    r = requests.get(
-        "https://tracerfy.com/v1/api/queue/",
-        headers={"Authorization": f"Bearer {key}"},
-        timeout=15,
+    key = env("DIRECTSKIP_API_KEY")
+    r = requests.post(
+        "https://api0.directskip.com/v2/search_contact.php",
+        headers={"Accept": "application/json", "Content-Type": "application/json"},
+        json={
+            "api_key": key,
+            "first_name": "Zzyzx", "last_name": "Preflightcheck",
+            "mailing_address": "", "mailing_city": "", "mailing_state": "TX",
+            "mailing_zip": "", "property_address": "1 Nowhere Ln",
+            "property_city": "Austin", "property_state": "TX", "property_zip": "78701",
+        },
+        timeout=30,
     )
-    if r.status_code == 401:
-        raise RuntimeError(f"401 — API key invalid: {r.text[:80]}")
-    if r.status_code == 403:
-        raise RuntimeError(f"403 — key rejected: {r.text[:80]}")
-    return f"auth ok (HTTP {r.status_code})"
+    r.raise_for_status()
+    data = r.json()
+    err = ((data.get("status") or {}).get("error") or "").strip()
+    if err:
+        raise RuntimeError(f"status.error={err!r} — bad key or IP not allowlisted "
+                           "(register this machine's public IP with support@directskip.com)")
+    return "auth ok ($0 no-match round-trip)"
 
-check("Tracerfy auth", test_tracerfy)
+check("DirectSkip auth", test_directskip)
 
 
 # ── SLACK / DISCORD WEBHOOK ─────────────────────────────────────────
