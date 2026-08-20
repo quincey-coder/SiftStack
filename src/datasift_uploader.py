@@ -752,19 +752,53 @@ async def _select_all_records(page: Page) -> bool:
             logger.info("Clicked header checkbox via JS: %s", clicked_header)
             await page.wait_for_timeout(1500)
         else:
-            # Strategy 2: Click each record checkbox individually via JS
-            clicked_count = await page.evaluate("""() => {
-                const checkboxes = document.querySelectorAll('input[type="checkbox"]');
-                let clicked = 0;
-                for (const cb of checkboxes) {
+            # Strategy 2: click each row checkbox via JS, PAGE BY PAGE. The
+            # table paginates at ~10 rows and selection PERSISTS across pages
+            # (verified live 2026-08-20: "Selecting 20 properties" after
+            # selecting on page 2), so walking every page before acting is the
+            # reliable way to cover a whole filtered list — the single-page
+            # version silently enriched/skip-traced only page 1 of a
+            # 29-record upload.
+            _SELECT_ROWS_JS = """() => {
+                let n = 0;
+                for (const cb of document.querySelectorAll('input[type="checkbox"]')) {
                     if (cb.classList.contains('react-toggle-screenreader-only')) continue;
-                    cb.click();
-                    clicked++;
+                    if (!cb.checked) { cb.click(); n++; }
                 }
-                return clicked;
-            }""")
-            logger.info("Clicked %d checkboxes via JS (all non-toggle)", clicked_count)
-            await page.wait_for_timeout(1500)
+                return n;
+            }"""
+            _NEXT_PAGE_JS = r"""() => {
+                const of_el = [...document.querySelectorAll('*')].find(e =>
+                    e.children.length === 0 && /^of \d+$/.test((e.textContent||'').trim()));
+                if (!of_el) return false;
+                const r0 = of_el.getBoundingClientRect();
+                const btns = [...document.querySelectorAll('button')]
+                    .map(b => ({b, r: b.getBoundingClientRect()}))
+                    .filter(x => Math.abs(x.r.y - r0.y) < 30 && x.r.x > r0.x)
+                    .sort((a, b) => a.r.x - b.r.x);
+                if (!btns.length || btns[0].b.disabled) return false;
+                btns[0].b.click();
+                return true;
+            }"""
+            total_selected = 0
+            for _pg in range(20):  # safety cap: 20 pages (~200 records)
+                total_selected += await page.evaluate(_SELECT_ROWS_JS)
+                await page.wait_for_timeout(900)
+                advanced = await page.evaluate(_NEXT_PAGE_JS)
+                if not advanced:
+                    break
+                await page.wait_for_timeout(2200)
+            try:
+                indicator = await page.evaluate(
+                    """() => [...document.querySelectorAll('*')]
+                        .filter(e => e.children.length === 0)
+                        .map(e => (e.innerText || '').trim())
+                        .find(t => /^Selecting/.test(t)) || ''""")
+            except Exception:
+                indicator = ""
+            logger.info("Selected %d row checkboxes across pages (%s)",
+                        total_selected, indicator or "no indicator")
+            await page.wait_for_timeout(1000)
 
         await _screenshot(page, "records_selected_header")
 
