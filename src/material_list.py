@@ -20,8 +20,9 @@ Quantities default to the 158 Old State walk facts (1,946 sqft finished 3/2,
 overridable by CLI.
 
 Usage:
-  python src/material_list.py --zip 37914                    # live pull (~60 searches)
-  python src/material_list.py --zip 37914 --cached           # reuse saved pull
+  python src/material_list.py --zip 78704                    # live pull (~94 searches)
+  python src/material_list.py --zip 78704 --cached           # reuse saved pull
+  python src/material_list.py --master --zip 78704 --lock    # write the locked artifacts
 """
 from __future__ import annotations
 
@@ -43,13 +44,31 @@ from openpyxl.styles import Alignment, Border, Font, Side
 from openpyxl.utils import get_column_letter
 
 sys.path.insert(0, str(Path(__file__).parent))
-from rehab_estimator import estimate_rehab  # noqa: E402
+from rehab_estimator import DEFAULT_REGION, estimate_rehab  # noqa: E402
 
 logger = logging.getLogger("material_list")
 
 NAVY, BLUE, GREEN, GOLD, GREY = "0A1130", "316AFF", "1B9E5A", "B8860B", "6B7280"
 
 OUTPUT_DIR = Path(__file__).parent.parent / "output"
+
+# Flush the pricing cache every N successful searches. Searches are paid
+# and slow; a run killed by a timeout used to lose all of them because the
+# cache was written only after the final key. With this, --cached resumes.
+CHECKPOINT_EVERY = 5
+
+# Market label stamped into the locked artifacts. The ZIP is what
+# sku_pricing validates against; this is the human-readable name.
+MARKET_BY_ZIP_PREFIX = {
+    "787": "austin",     # Travis / Williamson metro
+    "786": "austin",
+    "765": "bell",       # Killeen / Temple / Belton
+    "379": "knox",       # legacy East Tennessee list
+}
+
+
+def market_for_zip(zip_code: str) -> str:
+    return MARKET_BY_ZIP_PREFIX.get(str(zip_code)[:3], str(zip_code))
 
 # ── Search catalog ────────────────────────────────────────────────────
 # key: (query, relevance_regex, price_lo, price_hi)
@@ -64,7 +83,8 @@ SEARCHES = {
     "roof_nails": ("roofing nails coil", r"roofing nail", 20, 90),
     "pipe_boot": ("roof pipe boot flashing", r"boot|flashing", 5, 40),
     # structure + crawl
-    "pt_2x8": ("2x8x12 pressure treated lumber", r"2 in\. x 8 in\.", 10, 50),
+    "pt_2x8": ("2 in. x 8 in. x 12 ft. pressure treated lumber",
+               r"2 in\. x 8 in\. x 12 ft\.", 10, 80),
     "mortar": ("type s mortar mix 80 lb", r"type s", 5, 25),
     "vapor_barrier": ("20 mil crawl space vapor barrier", r"vapor|barrier|mil", 100, 700),
     "sump_pump": ("1/3 hp sump pump", r"sump", 100, 400),
@@ -558,16 +578,82 @@ MASTER_ALLOWANCES = [
 
 # ── Pricing pull ──────────────────────────────────────────────────────
 
+# Both spellings are accepted: the underscore form is what the docs and
+# .env.example use, the bare form is what the operator .env actually carries.
+# NOTE: this is SerpApi (serpapi.com, engine=home_depot), NOT Serper.dev
+# (google.serper.dev) which SERPER_API_KEY holds for obituary search. They are
+# unrelated vendors and the keys are not interchangeable.
+SERPAPI_KEY_NAMES = ("SERPAPI_KEY", "SERPAPIKEY")
+
+
 def load_key() -> str:
-    k = os.getenv("SERPAPI_KEY")
-    if k:
-        return k
+    for name in SERPAPI_KEY_NAMES:
+        k = os.getenv(name)
+        if k:
+            return k.strip()
     env = Path(__file__).parent.parent / ".env"
     if env.exists():
-        for line in env.read_text(encoding="utf-8").splitlines():
-            if line.strip().startswith("SERPAPI_KEY="):
-                return line.strip().split("=", 1)[1]
-    sys.exit("SERPAPI_KEY not found in env or .env")
+        for line in env.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            for name in SERPAPI_KEY_NAMES:
+                if line.startswith(name + "="):
+                    val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    if val:
+                        return val
+    sys.exit("SerpApi key not found. Set one of %s in env or .env "
+             "(serpapi.com — NOT the Serper.dev key)." % ", ".join(SERPAPI_KEY_NAMES))
+
+
+def _write_cache(cache: Path, zip_code: str, used: int, out: dict) -> None:
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    tmp = cache.with_suffix(cache.suffix + ".tmp")
+    tmp.write_text(json.dumps(
+        {"zip": zip_code, "date": date.today().isoformat(), "searches_used": used,
+         "keys": out}, indent=1), encoding="utf-8")
+    tmp.replace(cache)  # atomic: a kill mid-write cannot corrupt the cache
+
+
+def _search(k: str, term: str, zip_code: str, key: str, sort):
+    """One SerpApi home_depot call, 3 attempts. -> (json, sort_label) or (None, _)."""
+    params = {"engine": "home_depot", "q": term, "delivery_zip": zip_code,
+              "api_key": key}
+    if sort:
+        params["hd_sort"] = sort
+    label = sort or "relevance"
+    for attempt in range(3):
+        try:
+            r = requests.get("https://serpapi.com/search.json", params=params, timeout=90)
+        except Exception as exc:
+            # SerpApi read-timeouts arrive in waves under burst load
+            # (2026-07-31: 26 of 32 in one run); back off and retry.
+            logger.warning("[%s/%s] attempt %d: %s", k, label, attempt + 1, exc)
+            time.sleep(5 * (attempt + 1))
+            continue
+        try:
+            d = r.json()
+        except Exception as exc:
+            logger.warning("[%s/%s] bad JSON: %s", k, label, exc)
+            return None, label
+        if r.status_code != 200 or d.get("error"):
+            logger.warning("[%s/%s] HTTP %s %s", k, label, r.status_code,
+                           str(d.get("error"))[:80])
+            return None, label
+        return d, label
+    return None, label
+
+
+def _in_band(d: dict, rx: str, lo: float, hi: float) -> list:
+    """Products whose title matches the relevance regex and price is in band."""
+    rows = []
+    for p in d.get("products", []):
+        price, title = p.get("price"), p.get("title") or ""
+        if price is None or not re.search(rx, title, re.I):
+            continue
+        if not (lo <= float(price) <= hi):
+            continue
+        rows.append({"title": title[:120], "price": float(price),
+                     "link": p.get("link") or "", "brand": p.get("brand")})
+    return rows
 
 
 def pull_prices(zip_code: str, cache: Path, cached: bool, needed=None) -> dict:
@@ -590,49 +676,45 @@ def pull_prices(zip_code: str, cache: Path, cached: bool, needed=None) -> dict:
     if not todo:
         return prior
     key = load_key()
-    out, used = dict(prior), prior_used
+    out, used, done = dict(prior), prior_used, 0
+    logger.info("pulling %d searches for zip %s (checkpoint every %d)",
+                len(todo), zip_code, CHECKPOINT_EVERY)
     for k, (term, rx, lo, hi) in SEARCHES.items():
         if k not in todo:
             continue
-        d = None
-        for attempt in range(3):
-            try:
-                r = requests.get("https://serpapi.com/search.json", params={
-                    "engine": "home_depot", "q": term, "delivery_zip": zip_code,
-                    "hd_sort": "top_sellers", "api_key": key}, timeout=90)
-                d = r.json()
-                break
-            except Exception as exc:
-                # SerpApi read-timeouts arrive in waves under burst load
-                # (2026-07-31: 26 of 32 in one run); back off and retry.
-                logger.warning("[%s] attempt %d: %s", k, attempt + 1, exc)
-                time.sleep(5 * (attempt + 1))
+        d, sort_used = _search(k, term, zip_code, key, "top_sellers")
         if d is None:
             continue
-        if r.status_code != 200 or d.get("error"):
-            logger.warning("[%s] HTTP %s %s", k, r.status_code, str(d.get("error"))[:80])
-            continue
         used += 1
-        rows = []
-        for p in d.get("products", []):
-            price, title = p.get("price"), p.get("title") or ""
-            if price is None or not re.search(rx, title, re.I):
-                continue
-            if not (lo <= float(price) <= hi):
-                continue
-            rows.append({"title": title[:120], "price": float(price),
-                         "link": p.get("link") or "", "brand": p.get("brand")})
+        rows = _in_band(d, rx, lo, hi)
+        if not rows:
+            # hd_sort=top_sellers sometimes returns the store's GENERIC top
+            # sellers rather than results for the query (verified 78704
+            # 2026-08-20: "outdoor wall light" -> retaining-wall block and
+            # joint compound). Retry once on pure relevance before giving up.
+            raw_ts = len(d.get("products", []))
+            d2, _ = _search(k, term, zip_code, key, None)
+            if d2 is not None:
+                used += 1
+                rows2 = _in_band(d2, rx, lo, hi)
+                if rows2:
+                    logger.info("[%s] top_sellers returned %d irrelevant; "
+                                "relevance sort recovered %d", k, raw_ts, len(rows2))
+                    d, rows, sort_used = d2, rows2, "relevance"
         if rows:
-            out[k] = {"query": term, "products": sorted(rows, key=lambda x: x["price"])}
+            out[k] = {"query": term, "sort": sort_used,
+                      "products": sorted(rows, key=lambda x: x["price"])}
             logger.info("[%s] %d in-band, $%.2f-$%.2f", k, len(rows),
                         rows[0]["price"] if rows else 0, max(x["price"] for x in rows))
         else:
             logger.warning("[%s] no in-band matches (%d raw)", k, len(d.get("products", [])))
+        done += 1
+        if done % CHECKPOINT_EVERY == 0:
+            _write_cache(cache, zip_code, used, out)
+            logger.info("checkpoint: %d/%d searched, %d keys priced, %d paid",
+                        done, len(todo), len(out), used)
         time.sleep(0.5)
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    cache.write_text(json.dumps(
-        {"zip": zip_code, "date": date.today().isoformat(), "searches_used": used,
-         "keys": out}, indent=1), encoding="utf-8")
+    _write_cache(cache, zip_code, used, out)
     logger.info("searches used: %d | keys priced: %d/%d | cached to %s",
                 used, len(out), len(SEARCHES), cache)
     return out
@@ -912,7 +994,8 @@ def export_locked_artifacts(prices: dict, meta: dict) -> tuple:
                    "amount": amt, "basis": basis}
                   for (cat, item, amt, basis) in MASTER_ALLOWANCES]
 
-    header = {"locked": True, "zip": meta["zip"], "market": "knox",
+    header = {"locked": True, "zip": meta["zip"],
+              "market": market_for_zip(meta["zip"]),
               "pulled": meta["date"], "locked_on": date.today().isoformat(),
               "source": "SerpApi home_depot delivery_zip pricing",
               "rows": rows, "allowances": allowances}
@@ -1091,7 +1174,11 @@ def build_master_workbook(prices: dict, meta: dict, out_path: str):
 def main() -> int:
     ap = argparse.ArgumentParser(description="Tiered material list priced from Home Depot")
     ap.add_argument("--address", default="158 Old State Rd")
-    ap.add_argument("--zip", dest="zip_code", required=True, help="Target ZIP. NOTE: the locked master price list is 37914 (Knoxville); ""sku_pricing refuses other ZIPs until a local list is captured.")
+    ap.add_argument("--zip", dest="zip_code", required=True,
+                    help="Target ZIP. sku_pricing consumes the locked list whose ZIP "
+                         "matches its SKU_LOCKED_ZIP (default 78704, Austin); other "
+                         "markets stay on the engine tables until their own list is "
+                         "captured with --master --lock.")
     ap.add_argument("--sqft", type=int, default=1946)
     ap.add_argument("--beds", type=int, default=3, help="FINISHED config")
     ap.add_argument("--baths", type=float, default=2.0, help="FINISHED config")
@@ -1157,9 +1244,13 @@ def main() -> int:
             jp, cp = export_locked_artifacts(prices, meta)
             print(f"LOCKED: {jp}\nLOCKED: {cp}")
         return 0
+    # use_locked_materials=False on purpose: this column is the engine-table
+    # baseline the SKU list is compared AGAINST. Letting it read the locked
+    # list would compare the pull to itself.
     engine_mats = {t: estimate_rehab(sqft=sqft, bedrooms=args.beds, bathrooms=args.baths,
                                      year_built=args.year_built, tier=t, scope="full",
-                                     region="knoxville").total_materials
+                                     region=DEFAULT_REGION,
+                                     use_locked_materials=False).total_materials
                    for t in (1, 2, 3)}
     walk_notes = {
         "158": [

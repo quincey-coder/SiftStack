@@ -1,12 +1,19 @@
 """Locked master-material-list pricing for the rehab engine.
 
-Reads data/master_materials_locked_37914.json (written ONLY by
-`python src/material_list.py --master --zip 37914 --lock`) and prices the
-MATERIAL side of each rehab-engine category from real, Knox-local Home Depot
+Reads data/master_materials_locked_78704.json (written ONLY by
+`python src/material_list.py --master --zip 78704 --lock`) and prices the
+MATERIAL side of each rehab-engine category from real, Austin-local Home Depot
 SKUs. Labor never comes from here; the engine keeps its labor tables and the
 regional multiplier applies to labor only. Locked prices are already local to
-zip 37914, so they must NEVER be multiplied by the 0.88/0.86 regional factor
-(that would double-discount materials ~12%).
+zip 78704, so they must NEVER be multiplied by the 0.95/0.93 regional factor
+(that would double-discount materials ~5%).
+
+Market coverage: austin/travis/williamson share the 78704 list — Round Rock,
+Cedar Park and Georgetown stores price off the same Austin metro. BELL IS
+EXCLUDED: Killeen/Temple is a separate metro 60 miles north with its own
+store pricing, so it stays on the engine tables until
+`--master --zip 76541 --lock` captures a Bell list. Point SKU_LOCKED_ZIP at
+that file once it exists.
 
 Grade map: engine tier 1/2/3 -> Budget/Standard/Upgrade. Tier 4
 (Premium/Custom) is off-list by definition and stays on the legacy tables.
@@ -18,13 +25,15 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-DATA_PATH = Path(__file__).parent.parent / "data" / "master_materials_locked_37914.json"
-LOCKED_ZIP = "37914"
-SKU_REGIONS = ("knoxville", "blount")
+LOCKED_ZIP = os.getenv("SKU_LOCKED_ZIP", "78704")
+DATA_PATH = (Path(__file__).parent.parent / "data"
+             / f"master_materials_locked_{LOCKED_ZIP}.json")
+SKU_REGIONS = ("austin", "travis", "williamson")
 GRADE_BY_TIER = {1: "budget", 2: "standard", 3: "upgrade"}
 
 _cache: dict = {"loaded": False, "data": None}

@@ -40,7 +40,7 @@ from openpyxl.utils import get_column_letter
 
 import config
 from comp_analyzer import fetch_subject_property
-from rehab_estimator import estimate_rehab
+from rehab_estimator import DEFAULT_REGION, estimate_rehab
 from zillow_market_api import MarketListing, ZillowMarketAPI, filter_bbox, filter_streets
 
 logger = logging.getLogger(__name__)
@@ -122,9 +122,9 @@ def rehab_scenarios(sqft: int, beds: int, baths: float, year_built: int) -> dict
         return round(subtotal * (1 + SOFT_COST_PCT))
 
     cosmetic = estimate_rehab("", sqft, beds, baths, year_built,
-                              tier=2, scope="wholetail", region="knoxville")
+                              tier=2, scope="wholetail", region=DEFAULT_REGION)
     full = estimate_rehab("", sqft, max(beds, 3), max(baths, 2.0), year_built,
-                          tier=2, scope="full", region="knoxville")
+                          tier=2, scope="full", region=DEFAULT_REGION)
     gut_extra = GUT_ALLOWANCE_PER_SQFT * sqft
     return {
         "cosmetic": total(cosmetic),
@@ -248,7 +248,8 @@ def build_workbook(subject: dict, sold: list[MarketListing], active: list[Market
 
     ws = wb.create_sheet("Rehab Scenarios")
     _title(ws, f"Rehab scenarios - {subject['sqft']:,} sqft, built {subject['year_built']}",
-           "SiftStack rehab engine, Knoxville multiplier, tier 2, incl. 13% soft costs. "
+           f"SiftStack rehab engine, {DEFAULT_REGION.title()} multiplier, tier 2, "
+           "incl. 13% soft costs. "
            f"Full gut adds ${GUT_ALLOWANCE_PER_SQFT:.0f}/sf demo-drywall allowance.")
     for i, (label, cost) in enumerate([("Cosmetic (wholetail, keeps bed count)", rehab["cosmetic"]),
                                        ("Mid reno (kitchen/baths/systems, no envelope)", rehab["mid"]),
