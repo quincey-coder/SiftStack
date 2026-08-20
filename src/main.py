@@ -411,6 +411,14 @@ async def actor_main() -> None:
         # Alert-system drill: makes one named scraper raise intentionally so
         # the 🚨 health alert path can be verified end-to-end on the platform.
         health.max_notices = int(actor_input.get("max_notices", 0) or 0) or None
+        # Backfill lever: widen the tccsearch lookback window for one run
+        # (e.g. 45 to recover the Travis lis pendens/probate records the
+        # Temp-index bug hid for 30+ days). Cross-run dedup absorbs overlap.
+        _lag = int(actor_input.get("tcc_lookback_days", 0) or 0)
+        if _lag:
+            os.environ["TCC_INDEX_LAG_DAYS"] = str(_lag)
+            Actor.log.warning("TCC lookback widened to %d days for this run", _lag)
+
         _force_fail = (actor_input.get("force_scraper_fail") or "").strip()
         if _force_fail:
             os.environ["FORCE_SCRAPER_FAIL"] = _force_fail

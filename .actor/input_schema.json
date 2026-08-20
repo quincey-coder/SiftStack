@@ -2,13 +2,18 @@
     "title": "SiftStack Input",
     "type": "object",
     "schemaVersion": 1,
-    "required": ["mode"],
+    "required": [
+        "mode"
+    ],
     "properties": {
         "mode": {
             "title": "Scrape Mode",
             "type": "string",
             "description": "daily = new notices since last run (uses stored last_run_date); historical = full 12-month backfill",
-            "enum": ["daily", "historical"],
+            "enum": [
+                "daily",
+                "historical"
+            ],
             "default": "daily",
             "editor": "select",
             "sectionCaption": "Scrape scope"
@@ -17,15 +22,19 @@
             "title": "Counties",
             "type": "array",
             "description": "Counties to scrape. Leave empty for all (Travis, Bell, Williamson).",
-            "items": { "type": "string" },
+            "items": {
+                "type": "string"
+            },
             "default": [],
             "editor": "stringList"
         },
         "types": {
             "title": "Notice Types",
             "type": "array",
-            "description": "Notice types. Leave empty for the default set (foreclosure, probate, tax_sale, tax_delinquent, lien, lis_pendens, fire_damage). code_violation is excluded from the default and is Travis-only (Austin Code Socrata API) — request it explicitly. fire_damage is also Travis-only (CTECC Real-Time Fire Socrata feed) but IS in the default set.",
-            "items": { "type": "string" },
+            "description": "Notice types. Leave empty for the default set (foreclosure, probate, tax_sale, tax_delinquent, lien, lis_pendens, fire_damage). code_violation is excluded from the default and is Travis-only (Austin Code Socrata API) \u2014 request it explicitly. fire_damage is also Travis-only (CTECC Real-Time Fire Socrata feed) but IS in the default set.",
+            "items": {
+                "type": "string"
+            },
             "default": [],
             "editor": "stringList"
         },
@@ -55,11 +64,10 @@
         "force_scraper_fail": {
             "title": "Force Scraper Fail (alert drill)",
             "type": "string",
-            "description": "Alert-system drill: 'county/type' (e.g. 'bell/lien') makes that one scraper raise intentionally so you can verify the 🚨 health alert fires. Leave empty in production.",
+            "description": "Alert-system drill: 'county/type' (e.g. 'bell/lien') makes that one scraper raise intentionally so you can verify the \ud83d\udea8 health alert fires. Leave empty in production.",
             "editor": "textfield",
             "default": ""
         },
-
         "enable_obituary": {
             "title": "Enable Obituary / Deceased-Owner Detection",
             "type": "boolean",
@@ -106,7 +114,7 @@
         "skip_zillow": {
             "title": "Skip Zillow Enrichment",
             "type": "boolean",
-            "description": "Skip Zillow property enrichment (Zestimate, beds/baths, MLS status). Biggest compute consumer at ~6s/record — disable for cheaper runs.",
+            "description": "Skip Zillow property enrichment (Zestimate, beds/baths, MLS status). Biggest compute consumer at ~6s/record \u2014 disable for cheaper runs.",
             "default": false,
             "editor": "checkbox"
         },
@@ -141,14 +149,14 @@
         "keep_listed": {
             "title": "Keep Listed Properties",
             "type": "boolean",
-            "description": "Keep Active/Pending/Sold/For-Rent records. Default OFF — Zillow-listed properties get filtered out post-enrichment.",
+            "description": "Keep Active/Pending/Sold/For-Rent records. Default OFF \u2014 Zillow-listed properties get filtered out post-enrichment.",
             "default": false,
             "editor": "checkbox"
         },
         "keep_government_records": {
             "title": "Keep Government-Owned Records",
             "type": "boolean",
-            "description": "Keep records owned by City Of, Travis County, State Of, etc. in the DataSift CSV. Default OFF — government records get dropped.",
+            "description": "Keep records owned by City Of, Travis County, State Of, etc. in the DataSift CSV. Default OFF \u2014 government records get dropped.",
             "default": false,
             "editor": "checkbox"
         },
@@ -187,17 +195,16 @@
         "obituary_deadline_secs": {
             "title": "Obituary Time Budget (secs from start)",
             "type": "integer",
-            "description": "Wall-clock ceiling for the obituary step, measured from actor start. Past this, obituary enrichment stops and remaining records flow through unenriched (they still upload) — prevents the sequential Phase B from blowing the actor timeout. Set below your run timeout minus ~15min for upload/reports. 0 = unbounded.",
+            "description": "Wall-clock ceiling for the obituary step, measured from actor start. Past this, obituary enrichment stops and remaining records flow through unenriched (they still upload) \u2014 prevents the sequential Phase B from blowing the actor timeout. Set below your run timeout minus ~15min for upload/reports. 0 = unbounded.",
             "default": 2700,
             "minimum": 0,
             "maximum": 7200,
             "editor": "number"
         },
-
         "exclude_vacant": {
             "title": "Exclude Vacant Land",
             "type": "boolean",
-            "description": "Remove vacant land parcels. Default OFF — kept.",
+            "description": "Remove vacant land parcels. Default OFF \u2014 kept.",
             "default": false,
             "editor": "checkbox",
             "sectionCaption": "Buy-box filters"
@@ -205,18 +212,17 @@
         "exclude_commercial": {
             "title": "Exclude Commercial Properties",
             "type": "boolean",
-            "description": "Remove commercial properties. Default OFF — kept.",
+            "description": "Remove commercial properties. Default OFF \u2014 kept.",
             "default": false,
             "editor": "checkbox"
         },
         "exclude_entities": {
             "title": "Exclude Entity-Owned Properties",
             "type": "boolean",
-            "description": "Remove LLC/Corp/Trust owners (unless research_entities found a person). Default OFF — kept.",
+            "description": "Remove LLC/Corp/Trust owners (unless research_entities found a person). Default OFF \u2014 kept.",
             "default": false,
             "editor": "checkbox"
         },
-
         "min_delinquent_years": {
             "title": "Min Years Delinquent (Travis Tax)",
             "type": "integer",
@@ -242,7 +248,6 @@
             "default": false,
             "editor": "checkbox"
         },
-
         "use_residential_proxy": {
             "title": "Use Residential Proxy",
             "type": "boolean",
@@ -265,7 +270,6 @@
             "editor": "textfield",
             "default": ""
         },
-
         "upload_datasift_api": {
             "title": "Auto-upload to DataSift (RAWPIPE)",
             "type": "boolean",
@@ -289,29 +293,29 @@
             "editor": "checkbox"
         },
         "google_drive_folder_id": {
-            "title": "Google Drive Folder ID (raw records → 00_Inbox/daily)",
+            "title": "Google Drive Folder ID (raw records \u2192 00_Inbox/daily)",
             "type": "string",
-            "description": "Drive folder ID for the raw scraped record CSVs — point this at 00_Inbox/daily (these are records, not leads). Leave empty to skip Drive upload.",
+            "description": "Drive folder ID for the raw scraped record CSVs \u2014 point this at 00_Inbox/daily (these are records, not leads). Leave empty to skip Drive upload.",
             "editor": "textfield",
             "default": "",
             "sectionCaption": "Google Drive"
         },
         "google_drive_reports_folder_id": {
-            "title": "Google Drive Reports Folder ID (PDFs → 05_Deep-Prospecting-Reports)",
+            "title": "Google Drive Reports Folder ID (PDFs \u2192 05_Deep-Prospecting-Reports)",
             "type": "string",
             "description": "Drive folder ID for deep-prospecting PDF reports. Leave empty to send PDFs to the same folder as the CSVs.",
             "editor": "textfield",
             "default": ""
         },
         "google_drive_cleanup_folder_id": {
-            "title": "Google Drive Cleanup Folder ID (Sold/Resolved → 03_Sold-Cleanup)",
+            "title": "Google Drive Cleanup Folder ID (Sold/Resolved \u2192 03_Sold-Cleanup)",
             "type": "string",
             "description": "Drive folder ID for the drop-off cleanup CSV (Sold + Resolved). Leave empty to nest 03_Sold-Cleanup under the inbox folder instead.",
             "editor": "textfield",
             "default": ""
         },
         "google_drive_forensics_folder_id": {
-            "title": "Google Drive Forensics Folder ID (diff JSON → 04_Forensics-&-Audit)",
+            "title": "Google Drive Forensics Folder ID (diff JSON \u2192 04_Forensics-&-Audit)",
             "type": "string",
             "description": "Drive folder ID for cross-run diff JSON reports. Leave empty to nest 04_Forensics-&-Audit under the inbox folder instead.",
             "editor": "textfield",
@@ -338,11 +342,10 @@
             "editor": "textarea",
             "isSecret": true
         },
-
         "apify_token": {
             "title": "Apify Personal API Token",
             "type": "string",
-            "description": "Your Apify Personal API token (Console → Settings → Integrations → Personal API token). Required — Apify's auto-injected run token cannot access the cross-run state KVS. Paste once; scheduled runs inherit it.",
+            "description": "Your Apify Personal API token (Console \u2192 Settings \u2192 Integrations \u2192 Personal API token). Required \u2014 Apify's auto-injected run token cannot access the cross-run state KVS. Paste once; scheduled runs inherit it.",
             "editor": "textfield",
             "isSecret": true,
             "sectionCaption": "API keys (secrets)"
@@ -423,6 +426,12 @@
             "description": "Webhook URL for run summary notifications.",
             "editor": "textfield",
             "isSecret": true
+        },
+        "tcc_lookback_days": {
+            "title": "TCC lookback days (backfill)",
+            "type": "integer",
+            "description": "Widen the Travis tccsearch scrape window to this many days back (overrides the 7-day Temp-index default). Use for one-off backfills; leave 0 for normal runs.",
+            "default": 0
         }
     }
 }
