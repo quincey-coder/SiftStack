@@ -11,7 +11,7 @@
     "maxMemoryMbytes": 4096,
     "defaultRunOptions": {
         "memoryMbytes": 2048,
-        "timeoutSecs": 5400
+        "timeoutSecs": 7200
     },
     "storages": {
         "dataset": {

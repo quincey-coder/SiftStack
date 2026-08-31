@@ -419,9 +419,14 @@ async def _fill_wizard_setup(page: Page, mode: str, list_name: str | None,
     if await dd.count() > 0:
         await dd.first.click()
         await page.wait_for_timeout(900)
+        # The existing-list option's full label is "Adding properties to an
+        # existing list inside DataSift" (verified live 2026-08-23), so an
+        # exact-text match misses it — match on the stable prefix instead.
         option = ("Adding properties to an existing list" if existing_list
                   else "Uploading a new list not in DataSift yet")
-        opt = page.locator(f'text="{option}"')
+        opt = page.locator(f'[class*="SelectOptionContainer"]:has-text("{option}")')
+        if await opt.count() == 0:
+            opt = page.locator(f'text={option}')
         if await opt.count() > 0:
             await opt.first.click()
             await page.wait_for_timeout(900)
@@ -440,7 +445,70 @@ async def _fill_wizard_setup(page: Page, mode: str, list_name: str | None,
         except Exception:
             pass
 
-    if list_name:
+    if list_name and existing_list:
+        # "ASSOCIATE DATA WITH LIST" is a styled Select showing "Select a
+        # list" (verified live 2026-08-23) — open it and click the option
+        # whose exact text is the list title. Fail loudly rather than let the
+        # wizard proceed toward creating a list.
+        sel = page.locator('text="Select a list"')
+        if await sel.count() == 0:
+            raise RuntimeError(
+                "existing_list: 'Select a list' dropdown not found on Setup step")
+        await sel.first.click()
+        await page.wait_for_timeout(900)
+        # Type-to-filter when the opened select focuses a text input (several
+        # DataSift selects do); harmless no-op otherwise.
+        try:
+            box = page.locator("input:focus")
+            if await box.count():
+                await box.first.type(list_name, delay=30)
+                await page.wait_for_timeout(600)
+        except Exception:
+            pass
+        # The option list SCROLLS with 50+ lists on the account — a one-shot
+        # query only sees the rendered slice, which is how 'Probate' came back
+        # "not offered" on 2026-08-29. Scroll the options' scrollable ancestor
+        # until the exact title renders or the scroll position stops moving.
+        clicked = await page.evaluate(
+            """async (wanted) => {
+                const findOpt = () =>
+                    [...document.querySelectorAll('[class*="SelectOptionContainer"]')]
+                        .find(e => (e.innerText || '').trim() === wanted);
+                let opt = findOpt();
+                let box = document.querySelector('[class*="SelectOptionContainer"]');
+                box = box ? box.parentElement : null;
+                while (box && box !== document.body
+                       && box.scrollHeight <= box.clientHeight + 5) {
+                    box = box.parentElement;
+                }
+                for (let i = 0; i < 40 && !opt && box; i++) {
+                    const before = box.scrollTop;
+                    box.scrollTop = before + Math.max(box.clientHeight, 100);
+                    await new Promise(r => setTimeout(r, 150));
+                    opt = findOpt();
+                    if (box.scrollTop === before) break;
+                }
+                if (!opt) return false;
+                opt.scrollIntoView({block: 'center'});
+                opt.click();
+                return true;
+            }""",
+            list_name,
+        )
+        if clicked:
+            await page.wait_for_timeout(400)
+        if not clicked:
+            raise RuntimeError(
+                f"existing_list: list {list_name!r} not offered in the wizard's "
+                "'Select a list' dropdown — refusing to continue")
+        await page.wait_for_timeout(700)
+        confirm = page.locator(f'text="{list_name}"')
+        if await confirm.count() == 0:
+            raise RuntimeError(
+                f"existing_list: selected {list_name!r} but the Setup step does "
+                "not display it — aborting before any commit")
+        logger.info("Existing list selected: %s", list_name)
+    elif list_name:
         li = page.locator(
             'input[placeholder*="Enter new list name"], input[placeholder*="list name"]')
         if await li.count() > 0:
