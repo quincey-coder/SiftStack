@@ -91,6 +91,7 @@ EXPECTED_PAIRS: list[tuple[str, str]] = [
     ("travis", "lis_pendens"),
     ("travis", "fire_damage"),
     ("travis", "code_violation"),
+    ("travis", "condemned"),
     ("travis", "tax_sale"),
     ("bell", "foreclosure"),
     ("bell", "probate"),
@@ -246,6 +247,8 @@ _SCRAPER_MODULES = [
     "tax_delinquent_wilco",
     # Code enforcement — Travis (City of Austin) via Socrata SODA API
     "code_enforcement_travis",
+    # Condemned structures — Austin Building & Standards Commission agendas (EDIMS PDFs)
+    "bsc_austin",
     # Liens (county-clerk OPR) — Travis tccsearch, Bell publicsearch (headed),
     # Williamson Tyler Self-Service (headed, must follow lien_publicsearch)
     "lien_travis",

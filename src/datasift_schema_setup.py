@@ -45,7 +45,14 @@ FIELD_OPTIONS = {
 }
 # Values this pull writes into the existing Notice Type select.
 NOTICE_TYPE_OPTIONS = ["lien", "trustee_deed", "eviction",
-                       "code_violation", "public_sale", "order"]
+                       "code_violation", "public_sale", "order",
+                       # Austin BSC condemned structures (bsc_austin scraper).
+                       # NOTE: the LIVE options are Title Case ("Foreclosure",
+                       # "Code Violation", "Lien" — read 2026-08-29) and select
+                       # matching is case-sensitive; "Condemned" was added via
+                       # the API that day. The lowercase entries above predate
+                       # that finding and would create unused duplicates.
+                       "Condemned"]
 NEW_LISTS = ["Condemned", "Trustee Deed", "Public Sale", "Court Order"]
 
 

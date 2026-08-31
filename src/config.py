@@ -169,7 +169,10 @@ TESSERACT_PSM_PHOTO = 4  # assume single column of variable-size text — best f
 # code_violation is scraped for Travis (Austin Code Socrata API); Bell/Williamson
 # have no live source (open-records only) and warn harmlessly as unregistered.
 # fire_damage is likewise Travis-only (CTECC Real-Time Fire feed, Socrata).
-NOTICE_TYPES = ["foreclosure", "tax_sale", "tax_delinquent", "probate", "code_violation", "lien", "lis_pendens", "fire_damage"]
+# condemned is Travis-only too: Austin Building & Standards Commission hearing
+# agendas (repair / vacate / demolish orders) — the actual "condemned homes" signal;
+# it IS in the default daily set (one index fetch/day, new agenda PDFs only).
+NOTICE_TYPES = ["foreclosure", "tax_sale", "tax_delinquent", "probate", "code_violation", "lien", "lis_pendens", "fire_damage", "condemned"]
 
 # Notice types run automatically on the default daily/historical scrape (no --types
 # given). code_violation is deliberately excluded: it's a weak standalone distressor
@@ -244,7 +247,12 @@ BUSINESS_RE = re.compile(
     r"\b(?:LLC|L\.L\.C|INC|CORP|CORPORATION|COMPANY|CO\b|LTD|LP|L\.P|"
     r"PARTNERSHIP|ASSOCIATION|ASSOC|BANK|CREDIT UNION|CHURCH|MINISTRIES|"
     r"HOUSING|AUTHORITY|DEVELOPMENT|ENTERPRISES|PROPERTIES|INVESTMENTS|"
-    r"GROUP|HOLDINGS|MANAGEMENT|SERVICES|FOUNDATION|ORGANIZATION)\b",
+    r"GROUP|HOLDINGS|MANAGEMENT|SERVICES|FOUNDATION|ORGANIZATION|"
+    # Religious bodies without the word CHURCH ("ST JOHNS REG BAPTIST") —
+    # otherwise parse_tax_owner_name fabricates a person ("Johns St") from
+    # the CAD NAMELF (2026-08-29, Austin BSC). Mirrors notice_parser._RELIGIOUS_KEYWORDS.
+    r"MINISTRY|BAPTIST|METHODIST|LUTHERAN|CATHOLIC|PRESBYTERIAN|PENTECOSTAL|"
+    r"EPISCOPAL|TABERNACLE|CONGREGATION|SYNAGOGUE|MOSQUE|IGLESIA|DIOCESE)\b",
     re.IGNORECASE,
 )
 

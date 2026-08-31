@@ -200,6 +200,11 @@ async def main_async(args) -> int:
 
 
 def main() -> int:
+    # Windows consoles default to cp1252, which cannot print the arrows below.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )

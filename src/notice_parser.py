@@ -33,8 +33,17 @@ _NAME_SUFFIXES = {
 _GOVERNMENT_KEYWORDS = {
     "COUNTY", "CITY", "TOWN", "MUNICIPAL", "MUNICIPALITY", "STATE",
     "GOVERNMENT", "FEDERAL", "ESD", "MUD", "WCID", "DISTRICT",
-    "AUTHORITY", "HOA", "COMMITTEE", "ASSOCIATION", "CHURCH",
-    "MINISTRIES", "SCHOOL", "ISD",
+    "AUTHORITY", "HOA", "COMMITTEE", "ASSOCIATION", "SCHOOL", "ISD",
+}
+
+# Religious bodies are private nonprofits that CAN sell (a condemned church
+# building is a real record — see the BSC agendas), so they classify as
+# business entities and route to FULL NAME/COMPANY/TRUST. They used to sit in
+# the government set, which made the formatter drop them silently (2026-08-29).
+_RELIGIOUS_KEYWORDS = {
+    "CHURCH", "MINISTRIES", "MINISTRY", "BAPTIST", "METHODIST", "LUTHERAN",
+    "CATHOLIC", "PRESBYTERIAN", "PENTECOSTAL", "EPISCOPAL", "TABERNACLE",
+    "CONGREGATION", "SYNAGOGUE", "MOSQUE", "IGLESIA", "DIOCESE",
 }
 
 # Business entities — investors DO want these (skip-trace the LLC manager,
@@ -44,7 +53,7 @@ _BUSINESS_KEYWORDS = {
     "PARTNERSHIP", "PARTNERS", "HOLDINGS", "PROPERTIES", "REALTY",
     "INVESTMENTS", "GROUP", "ENTERPRISES", "TRUST", "TRUSTEE", "ESTATE",
     "BANK", "CREDIT UNION",
-}
+} | _RELIGIOUS_KEYWORDS
 
 
 def _strip_trailing_suffixes(parts: list[str]) -> tuple[list[str], list[str]]:
@@ -227,6 +236,7 @@ class NoticeData:
     compliance_deadline: str = ""      # Date owner must comply by (YYYY-MM-DD), if stated
     case_status: str = ""              # e.g. "Active"/"Open"/"Closed"/"In Compliance" — drives closed-case filter
     case_id: str = ""                  # Source case number (Austin Code case_id) — cross-run key for resolution tracking
+    order_class: str = ""              # condemned (Austin BSC) effective order class: "repair"/"vacate"/"demolish" — part of the cross-run dedup key
     # Travis tax-delinquent cleaner outputs (empty for all other scrapers)
     business_name: str = ""            # Entity name when owner_name is business (skill overflow merge result)
     mailing_address: str = ""          # Cleaned mailing address, distinct from property address

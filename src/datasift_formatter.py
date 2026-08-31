@@ -140,6 +140,7 @@ _NOTICE_TYPE_LABELS = {
     "lien": "Lien",
     "lis_pendens": "Lis Pendens",
     "fire_damage": "Fire Damage",
+    "condemned": "Condemned",
 }
 
 _OWNER_DECEASED_LABELS = {"yes": "Yes", "no": "No", "suspected": "Suspected"}
@@ -449,6 +450,9 @@ NOTICE_TYPE_TO_LIST = {
     # DataSift auto-creates it from the CSV on first upload.
     "lis_pendens": "Lis Pendens",
     "fire_damage": "Fire Damage",
+    # Austin BSC repair/vacate/demolish orders — list pre-exists in the account
+    # (datasift_schema_setup.NEW_LISTS).
+    "condemned": "Condemned",
 }
 
 
@@ -520,8 +524,25 @@ def _build_tags(notice: NoticeData) -> str:
         tags.append(notice.lien_type.lower().replace("'", "").replace(" ", "_"))
 
     # Code-enforcement vexation tier (worst = structure_condition) for targeting
-    if notice.notice_type == "code_violation" and getattr(notice, "severity", ""):
+    if notice.notice_type in ("code_violation", "condemned") and getattr(notice, "severity", ""):
         tags.append(f"code_severity_{notice.severity}")
+
+    # Condemned (Austin BSC): order class + hearing context for filter presets.
+    if notice.notice_type == "condemned":
+        order_class = (getattr(notice, "order_class", "") or "").strip().lower()
+        if order_class:
+            tags.append(f"bsc_{order_class}")
+        status = (notice.case_status or "").lower()
+        if "returning" in status:
+            tags.append("bsc_returning")
+        if "escalated" in status:
+            tags.append("bsc_escalated")
+        desc = (notice.violation_description or "").lower()
+        flags = (getattr(notice, "missing_data_flags", "") or "").lower()
+        if "repeat offender" in desc:
+            tags.append("repeat_offender")
+        if "multifamily" in flags or re.search(r"(bldg|building|units?)", desc):
+            tags.append("multifamily")
 
     # County
     if notice.county:
@@ -847,6 +868,7 @@ _DM_RELATIONSHIP_LABELS = {
 
 _DM_SOURCE_LABELS = {
     "tax_record_c_o":         "BellCAD tax record (C/O)",
+    "bsc_agenda_c_o":         "Austin BSC hearing agenda (C/O)",
     "tax_record_joint_owner": "county tax record",
     "obituary_survivors":     "obituary search",
     "snippet":                "obituary snippet",

@@ -37,6 +37,10 @@ TARGET_ZIPS: set[str] = {
     # and still carry real delinquent volume (78721 n=224, 78741 n=214,
     # 78752 n=90, 78703 n=57, 78735 n=54 on the 2026-08-06 roll).
     "78703", "78721", "78735", "78741", "78752",
+    # added 2026-08-21 — green in the Market Finder pull (78617 Del Valle
+    # 23.5 investor trans/mo, 78621 Elgin 16.2/mo) but missing from every
+    # target list and suppressed in the DataSift ZIP filter.
+    "78617", "78621",
 }
 
 # Condo property-type code filtered out per skill spec

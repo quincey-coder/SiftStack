@@ -79,6 +79,19 @@ def _notice_dedup_key(notice) -> str:
     path is what actually identifies them.
     """
     from data_formatter import _notice_id_from_url
+    # Condemned (Austin BSC): key on the CASE NUMBER + effective order class,
+    # never on parcel/URL. The generic parcel: key is type-agnostic and the
+    # code_violation pull has already seeded parcel:{geo_id} for many of these
+    # very properties, which would suppress the BSC lead forever. A class change
+    # (repair -> demolish) yields a new key so the escalation is re-emitted and
+    # merges onto the existing DataSift record by address.
+    ntype0 = (getattr(notice, "notice_type", "") or "").strip().lower()
+    if ntype0 == "condemned":
+        cid = "".join((getattr(notice, "case_id", "") or "").split()).upper()
+        if cid:
+            county0 = (getattr(notice, "county", "") or "").strip().lower()
+            ocls = (getattr(notice, "order_class", "") or "").strip().lower()
+            return f"case:condemned|{county0}|{cid}|{ocls}"
     url = getattr(notice, "source_url", "") or ""
     nid = _notice_id_from_url(url)
     if nid:
@@ -236,6 +249,7 @@ def _collect_health_events(health) -> None:
         ("Bell", "tax_delinquent_bell"),
         ("Williamson", "tax_delinquent_wilco"),
         ("Travis code-enforcement", "code_enforcement_travis"),
+        ("Travis condemned (BSC)", "bsc_austin"),
     ):
         try:
             mod = import_module(f"scrapers.{mod_name}")
@@ -317,7 +331,7 @@ def _upload_forensics_reports_to_drive(no_drive: bool = False) -> int:
     uploaded = 0
     for mod_name in (
         "tax_delinquent_travis", "tax_delinquent_bell", "tax_delinquent_wilco",
-        "code_enforcement_travis",
+        "code_enforcement_travis", "bsc_austin",
     ):
         try:
             mod = import_module(f"scrapers.{mod_name}")
@@ -359,6 +373,7 @@ async def actor_main() -> None:
     from scrapers import travis_texdel_state as _texdel_state
     from scrapers import tax_delinquent_state as _gtexdel_state
     from scrapers import code_enforcement_state as _ce_state
+    from scrapers import bsc_state as _bsc_state
 
     # Bell + Williamson share the generic, county-parameterized texdel state
     # module. (county, KVS key) pairs — slugs match county.lower() cache keys
@@ -679,6 +694,16 @@ async def actor_main() -> None:
                 len(_stored_ce.get("last_run_case_ids") or []),
             )
 
+            # -- Load Travis condemned (Austin BSC) state: seen agenda ids + case classes --
+            _stored_bsc = await kvs.get_value(_bsc_state.KVS_KEY) or _bsc_state._empty_state()
+            _bsc_state.inject_apify_state(_stored_bsc)
+            Actor.log.info(
+                "Loaded Travis BSC state: last_run_date=%s, agendas_seen=%d, cases=%d",
+                _stored_bsc.get("last_run_date", "(none)"),
+                len(_stored_bsc.get("seen_docs") or {}),
+                len(_stored_bsc.get("cases") or {}),
+            )
+
             # ── Load per-scraper health baselines (rolling 14-day counts) ──
             _health_baselines = await kvs.get_value(_rh.STATE_KEY) or {}
 
@@ -744,6 +769,7 @@ async def actor_main() -> None:
                     "travis_codeenf_state",
                     _ce_state.snapshot_apify_state("Travis"),
                 )
+                await kvs.set_value(_bsc_state.KVS_KEY, _bsc_state.snapshot_apify_state())
                 Actor.log.info("Rebuild complete — exiting without running pipeline")
                 return
 
@@ -817,6 +843,7 @@ async def actor_main() -> None:
                     "travis_codeenf_state",
                     _ce_state.snapshot_apify_state("Travis"),
                 )
+                await kvs.set_value(_bsc_state.KVS_KEY, _bsc_state.snapshot_apify_state())
                 if do_notify_slack and config.SLACK_WEBHOOK_URL:
                     try:
                         from slack_notifier import send_slack_notification
@@ -1285,6 +1312,15 @@ async def actor_main() -> None:
             except Exception as e:
                 Actor.log.warning("Failed to drain code-enforcement buffers to KVS: %s", e)
 
+            # -- Drain Travis BSC diff reports to KVS --
+            try:
+                for filename, json_text in _bsc_state.drain_apify_reports():
+                    await kvs.set_value(
+                        f"travis_bsc_{filename}", json_text, content_type="application/json",
+                    )
+            except Exception as e:
+                Actor.log.warning("Failed to drain BSC buffers to KVS: %s", e)
+
             # ── Slack notification ──
             elapsed_min = (_time() - pipeline_start) / 60
             cost_breakdown: dict[str, float] = {}
@@ -1394,6 +1430,17 @@ async def actor_main() -> None:
                     except Exception:
                         Actor.log.exception("Travis code-enforcement Slack summary failed")
 
+                    # Travis condemned (Austin BSC): new/returning/escalated cases
+                    try:
+                        from scrapers import bsc_austin as _bsc
+                        if _bsc.LAST_RUN_DIFF is not None:
+                            msg = _bsc_state.format_slack_summary(
+                                _bsc_state.DiffResult(**_bsc.LAST_RUN_DIFF)
+                            )
+                            _send_webhook(msg)
+                    except Exception:
+                        Actor.log.exception("Travis BSC Slack summary failed")
+
                     Actor.log.info("Slack notification sent")
                 except Exception as e:
                     Actor.log.warning("Slack notification failed: %s", e)
@@ -1460,6 +1507,14 @@ async def actor_main() -> None:
             Actor.log.info(
                 "Saved Travis code-enforcement state: open_cases=%d",
                 len(_ce_state.snapshot_apify_state("Travis").get("last_run_case_ids") or []),
+            )
+
+            # -- Persist Travis condemned (BSC) state for next run --
+            await kvs.set_value(_bsc_state.KVS_KEY, _bsc_state.snapshot_apify_state())
+            Actor.log.info(
+                "Saved Travis BSC state: agendas_seen=%d, cases=%d",
+                len(_bsc_state.snapshot_apify_state().get("seen_docs") or {}),
+                len(_bsc_state.snapshot_apify_state().get("cases") or {}),
             )
 
             Actor.log.info("Done — %d notices exported (%.1f min)", total, elapsed_min)
@@ -3590,6 +3645,18 @@ def _run_scrape_pipeline(args, targets) -> None:
                 _send_webhook(msg)
         except Exception:
             logging.exception("Travis code-enforcement Slack summary failed")
+
+        # Travis condemned (Austin BSC): new/returning/escalated hearing cases.
+        try:
+            from scrapers import bsc_austin as _bsc
+            from scrapers import bsc_state as _bsc_state_cli
+            if _bsc.LAST_RUN_DIFF is not None:
+                msg = _bsc_state_cli.format_slack_summary(
+                    _bsc_state_cli.DiffResult(**_bsc.LAST_RUN_DIFF)
+                )
+                _send_webhook(msg)
+        except Exception:
+            logging.exception("Travis BSC Slack summary failed")
 
     # Audit DataSift for incomplete records (future daily check)
     if getattr(args, "audit_records", False):

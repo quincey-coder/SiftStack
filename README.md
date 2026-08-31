@@ -284,6 +284,7 @@ src/
 | Eviction | Photos | Landlord-tenant, detainer warrant |
 | Code Violation | Photos | Building code, compliance deadline |
 | Divorce | Photos | Property division, marital assets |
+| Condemned | Austin BSC agenda PDFs (Travis) | Building & Standards Commission repair / vacate / demolish orders |
 
 ## API Cost Estimates
 
