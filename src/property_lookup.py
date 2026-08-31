@@ -182,6 +182,22 @@ def _maiden_name_variant(decedent_name: str) -> str | None:
 # ── Main entry point ──────────────────────────────────────────────────
 
 
+def _apply_lookup_mailing(notice, result: dict) -> None:
+    """Carry the CAD owner MAILING address into the mailing slots (fill-only)
+    and flag records whose property address rests on the mailing heuristic."""
+    if result.get("mail_street") and not (notice.owner_street or "").strip():
+        notice.owner_street = result["mail_street"]
+        notice.owner_city = result.get("mail_city", "")
+        notice.owner_state = result.get("mail_state") or "TX"
+        notice.owner_zip = (result.get("mail_zip") or "")[:5]
+    if result.get("address_basis") == "mailing_heuristic":
+        flag = "address_from_mailing_heuristic"
+        flags = [f for f in (notice.missing_data_flags or "").split("|") if f]
+        if flag not in flags:
+            flags.append(flag)
+            notice.missing_data_flags = "|".join(flags)
+
+
 async def lookup_decedent_properties(notices: list) -> None:
     """Look up property addresses for probate notices with decedent names.
 
@@ -215,7 +231,13 @@ async def lookup_decedent_properties(notices: list) -> None:
 
         try:
             from cad_lookup import lookup_property_by_name
-            result = lookup_property_by_name(search_name, notice.county)
+            # Probate opts into the mailing heuristic: a decedent's in-state
+            # residential mailing address is usually their home. The lookup
+            # still prefers a true situs (delinquent roll / parcel fabric) and
+            # labels the fallback so the record can be flagged.
+            result = lookup_property_by_name(
+                search_name, notice.county, allow_mailing_as_situs=True,
+            )
 
             if result and result.get("address"):
                 notice.address = result["address"]
@@ -224,6 +246,7 @@ async def lookup_decedent_properties(notices: list) -> None:
                 notice.zip = result.get("zip", "")
                 if result.get("parcel_id"):
                     notice.parcel_id = result["parcel_id"]
+                _apply_lookup_mailing(notice, result)
                 if result.get("value"):
                     try:
                         notice.estimated_value = str(int(float(result["value"])))
@@ -261,7 +284,9 @@ async def lookup_decedent_properties(notices: list) -> None:
             if not notice.address:
                 short_name = _shorten_search_name(_format_name_for_search(search_name))
                 if short_name:
-                    result = lookup_property_by_name(short_name, notice.county)
+                    result = lookup_property_by_name(
+                        short_name, notice.county, allow_mailing_as_situs=True,
+                    )
                     if result and result.get("address"):
                         notice.address = result["address"]
                         notice.city = result.get("city", "")
@@ -269,6 +294,7 @@ async def lookup_decedent_properties(notices: list) -> None:
                         notice.zip = result.get("zip", "")
                         if result.get("parcel_id"):
                             notice.parcel_id = result["parcel_id"]
+                        _apply_lookup_mailing(notice, result)
                         cad_owner_raw = result.get("owner_raw") or (result.get("owner") or "").upper()
                         cad_owner_clean = _clean_cad_owner_for_display(cad_owner_raw)
                         if cad_owner_clean and not (notice.owner_name or "").strip():

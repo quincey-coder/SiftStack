@@ -314,6 +314,7 @@ Configured in `config.py`:
 | Travis | Probate | Odyssey portal |
 | Travis | Lien | tccsearch.org OPR (doc-type checkboxes) |
 | Travis | Fire Damage | CTECC Real-Time Fire feed (Socrata `wpu4-x69d`) |
+| Travis | Condemned | Austin Building & Standards Commission agendas (EDIMS PDFs) |
 | Bell | Foreclosure | bellcountytx.com county clerk |
 | Bell | Tax Sale | MVBA Law Firm PDFs |
 | Bell | Probate | Odyssey portal |
@@ -357,6 +358,47 @@ enrichment **Step 3c-lien**.
   downstream, which also discards the mostly-business State Tax Liens (the same
   safety property as the sold flow).
 
+### Travis situs vs owner mailing — never conflate (2026-08-29)
+
+The Travis current tax roll (`TaxCurOpenData.csv`, ~471K parcels) has NO
+situs column — only the owner's MAILING address. `travis_tax_cache` used to
+store that mailing address in the record slot named `situsaddress` on the
+owner-occupancy guess, and `cad_lookup.lookup_property_by_name` dropped the
+`source` marker, so the lien backfill (Step 3c-lien), the probate lookup and
+the Travis tax-sale backfill all stamped an owner's MAILING address onto
+`Property Street Address` with no way to tell. It shipped an LLC's PO Box
+("P.O. Box 41539" — the LLC actually owns 11311 Wedgewood Dr) and a debtor's
+downtown office suite as property addresses. Fixed at the root:
+
+- **Cache records are honest.** Current-roll records carry `situsaddress=""`
+  and explicit `mailing/mcity/mstate/mzip`; delinquent-roll records keep their
+  true situs AND now capture the mailing block the CSV always had. The address
+  index is still keyed by the mailing address on purpose — that identifies the
+  owner-occupant for OWNER-by-address lookups; it is not a claim about where
+  that record's property sits.
+- **Situs comes from the parcel** (the fire-damage lesson, generalized):
+  `src/travis_gis.py::situs_by_geo_id` queries the TCAD parcel fabric
+  (`TCAD_public/MapServer/0`, `where=geo_id='…'`, memoized, 0.3 s throttle)
+  and returns the real street/ZIP (city from `city_for_zip`). `situs_num`
+  blank = unaddressed land = no situs.
+- **`lookup_property_by_name` is explicit.** Result carries `source`,
+  `address_basis` (`situs` | `gis_situs` | `mailing_heuristic`) and separate
+  `mail_street/mail_city/mail_state/mail_zip`. Default = situs-or-None —
+  **liens / lis pendens never opt in** (a debtor's mailing says nothing about
+  the encumbered property; no situs → blank → dropped, the safety property).
+  Probate passes `allow_mailing_as_situs=True` (a decedent's in-state
+  residential mailing is usually their home); PO Boxes, suite/unit mailings
+  and out-of-state mailings are still refused, and the record is flagged
+  `address_from_mailing_heuristic`. Equal name scores prefer the true-situs
+  (delinquent) record.
+- Consumers fill `owner_street/…` (the Mailing columns) from `mail_*` only.
+  `_parcel_lookup_one` no longer falls back to the situs for the mailing
+  (that had put the PROPERTY address in `owner_street` on delinquent rows).
+- Tests: `tests/test_travis_situs_mailing.py` (offline, monkeypatched cache +
+  GIS). A unit-style property (Ste/Unit/Bldg/Trlr/Apt/#) is a separate,
+  legitimate-address case handled by the Step 8a condo filter
+  (`_UNIT_DESIGNATOR_RE`), per owner preference: no suites/condos/units.
+
 ## Fire Damage (Travis) — `notice_type = "fire_damage"`
 
 Structure fires are the earliest worst-condition signal (a burned house sits
@@ -388,6 +430,59 @@ Hard-won (2026-07-23):
   `search_by_address` falls back to a street-only match when the ZIP is wrong
   or missing — accepted only for a unique Austin-area (786xx/787xx) ZIP, which
   keeps out-of-county mailing keys from matching.
+
+## Condemned (Travis) — `notice_type = "condemned"` (Austin BSC, 2026-08-29)
+
+The owner wants **condemned homes**, and the Socrata complaint dataset behind
+`code_violation` cannot isolate them (its `description` is a 6-value complaint
+category; ~59% of "Structure Condition" rows are apartment complexes; BSC case
+numbers never appear in it). The real signal is the **Building and Standards
+Commission** (Tex. Loc. Gov't Code §214.001): monthly hearings that order a
+structure REPAIRED, VACATED, or DEMOLISHED with weekly penalties.
+`scrapers/bsc_austin.py` parses its agenda PDFs; state in `scrapers/bsc_state.py`
+(KVS `travis_bsc_state`). In the daily default set; DataSift list **"Condemned"**;
+tags `bsc_repair` / `bsc_vacate` / `bsc_demolish`, `bsc_returning`, `bsc_escalated`,
+`repeat_offender`, `multifamily`, `code_severity_structure_condition`.
+
+- **Source:** index `austintexas.gov/boards-commissions/meetings/{YEAR}_17_{PAGE}`
+  (8 rows/page, server-rendered, **unquoted HTML attributes**, flat sibling divs;
+  Imperva returns HTTP 200 + EMPTY body on bursts → success requires the
+  `bcic_nav` sentinel, 0.5 s spacing). PDFs `services.austintexas.gov/edims/document.cfm?id=N`
+  (invalid id = 200 + HTML → check `%PDF`). Cancelled meetings still post an
+  Agenda → skipped by the `(Cancelled)` date suffix. Text-extract with
+  **pdfminer**, never pypdfium2 (it drops the space at wrap boundaries:
+  `Royal CrestDrive`).
+- **Grammar** (formats 2018+): `Case Number: CL YYYY-NNNNNN` → `Property address:
+  … / Owner: …` → `Staff presenter:` → `Staff recommendation:`; returning cases
+  REUSE the original CL number and add `Previous commission action: Order TRV
+  NNNNNNNNNN …` (the recorded Travis clerk instrument). Labels are canonicalized
+  first (`_canonicalize_labels`), then items split on the label — item numbers
+  bunch up as bare `3.`/`4.` lines and `Page N` footers land mid-item. `CV`/`OL`
+  numbers are NOV/STR **appeals** → dropped. Match `demoli(sh|tion)` (the noun
+  form is ~24% of demolitions). ≤2016 label-less table agendas are out of scope.
+- **Address → parcel/ZIP/owner:** agendas carry NO city/ZIP/parcel, and the
+  tax-cache ADDRESS index only covers owner-occupants. Every BSC property has
+  code-case history, so Socrata `6wtj-zbtb` (`house_number` + `street_name`
+  stem) is the gazetteer → `parcelid` (10-digit geo_id) + ZIP (8/8 live), then
+  `travis_tax_cache.search_by_parcel` for the owner NAMELF + mailing. On
+  `current_mailing` cache records the "situs" fields are the OWNER MAILING
+  address — never use them as property ZIP. The agenda owner stays `owner_name`
+  (the party the City is serving); the CAD name goes to `tax_owner_name` and the
+  formatter shows it in Notes when it differs (`_is_same_person` is order-independent).
+- **Dedup:** the generic `parcel:` key is type-agnostic and the code_violation
+  pull has already seeded those parcels, so `main._notice_dedup_key` keys
+  condemned records on **case number + effective order class** — an escalation
+  (repair → demolish) re-emits and merges onto the CRM record by address. A
+  case dropping off the docket is NOT treated as resolved (it is usually still
+  under an active order) — no cleanup rows.
+- Religious bodies (`CHURCH`, `BAPTIST`, `MINISTRIES`, …) moved from
+  `notice_parser._GOVERNMENT_KEYWORDS` to the BUSINESS set (`_RELIGIOUS_KEYWORDS`)
+  — they can sell, and the government class made the formatter DROP them
+  silently for every notice type. True government owners are still dropped.
+  `Life Estate` is a person.
+  Whole-building orders are prime leads → `_detect_condo` exempts `condemned`.
+- **Before the first upload:** `datasift_schema_setup.py --commit` must add the
+  `condemned` Notice Type select option (unknown select values drop silently).
 
 ## Deep Prospecting v5 — SmartSkip heir engine (`src/smartskip.py`, 2026-08-11)
 

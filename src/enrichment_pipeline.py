@@ -168,17 +168,36 @@ def _filter_entity_owners(notices: list[NoticeData]) -> list[NoticeData]:
     return result
 
 
+# Secondary-unit designators that mark a condo / apartment / office suite /
+# townhome building / mobile-home space when they appear in a STREET address
+# (USPS secondary-unit abbreviations). Requires a following identifier so a
+# street literally named "Unit Rd" or "Lot Ave" is not caught: the
+# identifier must carry a digit (1900, 2B, 4) or be a single letter (Unit A).
+_UNIT_DESIGNATOR_RE = re.compile(
+    r"\b(?:APT|APARTMENT|UNIT|STE|SUITE|BLDG|BUILDING|TRLR|TRAILER|FL|FLOOR|"
+    r"RM|ROOM|OFC|OFFICE|SPC|SPACE|LOT)\s*#?\s*(?:[A-Z]?\d[A-Z0-9-]*|[A-Z])\b"
+)
+
+
 def _detect_condo(notice: NoticeData) -> bool:
     """Check if a notice looks like a condo/townhouse from text and type."""
+    # Condemned (Austin BSC) orders routinely target whole apartment buildings
+    # ("Building 11", "Units 101-104") — those are prime leads, never condos to drop.
+    if notice.notice_type == "condemned":
+        return False
     # Layer 1: Zillow property type (most reliable, set after Zillow enrichment)
     if notice.property_type:
         ptype = notice.property_type.lower()
         if ptype in ("condo", "townhouse", "apartment"):
             return True
 
-    # Layer 2: Address contains unit/apt indicator
+    # Layer 2: Address contains a unit-style designator. Owner preference
+    # (2026-08-29): no suites, condos, units, buildings, or trailer lots —
+    # the 8/27 lien list shipped "500 W 2nd St Ste 1900", "20600 Haygrazer
+    # Way Unit A", "6312 Stockman Dr Bldg 4" and "900 Broken Feather Trl
+    # Trlr 324" because only "#N" / "APT N" were recognized here.
     addr = (notice.address or "").upper()
-    if re.search(r"#\s*\d+", addr) or re.search(r"\bAPT\s+\d+", addr):
+    if re.search(r"#\s*[A-Z0-9-]+", addr) or _UNIT_DESIGNATOR_RE.search(addr):
         return True
 
     # Layer 3: Raw text / legal description keywords
@@ -489,7 +508,9 @@ def run_enrichment_pipeline(
         logger.info("── Step 3c-lien: Lien / Lis-Pendens Property Lookup (%d candidates) ──", len(lien_no_addr))
         try:
             from cad_lookup import lookup_property_by_name
+            from collections import Counter
             found = 0
+            basis_counts: Counter = Counter()
             for n in lien_no_addr:
                 search_name = n.tax_owner_name.strip() or n.owner_name.strip()
                 try:
@@ -497,14 +518,29 @@ def run_enrichment_pipeline(
                 except Exception as e:
                     logger.debug("  Lien CAD lookup error for %r: %s", search_name, e)
                     continue
+                # Situs-or-nothing: the default lookup never substitutes the
+                # debtor's MAILING address for the property (an LLC's PO Box and
+                # a debtor's office suite shipped as property addresses on
+                # 2026-08-27/29). Travis current-roll owners resolve their situs
+                # from the parcel fabric; a record with no situs stays blank and
+                # drops downstream (the documented safety property).
                 if result and result.get("address"):
                     n.address = result["address"]
                     n.city = result.get("city", "") or n.city
                     n.zip = result.get("zip", "") or n.zip
                     if result.get("parcel_id"):
                         n.parcel_id = result["parcel_id"]
+                    if result.get("mail_street") and not n.owner_street:
+                        n.owner_street = result["mail_street"]
+                        n.owner_city = result.get("mail_city", "")
+                        n.owner_state = result.get("mail_state") or "TX"
+                        n.owner_zip = (result.get("mail_zip") or "")[:5]
                     found += 1
-            logger.info("  Lien property address found: %d/%d", found, len(lien_no_addr))
+                    basis_counts[result.get("address_basis", "situs")] += 1
+            logger.info(
+                "  Lien property address found: %d/%d (%s)", found, len(lien_no_addr),
+                ", ".join(f"{k}={v}" for k, v in basis_counts.items()) or "none",
+            )
         except Exception as e:
             logger.warning("  Lien property lookup failed: %s", e)
 

@@ -178,18 +178,31 @@ def _backfill_situs(notices: list[NoticeData]) -> None:
         except Exception as e:
             logger.warning("Travis tax sale: parcel situs lookup failed: %s", e)
             return
-        if not rec:
+        situs = ((rec or {}).get("situsaddress") or "").strip()
+        city = ((rec or {}).get("scity") or "").strip().title()
+        zipc = ((rec or {}).get("szip") or "").strip()
+        if not situs:
+            # Current-roll parcel (or not in the roll at all): the cache holds
+            # no situs and its mailing address is NOT one — ask the parcel
+            # fabric for the real location.
+            try:
+                from travis_gis import situs_by_geo_id
+                gis = situs_by_geo_id(n.parcel_id)
+            except Exception as e:
+                logger.debug("Travis tax sale: GIS situs lookup failed: %s", e)
+                gis = None
+            if gis:
+                situs, city, zipc = gis["address"], gis.get("city", ""), gis.get("zip", "")
+        if not situs:
             continue
-        situs = (rec.get("situsaddress") or "").strip()
-        if situs:
-            n.address = situs.title()
-        if not n.city:
-            n.city = (rec.get("scity") or "").strip().title()
-        if not n.zip:
-            n.zip = (rec.get("szip") or "").strip()
+        n.address = situs.title()
+        if not n.city and city:
+            n.city = city
+        if not n.zip and zipc:
+            n.zip = zipc
         filled += 1
-    logger.info("Travis tax sale: situs backfilled from tax roll for %d/%d "
-                "parcels", filled, len(notices))
+    logger.info("Travis tax sale: situs backfilled from tax roll / parcel fabric "
+                "for %d/%d parcels", filled, len(notices))
 
 
 @register("Travis", "tax_sale")

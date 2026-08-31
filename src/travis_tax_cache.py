@@ -13,14 +13,19 @@ Two CSVs feed the index:
 
   TaxCurOpenData.csv (~266 MB, ~500K rows):
     Owner Name (NAMELF) + Mailing Address + Parcel ID. NO situs column.
-    Covers every property with tax activity. For probate decedents
-    (individuals, not LLCs) the mailing address is almost always their
-    home property, so we treat it as situs when delinquent-CSV misses.
+    Covers every property with tax activity. Its records carry a BLANK
+    situs and explicit mailing keys (mailing/mcity/mstate/mzip) — the
+    mailing address is NEVER stored as the situs (it used to be, on the
+    owner-occupancy guess, and shipped an LLC's PO Box and a debtor's
+    office suite as PROPERTY addresses on 2026-08-27/29). The true situs
+    for a current-roll parcel comes from the TCAD parcel fabric
+    (travis_gis.situs_by_geo_id); probate may opt into the mailing
+    heuristic explicitly via cad_lookup.lookup_property_by_name.
 
 Both files are downloaded via a 24h TTL cache. The index maps
 normalized_last_name → list of property candidates, each tagged with
-source="delinquent_situs" (authoritative) or "current_mailing" (heuristic).
-Callers in cad_lookup.py do fuzzy name scoring and prefer delinquent_situs.
+source="delinquent_situs" (true situs) or "current_mailing" (no situs on
+the roll). cad_lookup.py scores names and prefers delinquent_situs on ties.
 """
 
 import csv
@@ -247,6 +252,13 @@ def _load_delq(
             record = {
                 "fullname": owner,
                 "situsaddress": situs,
+                # Owner MAILING block — the delinquent CSV carries it, and keeping
+                # it in its own keys is what lets parcel lookups hand back a true
+                # mailing address instead of falling back to the situs.
+                "mailing": (row.get("Address 1") or row.get("Address 2") or "").strip(),
+                "mcity": (row.get("City") or "").strip().upper(),
+                "mstate": (row.get("State") or "").strip().upper(),
+                "mzip": (row.get("Zip Code") or "").strip()[:5],
                 # Property city is not in the delinquent CSV — resolve it from
                 # the property ZIP. Blanket "AUSTIN" mislabelled every Del
                 # Valle / Pflugerville / Manor / Leander situs in the index.
@@ -281,10 +293,11 @@ def _load_cur(
 ) -> int:
     """Parse TaxCurOpenData.csv — owner + mailing address only, no situs.
 
-    Mailing address is used as situs (the decedent's home IS their property
-    for individual-owned parcels — the vast majority of probate candidates).
-    Records are tagged `source="current_mailing"` so scoring can deprioritize
-    them when a situs-tagged match also exists.
+    Records carry `situsaddress=""` plus explicit `mailing/mcity/mstate/mzip`
+    and `source="current_mailing"`. The mailing address is deliberately NOT
+    stored as the situs (2026-08-29): callers resolve the true situs from the
+    parcel fabric (travis_gis) or, for probate only, opt into the mailing
+    heuristic in cad_lookup.lookup_property_by_name.
 
     Populates the address index only when no delinquent-situs record already
     owns the key — delinquent data always wins.
@@ -318,10 +331,20 @@ def _load_cur(
             state = (row.get("STATE") or "").strip().upper()
             record = {
                 "fullname": owner,
-                "situsaddress": mailing,
-                "scity": (row.get("CITY") or "").strip().upper() or "AUSTIN",
-                "sstate": state or "TX",
-                "szip": zipc,
+                # The current roll has NO situs column. It stays BLANK here
+                # (2026-08-29) — the mailing address used to be stored in this
+                # slot on the owner-occupancy guess, which shipped an LLC's PO
+                # Box and a debtor's office suite as PROPERTY addresses. The
+                # true situs is resolved from the parcel (travis_gis) by callers;
+                # the mailing address lives in its own keys below.
+                "situsaddress": "",
+                "scity": "",
+                "sstate": "TX",
+                "szip": "",
+                "mailing": mailing,
+                "mcity": (row.get("CITY") or "").strip().upper(),
+                "mstate": state or "TX",
+                "mzip": zipc,
                 "quickrefid": (row.get("PARCEL") or "").strip() or "",
                 "totalpropmktvalue": "",
                 "propertytypedesc": "",
@@ -334,15 +357,18 @@ def _load_cur(
             # the formatter falls the mailing back to the property address). This
             # is what recovers the "not in roll" code-violation records.
             _add_parcel(parcel_idx, record)
-            # Name + address indexes need a real mailing address, and keep the
-            # TX-only heuristic (a probate decedent's mailing is assumed to be
-            # their in-county home, so out-of-state mailings shouldn't seed them).
+            # Name + address indexes need a real mailing address, TX-only (an
+            # out-of-state mailing can never be an in-county owner-occupant).
             if not mailing:
                 continue
             if state and state != "TX":
                 continue
             idx.setdefault(key, []).append(record)
-            # Only populate address index if delinquent load didn't already.
+            # The address index is keyed by the MAILING address on purpose: a
+            # property address that equals someone's mailing address identifies
+            # the owner-occupant (used for OWNER lookups by address). It is not
+            # a claim about where this record's property sits — the record's
+            # situs stays blank. Delinquent (true-situs) entries always win.
             addr_key = (_normalize_street(mailing), zipc)
             addr_idx.setdefault(addr_key, record)
             count += 1
