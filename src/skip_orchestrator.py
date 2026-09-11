@@ -17,23 +17,31 @@ the upload CSV.
 
 MONEY SAFETY:
   * `estimate` spends nothing - it prints the cost rundown only.
-  * `run` is gated by --max-cost (a hard ceiling across all three providers) and,
-    for SmartSkip's card charge, an explicit --confirm (mirrors smartskip.pay).
+  * `run` is a HARD STOP before any spend: it prints the rundown, then BLOCKS until
+    a person at an interactive terminal types the --max-cost amount back. If stdin
+    or stdout is not a terminal (piped, scripted, or run by an agent's shell tool)
+    it refuses with nothing spent. `run()` itself refuses without the
+    SpendApproval that only `request_approval()` issues.
+  * --max-cost is a hard ceiling across all three providers. SmartSkip's charge
+    counts against it the moment payment is attempted, even if the order fails.
   * DirectSkip no-match is free; Trestle dedupes before billing.
 
 CLI:
     python src/skip_orchestrator.py estimate --input export.csv
-    python src/skip_orchestrator.py run --input export.csv --max-cost 50 --confirm \
-        --out upload.csv
+    python src/skip_orchestrator.py run --input export.csv --max-cost 50 --out upload.csv
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import json
 import logging
+import math
+import os
 import re
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -310,9 +318,211 @@ def format_estimate(est: dict) -> str:
         f"  Per record             : ${est['per_record_low']:.3f} - ${est['per_record_high']:.3f}",
         "",
         "  Litigator add-on billed by Trestle on top (rate unpublished).",
-        "  Nothing has been spent. Approve, then run with --max-cost.",
+        "  Nothing has been spent.",
     ]
     return "\n".join(L)
+
+
+# -- 2b. the approval gate (hard stop before any spend) ----------------
+
+@dataclass(frozen=True)
+class SpendApproval:
+    """Proof that a person typed the spend approval at a terminal.
+
+    Only request_approval() creates one; run() refuses to spend without it, so
+    the approval can't be skipped by calling run() directly.
+    """
+    max_cost: float
+    eligible: int
+    smartskip: bool
+    directskip: bool
+
+
+def _check_ceiling(n_eligible, max_cost, run_smartskip, run_directskip) -> None:
+    if max_cost <= 0:
+        raise OrchestratorError(f"--max-cost must be positive (got {max_cost}).")
+    ceiling = n_eligible * ((SS_COST if run_smartskip else 0) + (DS_COST if run_directskip else 0))
+    if ceiling > max_cost:
+        raise OrchestratorError(
+            f"Estimated skip ceiling ${ceiling:.2f} exceeds --max-cost ${max_cost:.2f}. "
+            f"Raise --max-cost or reduce the record count. Nothing was spent.")
+
+
+def _is_interactive() -> bool:
+    """True only when a person is at a real terminal (both ends are TTYs).
+
+    Agent shell tools capture stdout and pipes/scripts redirect stdin, so either
+    check failing means nobody can be there to approve.
+    """
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def _ask(prompt: str) -> str:
+    return input(prompt)
+
+
+# Chat approval ("reply yes in chat"):
+#   1. `estimate` writes a PENDING approval (file + ceiling + batch). Pending is
+#      not permission - anyone/anything can make one by running the free estimate.
+#   2. The owner replies "yes" in chat. The project UserPromptSubmit hook
+#      (.claude/hooks/skip_spend_approve.py) fires ONLY on the owner's own
+#      messages - Claude cannot trigger it - and turns the pending into a
+#      one-time APPROVAL TOKEN via approve_pending().
+#   3. `run` spends only if it finds a fresh token for this exact file + ceiling
+#      + batch, and burns it. No token -> refuses (fail-closed: if a hook breaks,
+#      nothing spends). A PreToolUse guard (.claude/hooks/skip_spend_gate.py)
+#      blocks shell/Write access to these files and the approval internals.
+_STATE_DIR = Path(config.PROJECT_ROOT) / "data" / "skip_orchestrator"
+PENDING_PATH = _STATE_DIR / "pending_approval.json"
+APPROVAL_TOKEN_PATH = _STATE_DIR / "approval_token.json"
+PENDING_TTL_S = 3600
+APPROVAL_TOKEN_TTL_S = 900
+
+
+def _norm_path(p) -> str:
+    return os.path.normcase(os.path.abspath(str(p)))
+
+
+def suggested_ceiling(est: dict) -> float:
+    """Default --max-cost: the estimate's high end, rounded up to a whole dollar."""
+    return float(math.ceil(est["total_high"]))
+
+
+def write_pending_approval(input_path, est, max_cost, run_smartskip, run_directskip) -> None:
+    """Called by `estimate`. Records what the owner would be approving."""
+    _STATE_DIR.mkdir(parents=True, exist_ok=True)
+    PENDING_PATH.write_text(json.dumps({
+        "input": _norm_path(input_path), "file": Path(input_path).name,
+        "max_cost": round(float(max_cost), 2), "eligible": int(est["eligible"]),
+        "total_low": est["total_low"], "total_high": est["total_high"],
+        "smartskip": bool(run_smartskip), "directskip": bool(run_directskip),
+        "created": time.time(),
+    }), encoding="utf-8")
+
+
+def write_approval_token(input_path, max_cost, eligible, run_smartskip, run_directskip) -> None:
+    _STATE_DIR.mkdir(parents=True, exist_ok=True)
+    APPROVAL_TOKEN_PATH.write_text(json.dumps({
+        "input": _norm_path(input_path), "max_cost": round(float(max_cost), 2),
+        "eligible": int(eligible), "smartskip": bool(run_smartskip),
+        "directskip": bool(run_directskip), "created": time.time(),
+    }), encoding="utf-8")
+
+
+def approve_pending(ceiling_override: float | None = None) -> dict:
+    """Pending -> approval token. Called ONLY by the owner's-message hook.
+
+    Returns the approved pending (with the final max_cost). Raises
+    OrchestratorError if there is nothing fresh to approve or the ceiling can't
+    cover the skip cost.
+    """
+    try:
+        pend = json.loads(PENDING_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise OrchestratorError("there's no pending skip-trace estimate to approve") from None
+    if time.time() - float(pend.get("created", 0)) > PENDING_TTL_S:
+        PENDING_PATH.unlink(missing_ok=True)
+        raise OrchestratorError("the pending estimate expired; re-run the estimate")
+    max_cost = round(float(ceiling_override if ceiling_override is not None else pend["max_cost"]), 2)
+    _check_ceiling(pend["eligible"], max_cost, pend["smartskip"], pend["directskip"])
+    write_approval_token(pend["input"], max_cost, pend["eligible"],
+                         pend["smartskip"], pend["directskip"])
+    PENDING_PATH.unlink(missing_ok=True)
+    return {**pend, "max_cost": max_cost}
+
+
+def cancel_pending() -> bool:
+    try:
+        PENDING_PATH.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def _consume_approval_token(input_path, max_cost, eligible, run_smartskip, run_directskip) -> None:
+    """Accept + delete the hook's token if it matches this exact run; else raise."""
+    try:
+        tok = json.loads(APPROVAL_TOKEN_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        tok = None
+    try:
+        APPROVAL_TOKEN_PATH.unlink()          # single use, even when it doesn't match
+    except OSError:
+        pass
+    problem = None
+    if not tok:
+        problem = "the owner hasn't approved this in chat"
+    elif time.time() - float(tok.get("created", 0)) > APPROVAL_TOKEN_TTL_S:
+        problem = "the approval expired"
+    elif input_path is None or tok.get("input") != _norm_path(input_path):
+        problem = "the approval was for a different file"
+    elif tok.get("max_cost") != round(float(max_cost), 2):
+        problem = f"the approval was for a ${tok.get('max_cost')} ceiling, not ${max_cost:.2f}"
+    elif (tok.get("eligible") != eligible or tok.get("smartskip") != bool(run_smartskip)
+          or tok.get("directskip") != bool(run_directskip)):
+        problem = "the approval was for a different batch or vendor set"
+    if problem:
+        raise OrchestratorError(
+            f"Not approved: {problem}. Run the estimate, then the owner replies 'yes' in "
+            f"chat (or runs this in a terminal and types the ceiling). Nothing was spent.")
+
+
+def request_approval(notices, max_cost: float, run_smartskip=True,
+                     run_directskip=True, input_path=None) -> SpendApproval:
+    """Show the cost rundown and STOP until a person approves the spend ceiling.
+
+    This is the hard stop between the free estimate and any vendor spend. Two
+    ways to approve, both from the person, never the agent:
+      * interactive terminal: type the exact ceiling back;
+      * Claude Code chat: reply "yes" after the estimate (the owner's-message
+        hook turns the pending estimate into a one-time token).
+    Anything else cancels with nothing spent.
+    """
+    est = estimate(notices, run_smartskip=run_smartskip, run_directskip=run_directskip)
+    if not est["eligible"]:
+        raise OrchestratorError("No eligible (person) records to skip trace. Nothing was spent.")
+    _check_ceiling(est["eligible"], max_cost, run_smartskip, run_directskip)
+
+    vendors = [v for v, on in (("SmartSkip", run_smartskip), ("DirectSkip", run_directskip)) if on]
+    print(format_estimate(est))
+    print("")
+    print("=== APPROVAL REQUIRED BEFORE ANY SPEND ===")
+    print(f"  Vendors                : {' + '.join(vendors + ['Trestle'])}")
+    print(f"  Spend ceiling          : ${max_cost:.2f}  (hard stop across all vendors)")
+    if run_smartskip:
+        print("  SmartSkip charges your saved card.")
+    if max_cost < est["total_high"]:
+        print(f"  Note: ceiling is below the high estimate (${est['total_high']:.2f}); "
+              "some numbers may stay unscored.")
+    print("")
+
+    if not _is_interactive():
+        _consume_approval_token(input_path, max_cost, est["eligible"],
+                                run_smartskip, run_directskip)
+        logger.info("Spend approved by the owner in chat: ceiling $%.2f for %d record(s).",
+                    max_cost, est["eligible"])
+        return SpendApproval(max_cost=float(max_cost), eligible=est["eligible"],
+                             smartskip=bool(run_smartskip), directskip=bool(run_directskip))
+
+    try:
+        answer = _ask(f"Type {max_cost:.2f} to approve spending up to ${max_cost:.2f} "
+                      "(anything else cancels): ")
+    except (EOFError, KeyboardInterrupt):
+        raise OrchestratorError("Approval cancelled. Nothing was spent.") from None
+    try:
+        typed = float((answer or "").strip().lstrip("$").replace(",", ""))
+    except ValueError:
+        typed = None
+    if typed is None or round(typed, 2) != round(max_cost, 2):
+        raise OrchestratorError(f"Not approved (typed {answer!r}). Nothing was spent.")
+
+    logger.info("Spend approved at the terminal: ceiling $%.2f for %d record(s).",
+                max_cost, est["eligible"])
+    return SpendApproval(max_cost=float(max_cost), eligible=est["eligible"],
+                         smartskip=bool(run_smartskip), directskip=bool(run_directskip))
 
 
 # -- 3. run the vendors ------------------------------------------------
@@ -334,16 +544,22 @@ def _run_directskip(eligible, budget) -> tuple[dict, float]:
     return out, round(spent, 2)
 
 
-def _run_smartskip(eligible, confirm, tmp_csv) -> dict:
-    """Submit -> (pay if confirm) -> wait -> download -> parse. Returns {addr_key: rec}."""
+def _run_smartskip(eligible, tmp_csv, ledger: dict) -> dict:
+    """Submit -> pay -> wait -> download -> parse. Returns {addr_key: rec}.
+
+    Records the card charge in ledger["smartskip"] BEFORE paying: once pay() is
+    called the card may be billed even if pay/wait/download then fails, and an
+    uncounted charge would hand DirectSkip + Trestle the full ceiling again.
+    """
     client = smartskip.SmartSkipClient()
     smartskip.build_trace_csv(eligible, tmp_csv)
     entry = client.submit(tmp_csv)                       # free: upload + calculate
     billable = int(entry.get("entities") or 0)
-    if not confirm:
+    if billable > len(eligible):
         raise OrchestratorError(
-            f"SmartSkip calculated {billable} billable row(s) but --confirm was not "
-            f"passed. SmartSkip bills the saved card; re-run with --confirm to pay.")
+            f"SmartSkip calculated {billable} billable row(s) but only {len(eligible)} "
+            f"were approved. Refusing to pay.")
+    ledger["smartskip"] = round(billable * SS_COST, 2)
     if not client.pay(entry["bulkSkipId"], confirm_rows=billable):
         raise OrchestratorError("SmartSkip payment did not succeed - see log.")
     client.wait_for_completion(entry["bulkSkipId"])
@@ -692,20 +908,27 @@ def write_upload_csv(merged, out_path: str | Path, phone_cap: int = DEFAULT_PHON
 
 # -- orchestration -----------------------------------------------------
 
-def run(notices, max_cost: float, confirm: bool = False,
-        phone_cap: int = DEFAULT_PHONE_CAP, run_smartskip: bool = True,
-        run_directskip: bool = True, out_path: str | Path = "skip_upload.csv",
+def run(notices, approval: SpendApproval,
+        phone_cap: int = DEFAULT_PHONE_CAP, out_path: str | Path = "skip_upload.csv",
         stamp: str | None = None, tmp_dir: str | Path | None = None) -> dict:
-    """Full pipeline with a hard cost ceiling. Returns a stats/cost dict."""
+    """Full pipeline under the approved hard cost ceiling. Returns a stats/cost dict.
+
+    Spends nothing unless `approval` came from request_approval() for this batch.
+    """
+    if not isinstance(approval, SpendApproval):
+        raise OrchestratorError(
+            "run() needs a SpendApproval from request_approval() - a person must "
+            "approve the spend at a terminal. Nothing was spent.")
     eligible = [n for n in notices if _is_eligible(n)]
     if not eligible:
         raise OrchestratorError("No eligible (person) records to skip trace.")
-
-    skip_ceiling = len(eligible) * ((SS_COST if run_smartskip else 0) + (DS_COST if run_directskip else 0))
-    if skip_ceiling > max_cost:
+    if len(eligible) != approval.eligible:
         raise OrchestratorError(
-            f"Estimated skip ceiling ${skip_ceiling:.2f} exceeds --max-cost ${max_cost:.2f}. "
-            f"Raise --max-cost or reduce the record count.")
+            f"Approval covered {approval.eligible} record(s) but this batch has "
+            f"{len(eligible)}. Nothing was spent.")
+    max_cost = approval.max_cost
+    run_smartskip, run_directskip = approval.smartskip, approval.directskip
+    _check_ceiling(len(eligible), max_cost, run_smartskip, run_directskip)
 
     tmp_dir = Path(tmp_dir) if tmp_dir else (Path(config.PROJECT_ROOT) / "data" / "skip_orchestrator")
     tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -718,11 +941,12 @@ def run(notices, max_cost: float, confirm: bool = False,
     # fails, the run still degrades to DirectSkip-only exactly as before;
     # DirectSkip's budget is what remains under the ceiling after SmartSkip.
     if run_smartskip:
+        ledger = {"smartskip": 0.0}
         try:
-            ss_records = _run_smartskip(eligible, confirm, tmp_dir / "smartskip_input.csv")
-            spent += len(eligible) * SS_COST   # bulk bills all calculated rows
+            ss_records = _run_smartskip(eligible, tmp_dir / "smartskip_input.csv", ledger)
         except (smartskip.SmartSkipError, OrchestratorError) as e:
             logger.error("SmartSkip failed (%s) - continuing DirectSkip-only.", e)
+        spent += ledger["smartskip"]   # counted even when the order failed after paying
     if run_directskip:
         ds_records, ds_spent = _run_directskip(eligible, budget=max(max_cost - spent, 0.0))
         spent += ds_spent
@@ -754,8 +978,9 @@ def main() -> int:
     ap.add_argument("cmd", choices=["estimate", "run"])
     ap.add_argument("--input", required=True, help="DataSift records export CSV")
     ap.add_argument("--out", default="skip_upload.csv", help="output upload CSV (run)")
-    ap.add_argument("--max-cost", type=float, help="hard USD ceiling across all providers (run)")
-    ap.add_argument("--confirm", action="store_true", help="authorize SmartSkip's card charge")
+    ap.add_argument("--max-cost", type=float,
+                    help="hard USD ceiling across all providers (required for run; "
+                         "estimate defaults it to the high estimate, rounded up)")
     ap.add_argument("--phone-cap", type=int, default=DEFAULT_PHONE_CAP)
     ap.add_argument("--no-smartskip", action="store_true")
     ap.add_argument("--no-directskip", action="store_true")
@@ -769,14 +994,35 @@ def main() -> int:
     rs, rd = not args.no_smartskip, not args.no_directskip
 
     if args.cmd == "estimate":
-        print(format_estimate(estimate(notices, run_smartskip=rs, run_directskip=rd)))
+        est = estimate(notices, run_smartskip=rs, run_directskip=rd)
+        print(format_estimate(est))
+        if not est["eligible"]:
+            return 0
+        ceiling = args.max_cost if args.max_cost is not None else suggested_ceiling(est)
+        try:
+            _check_ceiling(est["eligible"], ceiling, rs, rd)
+        except OrchestratorError as e:
+            print(f"\nSTOPPED: {e}", file=sys.stderr)
+            return 2
+        write_pending_approval(args.input, est, ceiling, rs, rd)
+        print("")
+        print("=== AWAITING OWNER APPROVAL ===")
+        print(f"  Spend ceiling          : ${ceiling:.2f}  (hard stop across all vendors)")
+        print("  Owner: reply 'yes' in chat to approve (or 'yes, cap $X' for a different")
+        print(f"  ceiling). Pending expires in {PENDING_TTL_S // 60} min. Then:")
+        print(f"    run --input \"{args.input}\" --max-cost {ceiling:g}")
         return 0
 
     if args.max_cost is None:
         ap.error("run requires --max-cost (a hard spend ceiling)")
-    stats = run(notices, max_cost=args.max_cost, confirm=args.confirm,
-                phone_cap=args.phone_cap, run_smartskip=rs, run_directskip=rd,
-                out_path=args.out, stamp=args.stamp)
+    try:
+        approval = request_approval(notices, args.max_cost, run_smartskip=rs,
+                                    run_directskip=rd, input_path=args.input)
+        stats = run(notices, approval, phone_cap=args.phone_cap,
+                    out_path=args.out, stamp=args.stamp)
+    except OrchestratorError as e:
+        print(f"\nSTOPPED: {e}", file=sys.stderr)
+        return 2
     print(f"\nWrote {stats['records']} record(s) to {args.out}")
     print(f"  DirectSkip hits {stats['directskip_hits']} | SmartSkip hits {stats['smartskip_hits']} "
           f"| numbers scored {stats['numbers_scored']}")

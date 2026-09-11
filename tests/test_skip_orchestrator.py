@@ -221,6 +221,289 @@ def test_score_all_respects_budget(monkeypatch):
     assert captured["n"] == 2 and len(score_map) == 2
 
 
+# ── approval gate (hard stop before any spend) ────────────────────────
+
+def _people(n=3):
+    return [NoticeData(owner_name=f"Jane Doe{i}", address=f"{100 + i} Main St",
+                       city="Austin", state="TX", zip="78704") for i in range(n)]
+
+
+def _forbid(*a, **k):
+    raise AssertionError("a paid vendor path was reached without approval")
+
+
+def _no_vendors(monkeypatch):
+    monkeypatch.setattr(so.smartskip, "SmartSkipClient", _forbid)
+    monkeypatch.setattr(so.directskip, "DirectSkipClient", _forbid)
+    monkeypatch.setattr(so, "score_all", _forbid)
+
+
+def test_run_refuses_without_approval(monkeypatch):
+    _no_vendors(monkeypatch)
+    for bogus in (None, 50, {"max_cost": 50}):
+        try:
+            so.run(_people(), bogus)
+        except so.OrchestratorError as e:
+            assert "Nothing was spent" in str(e)
+        else:
+            raise AssertionError(f"run() spent with approval={bogus!r}")
+
+
+def test_run_refuses_approval_for_a_different_batch(monkeypatch):
+    _no_vendors(monkeypatch)
+    approval = so.SpendApproval(max_cost=50, eligible=2, smartskip=True, directskip=True)
+    try:
+        so.run(_people(3), approval)
+    except so.OrchestratorError as e:
+        assert "covered 2" in str(e)
+    else:
+        raise AssertionError("approval for 2 records was accepted for 3")
+
+
+def _token_env(monkeypatch):
+    """Point the approval token at a temp file; returns (token path, export path)."""
+    import tempfile
+    d = tempfile.mkdtemp()
+    monkeypatch.setattr(so, "_STATE_DIR", so.Path(d))
+    monkeypatch.setattr(so, "APPROVAL_TOKEN_PATH", so.Path(d) / "approval_token.json")
+    monkeypatch.setattr(so, "PENDING_PATH", so.Path(d) / "pending_approval.json")
+    monkeypatch.setattr(so, "_is_interactive", lambda: False)
+    monkeypatch.setattr(so, "_ask", _forbid)          # the chat path never prompts
+    return so.APPROVAL_TOKEN_PATH, os.path.join(d, "export.csv")
+
+
+def test_approval_refuses_when_no_terminal_and_no_chat_approval(monkeypatch):
+    _, export = _token_env(monkeypatch)
+    try:
+        so.request_approval(_people(), 50, input_path=export)
+    except so.OrchestratorError as e:
+        assert "hasn't approved" in str(e) and "Nothing was spent" in str(e)
+    else:
+        raise AssertionError("approved with no terminal and no chat approval")
+
+
+def test_chat_approval_token_accepted_once(monkeypatch):
+    tok, export = _token_env(monkeypatch)
+    so.write_approval_token(export, 50, 3, True, True)   # what the hook does
+    a = so.request_approval(_people(3), 50, input_path=export)
+    assert a == so.SpendApproval(max_cost=50.0, eligible=3, smartskip=True, directskip=True)
+    assert not tok.exists()                               # consumed
+    try:
+        so.request_approval(_people(3), 50, input_path=export)
+    except so.OrchestratorError:
+        pass
+    else:
+        raise AssertionError("a chat approval was reused")
+
+
+def test_chat_approval_token_must_match_the_exact_run(monkeypatch):
+    import time as _time
+    tok, export = _token_env(monkeypatch)
+    cases = [
+        ("different file", dict(input_path=export + ".other"), "different file"),
+        ("different ceiling", dict(max_cost=60), "ceiling"),
+        ("different batch", dict(n=2), "different batch"),
+        ("different vendors", dict(run_smartskip=False), "different batch"),
+    ]
+    for label, kw, needle in cases:
+        so.write_approval_token(export, 50, 3, True, True)
+        try:
+            so.request_approval(_people(kw.get("n", 3)), kw.get("max_cost", 50),
+                                run_smartskip=kw.get("run_smartskip", True),
+                                input_path=kw.get("input_path", export))
+        except so.OrchestratorError as e:
+            assert needle in str(e), (label, str(e))
+            assert not tok.exists(), label               # a mismatch burns the token too
+        else:
+            raise AssertionError(f"accepted a token for a {label}")
+    # expired
+    so.write_approval_token(export, 50, 3, True, True)
+    data = so.json.loads(tok.read_text())
+    data["created"] = _time.time() - so.APPROVAL_TOKEN_TTL_S - 1
+    tok.write_text(so.json.dumps(data))
+    try:
+        so.request_approval(_people(3), 50, input_path=export)
+    except so.OrchestratorError as e:
+        assert "expired" in str(e)
+    else:
+        raise AssertionError("accepted an expired token")
+
+
+def test_approval_refuses_anything_but_the_exact_ceiling(monkeypatch):
+    monkeypatch.setattr(so, "_is_interactive", lambda: True)
+    for typed in ("y", "yes", "", "5", "50.01", "approve"):
+        monkeypatch.setattr(so, "_ask", lambda prompt, t=typed: t)
+        try:
+            so.request_approval(_people(), 50)
+        except so.OrchestratorError as e:
+            assert "Nothing was spent" in str(e)
+        else:
+            raise AssertionError(f"approved on typed={typed!r}")
+
+
+def test_approval_cancelled_by_eof_or_ctrl_c(monkeypatch):
+    monkeypatch.setattr(so, "_is_interactive", lambda: True)
+    for exc in (EOFError, KeyboardInterrupt):
+        def boom(prompt, exc=exc):
+            raise exc()
+        monkeypatch.setattr(so, "_ask", boom)
+        try:
+            so.request_approval(_people(), 50)
+        except so.OrchestratorError as e:
+            assert "cancelled" in str(e)
+        else:
+            raise AssertionError(f"{exc.__name__} did not cancel")
+
+
+def test_approval_accepts_typed_ceiling(monkeypatch):
+    monkeypatch.setattr(so, "_is_interactive", lambda: True)
+    for typed in ("50", "50.00", "$50", " 50.0 "):
+        monkeypatch.setattr(so, "_ask", lambda prompt, t=typed: t)
+        a = so.request_approval(_people(3), 50, run_smartskip=True, run_directskip=False)
+        assert a == so.SpendApproval(max_cost=50.0, eligible=3, smartskip=True, directskip=False)
+
+
+def test_approval_refuses_ceiling_below_skip_cost_before_prompting(monkeypatch):
+    monkeypatch.setattr(so, "_is_interactive", lambda: True)
+    monkeypatch.setattr(so, "_ask", _forbid)
+    try:
+        so.request_approval(_people(3), 0.50)   # 3 x (0.15 + 0.10) = 0.75 > 0.50
+    except so.OrchestratorError as e:
+        assert "exceeds --max-cost" in str(e)
+    else:
+        raise AssertionError("ceiling below skip cost was offered for approval")
+
+
+def test_estimate_cli_writes_pending_and_yes_chain_approves_run(monkeypatch):
+    """estimate -> pending; owner's yes (approve_pending) -> token; run's approval
+    consumes it. Without the yes step, the same run refuses."""
+    import io
+    import contextlib
+    _, export = _token_env(monkeypatch)
+    with open(export, "w", encoding="utf-8", newline="") as fh:
+        fh.write("Owner First Name,Owner Last Name,Property Street Address,Property City,"
+                 "Property State,Property ZIP Code\n"
+                 "Jane,Doe,1 A St,Austin,TX,78704\nBob,Roe,2 B St,Austin,TX,78704\n")
+    monkeypatch.setattr(so.sys, "argv", ["x", "estimate", "--input", export])
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert so.main() == 0
+    assert "AWAITING OWNER APPROVAL" in buf.getvalue()
+    pend = so.json.loads(so.PENDING_PATH.read_text())
+    assert pend["eligible"] == 2 and pend["max_cost"] == 1.0   # ceil($0.92)
+
+    notices = so.load_datasift_export(export)
+    try:                                                         # no yes yet -> refuses
+        so.request_approval(notices, 1.0, input_path=export)
+    except so.OrchestratorError as e:
+        assert "hasn't approved" in str(e)
+    else:
+        raise AssertionError("ran on a pending estimate with no approval")
+
+    approved = so.approve_pending()                              # what the yes-hook does
+    assert approved["max_cost"] == 1.0 and not so.PENDING_PATH.exists()
+    a = so.request_approval(notices, 1.0, input_path=export)
+    assert a.max_cost == 1.0 and a.eligible == 2
+
+
+def test_approve_pending_refuses_stale_missing_or_underfunded(monkeypatch):
+    import time as _time
+    _token_env(monkeypatch)
+    try:
+        so.approve_pending()
+    except so.OrchestratorError as e:
+        assert "no pending" in str(e)
+    else:
+        raise AssertionError("approved with nothing pending")
+    est = {"eligible": 100, "total_low": 30, "total_high": 40}
+    so.write_pending_approval("e.csv", est, 40, True, True)
+    try:
+        so.approve_pending(5)                  # 100 x $0.25 skip cost > $5
+    except so.OrchestratorError as e:
+        assert "exceeds" in str(e)
+    else:
+        raise AssertionError("approved a ceiling below the skip cost")
+    assert not so.APPROVAL_TOKEN_PATH.exists()
+    data = so.json.loads(so.PENDING_PATH.read_text())
+    data["created"] = _time.time() - so.PENDING_TTL_S - 1
+    so.PENDING_PATH.write_text(so.json.dumps(data))
+    try:
+        so.approve_pending()
+    except so.OrchestratorError as e:
+        assert "expired" in str(e)
+    else:
+        raise AssertionError("approved an expired pending")
+
+
+def test_smartskip_charge_counts_against_ceiling_even_if_order_fails(monkeypatch):
+    """Card charged, then the order fails: DirectSkip + Trestle must NOT get the
+    full ceiling again (this overran $0.80 -> $1.20 before the fix)."""
+    import tempfile
+    bill = {"ss": 0.0, "ds": 0.0, "trestle": 0.0}
+
+    class FakeSS:
+        def submit(self, p):
+            return {"entities": 3, "bulkSkipId": "x"}
+
+        def pay(self, bid, confirm_rows):
+            bill["ss"] += confirm_rows * so.SS_COST
+            return True
+
+        def wait_for_completion(self, bid):
+            raise ss.SmartSkipError("bulk skip ended in status failed")
+
+    class FakeDS:
+        n = 0
+
+        def search_record(self, notice):
+            FakeDS.n += 1
+            bill["ds"] += so.DS_COST
+            r = ds.DirectSkipRecord(first="Jane", last="Doe", property_address=notice.address,
+                                    result_code="CI", source="api")
+            r.subject_phones = [{"number": f"512555{FakeDS.n * 10 + j:04d}", "type": "mobile"}
+                                for j in range(10)]
+            return r
+
+    def fake_score_all(merged, budget, **kw):
+        nums = so._all_digits(merged)[:int(budget / so.TRESTLE_COST)]
+        bill["trestle"] += len(nums) * so.TRESTLE_COST
+        return {d: {"tier": "Dial First", "score": 90, "valid": True, "litigator": False}
+                for d in nums}
+
+    monkeypatch.setattr(so.smartskip, "SmartSkipClient", FakeSS)
+    monkeypatch.setattr(so.smartskip, "build_trace_csv", lambda e, p: None)
+    monkeypatch.setattr(so.directskip, "DirectSkipClient", FakeDS)
+    monkeypatch.setattr(so, "score_all", fake_score_all)
+
+    approval = so.SpendApproval(max_cost=0.80, eligible=3, smartskip=True, directskip=True)
+    tmp = tempfile.mkdtemp()
+    stats = so.run(_people(3), approval, out_path=os.path.join(tmp, "out.csv"), tmp_dir=tmp)
+    real = round(sum(bill.values()), 2)
+    assert real <= 0.80, f"real spend ${real} exceeded the $0.80 ceiling"
+    assert stats["cost"] >= round(bill["ss"], 2)   # the failed order's charge is reported
+
+
+def test_cli_run_stops_without_any_approval():
+    """End-to-end, no patching: the real CLI run with piped stdin + captured
+    stdout (how an agent's shell tool runs it) and no permission-prompt token
+    must stop before any spend, even when the correct ceiling is piped in."""
+    import subprocess
+    export = _tmp("Owner First Name,Owner Last Name,Property Street Address,Property City,"
+                  "Property State,Property ZIP Code\nJane,Doe,123 Main St,Austin,TX,78704\n")
+    env = dict(os.environ, APIFY_TOKEN="", SMARTSKIP_EMAIL="", SMARTSKIP_PASSWORD="",
+               DIRECTSKIP_API_KEY="", TRESTLE_API_KEY="", PYTHONIOENCODING="utf-8")
+    script = os.path.join(os.path.dirname(__file__), "..", "src", "skip_orchestrator.py")
+    out = _tmp("", ext="csv")
+    os.remove(out)
+    proc = subprocess.run([sys.executable, script, "run", "--input", export,
+                           "--max-cost", "5", "--out", out],
+                          input="5\n", capture_output=True, text=True, env=env, timeout=120)
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "APPROVAL REQUIRED" in proc.stdout
+    assert "Not approved" in proc.stderr and "Nothing was spent" in proc.stderr
+    assert not os.path.exists(out)   # never reached the write step
+
+
 # ── harness ───────────────────────────────────────────────────────────
 
 _TMP = []
