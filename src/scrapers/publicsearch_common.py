@@ -45,6 +45,23 @@ def _parse_total(text: str) -> int | None:
         return None
 
 
+SANITY_WINDOW_MAX_DAYS = 31
+
+
+def sanity_cap_for(window_days: int, base: int = DEFAULT_SANITY_MAX) -> int | None:
+    """Max plausible total for a window: `base` per started 7-day block.
+
+    The header probe used to run only for windows <= 7 days; the shared
+    14-day rolling lookback (scrapers.lookback) would have silently disabled
+    it. 14d -> 2*base, 28d -> 4*base — all below the portal's 2500-row cap.
+    Windows longer than SANITY_WINDOW_MAX_DAYS return None (probe off; the
+    outside-share probe still runs).
+    """
+    if window_days > SANITY_WINDOW_MAX_DAYS:
+        return None
+    return base * max(1, -(-window_days // 7))
+
+
 async def verify_window_applied(
     page: Page,
     from_date: datetime,
@@ -55,7 +72,8 @@ async def verify_window_applied(
     """Check that the results actually honor the requested recorded-date window.
 
     Two independent probes on the rendered results page:
-      1. Total-results header: a ≤7-day window with > sanity_max results.
+      1. Total-results header: more results than `sanity_cap_for(window_days)`
+         allows (windows up to 31 days).
       2. Row dates: > OUTSIDE_SHARE_MAX of page-1 recorded dates outside
          [from_date - 1d, to_date + 1d].
 
@@ -88,10 +106,11 @@ async def verify_window_applied(
     outside_share = (outside / len(dates)) if dates else 0.0
     evidence["outside_share"] = round(outside_share, 2)
 
-    if window_days <= 7 and total is not None and total > sanity_max:
+    cap = sanity_cap_for(window_days, sanity_max)
+    if cap is not None and total is not None and total > cap:
         logger.warning(
             "%s: %d results for a %d-day window (> %d) — date filter did NOT apply",
-            label, total, window_days, sanity_max,
+            label, total, window_days, cap,
         )
         evidence["hit_cap"] = True
         return False, evidence

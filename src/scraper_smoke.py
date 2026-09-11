@@ -45,6 +45,9 @@ SLOW_TARGETS = {
     ("travis", "tax_delinquent"),
     ("bell", "tax_delinquent"),
     ("williamson", "tax_delinquent"),
+    # OCR-bound scanned-PDF sources (per-run budget; Tesseract required).
+    ("bell", "foreclosure"),
+    ("williamson", "foreclosure"),
 }
 
 
@@ -66,6 +69,11 @@ async def _run_one(county: str, ntype: str, args, capture_root: Path) -> dict:
     os.environ["SIFT_DEBUG_CAPTURE_DIR"] = str(capture_dir)
 
     since = (datetime.now() - timedelta(days=args.days)).strftime("%Y-%m-%d")
+    # Keep the scanned-PDF OCR budgets inside this harness's per-target
+    # timeout (state is never written here: max_notices is passed).
+    _ocr_cap = str(max(60, int(args.timeout) - 60))
+    os.environ.setdefault("SIFT_BELL_OCR_BUDGET_S", _ocr_cap)
+    os.environ.setdefault("SIFT_WILCO_OCR_BUDGET_S", _ocr_cap)
     result = {
         "county": county, "type": ntype, "status": "fail", "count": 0,
         "duration_s": 0.0, "error": "", "evidence": {}, "captures": [],

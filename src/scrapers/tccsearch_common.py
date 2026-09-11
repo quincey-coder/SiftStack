@@ -370,18 +370,22 @@ def effective_from_date(from_date, to_date, mode: str):
     zero. This is why Travis probate and lis pendens produced 0 records for
     30+ straight days while the search itself "worked".
 
-    Looking back TCC_INDEX_LAG_DAYS (default 7) picks the same filings up once
-    the clerk verifies them; the cross-run seen_notice_ids dedup absorbs the
-    re-scans.
+    Looking back picks the same filings up once the clerk verifies them; the
+    cross-run seen_notice_ids dedup (which seals only COMPLETE records) absorbs
+    the re-scans. The lag defaults to the shared rolling lookback
+    (`scrapers.lookback.daily_lookback_days`, 14 days); TCC_INDEX_LAG_DAYS can
+    only widen it further (backfill lever), never narrow it.
     """
     from datetime import timedelta
 
+    from scrapers.lookback import daily_lookback_days
+
     if mode != "daily":
         return from_date
-    lag = 7
+    lag = daily_lookback_days()
     raw = os.getenv("TCC_INDEX_LAG_DAYS", "").strip()
     if raw.isdigit():
-        lag = int(raw)
+        lag = max(lag, int(raw))
     widened = to_date - timedelta(days=lag)
     return min(from_date, widened)
 

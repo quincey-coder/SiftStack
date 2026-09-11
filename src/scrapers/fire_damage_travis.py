@@ -333,20 +333,15 @@ class TravisFireDamageScraper:
     """Structure-fire incidents via the CTECC Real-Time Fire Socrata feed."""
 
     def _since_iso(self, mode: str, since_date: str | None) -> str:
-        if mode == "historical":
-            cutoff = datetime.now() - timedelta(days=HISTORICAL_DAYS)
-        elif since_date:
-            try:
-                cutoff = datetime.strptime(since_date, "%Y-%m-%d")
-            except ValueError:
-                logger.warning(
-                    "Invalid since_date %r — defaulting to last %d days",
-                    since_date, DAILY_DEFAULT_DAYS,
-                )
-                cutoff = datetime.now() - timedelta(days=DAILY_DEFAULT_DAYS)
-        else:
-            cutoff = datetime.now() - timedelta(days=DAILY_DEFAULT_DAYS)
-        return cutoff.strftime("%Y-%m-%dT00:00:00")
+        # Shared rolling lookback (>= 14 days) — feed rows are complete on
+        # arrival, but the parcel/owner resolution can fail and the record
+        # then stays open for a re-hit inside the window.
+        from scrapers.lookback import since_iso
+
+        return since_iso(
+            mode, since_date, default_days=DAILY_DEFAULT_DAYS,
+            historical_days=HISTORICAL_DAYS, log_label="Travis fire damage",
+        )
 
     def _fetch_page(self, where: str, offset: int) -> list[dict]:
         params = {

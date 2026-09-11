@@ -52,6 +52,13 @@
             "default": false,
             "editor": "checkbox"
         },
+        "rebuild_seal_all": {
+            "title": "Rebuild: seal incomplete records too",
+            "type": "boolean",
+            "description": "With Rebuild Dedup Only: seal EVERY scraped record into seen_notice_ids, including ones with no owner name or no address (pre-2026-09-09 behaviour). Default seals only complete records so late-completed clerk rows stay re-scannable.",
+            "default": false,
+            "editor": "checkbox"
+        },
         "max_notices": {
             "title": "Max Notices (smoke-test cap)",
             "type": "integer",
@@ -444,8 +451,32 @@
         "tcc_lookback_days": {
             "title": "TCC lookback days (backfill)",
             "type": "integer",
-            "description": "Widen the Travis tccsearch scrape window to this many days back (overrides the 7-day Temp-index default). Use for one-off backfills; leave 0 for normal runs.",
+            "description": "Widen the Travis tccsearch scrape window beyond the shared daily lookback (only widens, never narrows). Use e.g. 60 for a one-off backfill; leave 0 for normal runs.",
             "default": 0
+        },
+        "daily_lookback_days": {
+            "title": "Daily rolling lookback (days)",
+            "type": "integer",
+            "description": "Every daily run re-scans today minus N days .. today on every date-windowed scraper, so rows the clerk posts nameless/addressless are re-hit once completed; cross-run dedup absorbs the repeats. 0 = default (14).",
+            "default": 0,
+            "minimum": 0,
+            "maximum": 120
+        },
+        "bell_ocr_budget_secs": {
+            "title": "Bell foreclosure OCR budget (seconds/run)",
+            "type": "integer",
+            "description": "Wall-clock budget for OCR-ing Bell County's scanned foreclosure PDFs each run (default 900). Already-read PDFs are remembered and replayed for free, so only new/re-posted/unfinished PDFs spend it. Raise (e.g. 2400) for a one-off backfill.",
+            "default": 900,
+            "minimum": 0,
+            "maximum": 3600
+        },
+        "williamson_ocr_budget_secs": {
+            "title": "Williamson foreclosure OCR budget (seconds/run)",
+            "type": "integer",
+            "description": "Wall-clock budget for OCR-ing Williamson County's individual trustee-sale notice PDFs when the clerk has not posted a month's index yet (default 600). Remembered PDFs replay for free. Raise (e.g. 3600) for a one-off backfill.",
+            "default": 600,
+            "minimum": 0,
+            "maximum": 3600
         }
     }
 }

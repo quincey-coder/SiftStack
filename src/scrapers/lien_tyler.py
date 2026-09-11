@@ -116,16 +116,13 @@ class WilliamsonTylerLienScraper:
         since_date: str | None = None,
         max_notices: int | None = None,
     ) -> list[NoticeData]:
-        to_date = datetime.now()
-        if since_date:
-            try:
-                from_date = datetime.strptime(since_date, "%Y-%m-%d")
-            except ValueError:
-                from_date = to_date - timedelta(days=30)
-        elif mode == "historical":
-            from_date = to_date - timedelta(days=365)
-        else:
-            from_date = to_date - timedelta(days=30)
+        from scrapers.lookback import daily_window
+
+        # Rolling lookback (>= 14 days) so late-completed filings are re-hit;
+        # the default window is exactly one CHUNK_DAYS chunk.
+        from_date, to_date, _ = daily_window(
+            mode, since_date, log_label="Williamson lien",
+        )
 
         self.last_meta = {
             "window_days": (to_date - from_date).days + 1,

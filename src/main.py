@@ -132,6 +132,68 @@ def _notice_dedup_key_from_row(row: dict) -> str:
     return f"addr:{ntype}|{county}|{addr}|{zipc}"
 
 
+# ── Completeness-gated dedup seal (owner rule, 2026-09-09) ───────────
+#
+# Clerks post rows INCOMPLETE (nameless Temp-index rows, address-less liens,
+# re-posted PDFs) and complete them days later. The daily window is now a
+# rolling lookback (scrapers/lookback.py) so those rows are re-scanned — but
+# that only helps if the incomplete first sighting was NOT sealed into
+# seen_notice_ids. Rule: seal ONLY when the record has BOTH an owner identity
+# AND a property address. Anything less stays open and is re-hit until the
+# window ages it out. Sold tag-update rows are never sealed.
+
+def _has_owner_identity(n) -> bool:
+    ntype = (getattr(n, "notice_type", "") or "").lower()
+    fields = ["owner_name", "tax_owner_name", "business_name"]
+    if ntype == "probate":
+        fields = ["decedent_name", "decision_maker_name", "owner_name"]
+    return any((getattr(n, f, "") or "").strip() for f in fields)
+
+
+def _has_property_address(n) -> bool:
+    addr = (getattr(n, "address", "") or "").strip()
+    if not addr:
+        return False
+    return bool((getattr(n, "zip", "") or "").strip() or (getattr(n, "city", "") or "").strip())
+
+
+def _is_complete_for_seen(n) -> bool:
+    """True when a record may be sealed into seen_notice_ids."""
+    if getattr(n, "record_status", "") == "sold":
+        return False
+    return _has_owner_identity(n) and _has_property_address(n)
+
+
+def _seal_seen_ids(notices, seen_ids: set, *, require_complete: bool = True) -> tuple[int, int]:
+    """Add each notice's pre-enrichment snapshot key to `seen_ids` when complete.
+
+    Returns (added, left_open): `added` = keys newly inserted, `left_open` =
+    notices skipped because they are incomplete (never counts sold rows).
+    `require_complete=False` (the --rebuild-seal-all escape hatch) seals every
+    non-sold record, matching the pre-2026-09-09 behaviour.
+    """
+    added = 0
+    open_by_type: dict = {}
+    for n in notices:
+        if getattr(n, "record_status", "") == "sold":
+            continue
+        if require_complete and not _is_complete_for_seen(n):
+            t = (getattr(n, "notice_type", "") or "?")
+            open_by_type[t] = open_by_type.get(t, 0) + 1
+            continue
+        key = getattr(n, "_dedup_key", None) or _notice_dedup_key(n)
+        if key not in seen_ids:
+            seen_ids.add(key)
+            added += 1
+    left_open = sum(open_by_type.values())
+    if left_open:
+        logging.info(
+            "Dedup seal: %d record(s) left OPEN for re-hit (incomplete name/address): %s",
+            left_open, ", ".join(f"{t}={c}" for t, c in sorted(open_by_type.items())),
+        )
+    return added, left_open
+
+
 # ── Shared helpers ────────────────────────────────────────────────────
 
 
@@ -374,6 +436,12 @@ async def actor_main() -> None:
     from scrapers import tax_delinquent_state as _gtexdel_state
     from scrapers import code_enforcement_state as _ce_state
     from scrapers import bsc_state as _bsc_state
+    from scrapers import pdf_notice_state as _pdfn_state
+    # Bell/Williamson foreclosure per-PDF memory (OCR replay cache), one KVS
+    # key per county — loaded before scrape_targets, saved at every exit.
+    _PDF_NOTICE_STATE = tuple(
+        (cty, _pdfn_state.kvs_key(cty)) for cty in ("Bell", "Williamson")
+    )
 
     # Bell + Williamson share the generic, county-parameterized texdel state
     # module. (county, KVS key) pairs — slugs match county.lower() cache keys
@@ -433,6 +501,24 @@ async def actor_main() -> None:
         if _lag:
             os.environ["TCC_INDEX_LAG_DAYS"] = str(_lag)
             Actor.log.warning("TCC lookback widened to %d days for this run", _lag)
+        # Shared rolling lookback for EVERY date-windowed scraper (default 14
+        # days, scrapers/lookback.py): clerks post rows nameless/addressless
+        # and complete them days later; the re-scan picks them up once complete.
+        _lb = int(actor_input.get("daily_lookback_days", 0) or 0)
+        if _lb:
+            os.environ["SIFT_DAILY_LOOKBACK_DAYS"] = str(_lb)
+            Actor.log.warning("Daily rolling lookback set to %d days for this run", _lb)
+        # Per-run OCR budgets for the scanned-PDF foreclosure sources (defaults
+        # 900 s Bell / 600 s Williamson live in the scrapers). Raise for a
+        # one-off backfill; the per-PDF memory makes later runs cheap.
+        for _inp, _env in (
+            ("bell_ocr_budget_secs", "SIFT_BELL_OCR_BUDGET_S"),
+            ("williamson_ocr_budget_secs", "SIFT_WILCO_OCR_BUDGET_S"),
+        ):
+            _v = actor_input.get(_inp)
+            if _v is not None and str(_v).strip() != "" and float(_v) >= 0:
+                os.environ[_env] = str(int(float(_v)))
+                Actor.log.info("%s = %ss for this run", _env, int(float(_v)))
 
         _force_fail = (actor_input.get("force_scraper_fail") or "").strip()
         if _force_fail:
@@ -524,6 +610,7 @@ async def actor_main() -> None:
         # ── Operational toggles ──
         do_notify_slack = bool(actor_input.get("notify_slack", True))
         rebuild_dedup_only = bool(actor_input.get("rebuild_dedup_only", False))
+        rebuild_seal_all = bool(actor_input.get("rebuild_seal_all", False))
         no_reports = bool(actor_input.get("no_reports", False))
         use_proxy = bool(actor_input.get("use_residential_proxy", False))  # Default OFF on Free plan
 
@@ -647,7 +734,8 @@ async def actor_main() -> None:
                 else:
                     Actor.log.info(
                         "Daily mode: no stored last_run_date — scrapers fall back to "
-                        "default window (365 days). Seed KVS via scripts/seed_apify_kvs.py "
+                        "their 30-day default (always widened to the rolling lookback, "
+                        "scrapers/lookback.py). Seed KVS via scripts/seed_apify_kvs.py "
                         "to pick up where local CLI left off."
                     )
 
@@ -704,6 +792,16 @@ async def actor_main() -> None:
                 len(_stored_bsc.get("cases") or {}),
             )
 
+            # -- Load Bell/Williamson foreclosure per-PDF memory (OCR replay cache) --
+            for _cty, _key in _PDF_NOTICE_STATE:
+                _stored_pdf = await kvs.get_value(_key) or _pdfn_state._empty_state()
+                _pdfn_state.inject_apify_state(_cty, _stored_pdf)
+                Actor.log.info(
+                    "Loaded %s foreclosure PDF memory: last_run_date=%s, pdfs=%d",
+                    _cty, _stored_pdf.get("last_run_date") or "(none)",
+                    len(_stored_pdf.get("pdfs") or {}),
+                )
+
             # ── Load per-scraper health baselines (rolling 14-day counts) ──
             _health_baselines = await kvs.get_value(_rh.STATE_KEY) or {}
 
@@ -750,15 +848,16 @@ async def actor_main() -> None:
 
             # ── rebuild_dedup_only branch: seed seen_ids + exit ──
             if rebuild_dedup_only:
-                added = 0
-                for n in notices:
-                    if n._dedup_key not in seen_ids:
-                        seen_ids.add(n._dedup_key)
-                        added += 1
+                # Runs PRE-enrichment, so name-indexed liens/lis pendens have no
+                # address yet and stay open unless rebuild_seal_all is set.
+                added, left_open = _seal_seen_ids(
+                    notices, seen_ids, require_complete=not rebuild_seal_all,
+                )
                 Actor.log.info(
-                    "Rebuild dedup: scraped %d records, added %d raw-address keys "
-                    "(%d already present). Total seen_ids: %d",
-                    len(notices), added, len(notices) - added, len(seen_ids),
+                    "Rebuild dedup: scraped %d records, added %d keys, %d left open "
+                    "(incomplete), %d already present. Total seen_ids: %d",
+                    len(notices), added, left_open,
+                    len(notices) - added - left_open, len(seen_ids),
                 )
                 await kvs.set_value("seen_notice_ids", sorted(seen_ids))
                 await kvs.set_value(
@@ -770,6 +869,8 @@ async def actor_main() -> None:
                     _ce_state.snapshot_apify_state("Travis"),
                 )
                 await kvs.set_value(_bsc_state.KVS_KEY, _bsc_state.snapshot_apify_state())
+                for _cty, _key in _PDF_NOTICE_STATE:
+                    await kvs.set_value(_key, _pdfn_state.snapshot_apify_state(_cty))
                 Actor.log.info("Rebuild complete — exiting without running pipeline")
                 return
 
@@ -844,6 +945,8 @@ async def actor_main() -> None:
                     _ce_state.snapshot_apify_state("Travis"),
                 )
                 await kvs.set_value(_bsc_state.KVS_KEY, _bsc_state.snapshot_apify_state())
+                for _cty, _key in _PDF_NOTICE_STATE:
+                    await kvs.set_value(_key, _pdfn_state.snapshot_apify_state(_cty))
                 if do_notify_slack and config.SLACK_WEBHOOK_URL:
                     try:
                         from slack_notifier import send_slack_notification
@@ -1166,6 +1269,7 @@ async def actor_main() -> None:
             # via datasift_no_skip_trace=False because it costs $0.15/owner
             # and requires account balance.
             rawpipe_results: list[dict] = []
+            _rawpipe_fatal = ""  # set when the whole upload stage dies before per-list results
             if upload_datasift_api and 'csv_infos' in dir() and csv_infos:
                 try:
                     from datasift_api_client import DataSiftAPIClient, DataSiftAPIError
@@ -1258,16 +1362,50 @@ async def actor_main() -> None:
                                     }
                         except Exception as e:
                             Actor.log.exception("Skip-trace stage crashed: %s", e)
+                            for r in rawpipe_results:
+                                if r.get("success") and "skip_trace" not in r:
+                                    r["skip_trace"] = {"success": False, "error": f"stage crashed: {e}"}
 
                 except DataSiftAPIError as e:
                     Actor.log.error(
                         "RAWPIPE auth failed (%d): %s — manual upload still available via the KVS links",
                         e.status, e.body[:200],
                     )
+                    _rawpipe_fatal = f"auth failed (HTTP {e.status}): {e.body[:200]}"
                 except Exception as e:
                     Actor.log.exception("RAWPIPE crashed: %s — manual upload still available", e)
+                    _rawpipe_fatal = f"crashed: {type(e).__name__}: {e}"
             elif upload_datasift_api:
                 Actor.log.warning("upload_datasift_api=true but no DataSift CSVs were generated")
+
+            # ── Upload-failure alert: any list that did not fully land ──
+            # Error-level Slack alert + JSON manifest (KVS rolling history)
+            # naming the CSV, the list, the stage that broke and what to do —
+            # so a failed upload is never just a line in the run log.
+            if upload_datasift_api and 'csv_infos' in dir() and csv_infos:
+                try:
+                    import upload_outcome as _uo
+                    _up_fail = _uo.failures_from_api(
+                        rawpipe_results, csv_infos, drive_links,
+                        fatal_error=_rawpipe_fatal,
+                    )
+                    if _up_fail:
+                        health.record_event(
+                            "error", "datasift upload",
+                            f"{len(_up_fail)} of {len(csv_infos)} list(s) did not "
+                            f"fully land — see the upload alert",
+                        )
+                        _manifest = _uo.report_upload_failures(
+                            _up_fail, out_dir=config.OUTPUT_DIR,
+                            slack=do_notify_slack and bool(config.SLACK_WEBHOOK_URL),
+                            total_lists=len(csv_infos),
+                            run_id=os.environ.get("APIFY_ACTOR_RUN_ID", ""),
+                            manifest_ref=f"KVS key `{_uo.KVS_KEY}` (newest first)",
+                        )
+                        _hist = await kvs.get_value(_uo.KVS_KEY)
+                        await kvs.set_value(_uo.KVS_KEY, _uo.append_history(_hist, _manifest))
+                except Exception:
+                    Actor.log.exception("Upload-failure reporting failed")
 
             # ── Drain Travis texdel buffers to KVS (raw CSVs + reports) ──
             try:
@@ -1474,10 +1612,13 @@ async def actor_main() -> None:
                 Actor.log.exception("Run-health reporting failed")
 
             # ── Persist state for next run ──
-            # Use the pre-pipeline snapshot key so Smarty mutations don't poison dedup.
-            for n in notices:
-                key = getattr(n, "_dedup_key", None) or _notice_dedup_key(n)
-                seen_ids.add(key)
+            # Seal only COMPLETE records (name + address) using the pre-pipeline
+            # snapshot key; incomplete ones stay open for the rolling re-scan.
+            _sealed, _left_open = _seal_seen_ids(notices, seen_ids)
+            Actor.log.info(
+                "Dedup seal: %d new key(s) sealed, %d left open for re-hit",
+                _sealed, _left_open,
+            )
             await kvs.set_value("seen_notice_ids", sorted(seen_ids))
             await kvs.set_value("last_run_date", datetime.now().strftime("%Y-%m-%d"))
             await kvs.set_value(
@@ -1511,6 +1652,8 @@ async def actor_main() -> None:
 
             # -- Persist Travis condemned (BSC) state for next run --
             await kvs.set_value(_bsc_state.KVS_KEY, _bsc_state.snapshot_apify_state())
+            for _cty, _key in _PDF_NOTICE_STATE:
+                await kvs.set_value(_key, _pdfn_state.snapshot_apify_state(_cty))
             Actor.log.info(
                 "Saved Travis BSC state: agendas_seen=%d, cases=%d",
                 len(_bsc_state.snapshot_apify_state().get("seen_docs") or {}),
@@ -1821,27 +1964,44 @@ def _run_csv_import(args) -> None:
         for info in csv_infos:
             logging.info("DataSift CSV (%s): %s", info["label"], info["path"])
 
-        if len(csv_infos) > 1:
-            upload_result = asyncio.run(
-                upload_datasift_split(
-                    csv_infos,
-                    enrich=do_enrich,
-                    skip_trace=do_skip_trace,
+        import upload_outcome as _uo
+        try:
+            if len(csv_infos) > 1:
+                upload_result = asyncio.run(
+                    upload_datasift_split(
+                        csv_infos,
+                        enrich=do_enrich,
+                        skip_trace=do_skip_trace,
+                    )
                 )
-            )
+            else:
+                upload_result = asyncio.run(
+                    upload_to_datasift(
+                        csv_infos[0]["path"],
+                        enrich=do_enrich,
+                        skip_trace=do_skip_trace,
+                    )
+                )
+        except Exception as e:
+            logging.exception("DataSift Playwright upload crashed: %s", e)
+            upload_result = {"success": False, "message": f"uploader crashed: {e}"}
+            _up_fail = _uo.failures_from_exception(e, csv_infos, uploader="playwright")
         else:
-            upload_result = asyncio.run(
-                upload_to_datasift(
-                    csv_infos[0]["path"],
-                    enrich=do_enrich,
-                    skip_trace=do_skip_trace,
-                )
-            )
+            _up_fail = _uo.failures_from_playwright(upload_result, csv_infos)
 
         if upload_result.get("success"):
             logging.info("DataSift upload: %s", upload_result.get("message", "OK"))
         else:
             logging.error("DataSift upload failed: %s", upload_result.get("message"))
+        if _up_fail:
+            try:
+                _uo.report_upload_failures(
+                    _up_fail, out_dir=config.OUTPUT_DIR,
+                    slack=not getattr(args, "no_slack", False) and bool(config.SLACK_WEBHOOK_URL),
+                    total_lists=len(csv_infos),
+                )
+            except Exception:
+                logging.exception("Upload-failure reporting failed (csv-import)")
 
     logging.info("Done — %d records exported", len(notices))
 
@@ -2035,6 +2195,24 @@ def cli_main() -> None:
         type=str,
         default=None,
         help="Override date cutoff (YYYY-MM-DD). Overrides daily/historical mode logic.",
+    )
+    parser.add_argument(
+        "--lookback-days",
+        type=int,
+        default=None,
+        help=(
+            "Rolling daily lookback: every date-windowed scraper re-scans at least "
+            "today minus N days (default 14; env SIFT_DAILY_LOOKBACK_DAYS). Only widens."
+        ),
+    )
+    parser.add_argument(
+        "--rebuild-seal-all",
+        action="store_true",
+        help=(
+            "With --rebuild-dedup: seal EVERY scraped record into seen_ids, including "
+            "incomplete ones (pre-2026-09-09 behaviour). Default seals only records "
+            "that have both an owner name and a property address."
+        ),
     )
     parser.add_argument(
         "--max-notices",
@@ -2930,7 +3108,7 @@ def _run_scrape_pipeline(args, targets) -> None:
                     logging.error("Health Slack send FAILED — webhook missing/dead")
             else:
                 logging.info("Health report (Slack off):\n%s",
-                             _rh.build_health_block(report))
+                             _rh.build_health_block(report, include_warnings=True))
             _health_state_file.parent.mkdir(parents=True, exist_ok=True)
             _health_state_file.write_text(
                 json.dumps(_rh.update_baselines(_health_baselines, health), indent=1)
@@ -2975,6 +3153,10 @@ def _run_scrape_pipeline(args, targets) -> None:
     if args.mode == "daily" and since_arg is None and cli_last_run:
         since_arg = cli_last_run
         logging.info("Daily mode: using stored last_run_date = %s", cli_last_run)
+    _lookback = getattr(args, "lookback_days", None)
+    if _lookback:
+        os.environ["SIFT_DAILY_LOOKBACK_DAYS"] = str(int(_lookback))
+        logging.info("Daily rolling lookback set to %d days for this run", int(_lookback))
 
     notices = asyncio.run(scrape_targets(
         targets=runnable,
@@ -3016,15 +3198,17 @@ def _run_scrape_pipeline(args, targets) -> None:
     # an existing seen_ids.json from post-Smarty keys to raw-address keys
     # after the snapshot fix ships — one-shot operation.
     if getattr(args, "rebuild_dedup", False):
-        added = 0
-        for n in notices:
-            if n._dedup_key not in cli_seen_ids:
-                cli_seen_ids.add(n._dedup_key)
-                added += 1
+        # Runs PRE-enrichment: name-indexed liens/lis pendens have no address
+        # yet and stay open unless --rebuild-seal-all is given.
+        added, left_open = _seal_seen_ids(
+            notices, cli_seen_ids,
+            require_complete=not getattr(args, "rebuild_seal_all", False),
+        )
         logging.info(
-            "Rebuild dedup: scraped %d records, added %d raw-address keys "
-            "(%d already present). Total seen_ids: %d",
-            len(notices), added, len(notices) - added, len(cli_seen_ids),
+            "Rebuild dedup: scraped %d records, added %d keys, %d left open "
+            "(incomplete), %d already present. Total seen_ids: %d",
+            len(notices), added, left_open,
+            len(notices) - added - left_open, len(cli_seen_ids),
         )
         _save_cli_state(cli_seen_ids)
         logging.info("Rebuild complete — exiting without running pipeline.")
@@ -3168,16 +3352,15 @@ def _run_scrape_pipeline(args, targets) -> None:
     # Persist incremental state so tomorrow's daily run skips these records.
     # Uses the same composite dedup key as the filter step — monotonic growth.
     if args.mode == "daily":
-        for n in notices:
-            # Sold rows are tag-update rows, not new leads — never add them to
-            # the seen set (they're off the roll and won't recur as new).
-            if getattr(n, "record_status", "") == "sold":
-                continue
-            # Use the pre-pipeline snapshot key set earlier (Smarty may have
-            # mutated notice.address since then). Fall back to recomputing
-            # if the snapshot somehow wasn't attached (defensive).
-            key = getattr(n, "_dedup_key", None) or _notice_dedup_key(n)
-            cli_seen_ids.add(key)
+        # Seal only COMPLETE records (name + address) using the pre-pipeline
+        # snapshot key (Smarty may have mutated notice.address since). Sold
+        # tag-update rows are never sealed; incomplete records stay open so the
+        # rolling lookback re-hits them once the clerk completes them.
+        _sealed, _left_open = _seal_seen_ids(notices, cli_seen_ids)
+        logging.info(
+            "Dedup seal: %d new key(s) sealed, %d left open for re-hit",
+            _sealed, _left_open,
+        )
         _save_cli_state(cli_seen_ids)
 
     # Generate deep-prospecting PDFs for deceased/DM/heir records.
@@ -3380,10 +3563,11 @@ def _run_scrape_pipeline(args, targets) -> None:
         # user wants skip-trace, fall back to the Playwright path after upload.
         do_skip_trace = not getattr(args, "no_skip_trace", False)
         api_failed = False
+        api_results: list[dict] = []
+        _rawpipe_fatal = ""  # set when the stage dies before per-list results
 
         try:
             client = DataSiftAPIClient.from_env()
-            api_results = []
             for info in csv_infos:
                 # List name is the bare notice-type label, e.g. "Foreclosure",
                 # "Tax Delinquent", "Probate". Records from different runs
@@ -3427,9 +3611,11 @@ def _run_scrape_pipeline(args, targets) -> None:
         except DataSiftAPIError as e:
             logging.error("RAWPIPE upload failed (%s): %s", e.status, e.body[:200])
             api_failed = True
+            _rawpipe_fatal = f"HTTP {e.status}: {e.body[:200]}"
         except Exception as e:
             logging.exception("RAWPIPE crashed: %s", e)
             api_failed = True
+            _rawpipe_fatal = f"crashed: {type(e).__name__}: {e}"
 
         # Skip-trace via the direct API. Endpoint: POST /api/internal/property/skip-trace/
         # Body filters by `all_lists` for each uploaded list. Defaults to `clean`
@@ -3455,6 +3641,7 @@ def _run_scrape_pipeline(args, targets) -> None:
                             "list_name": title, "success": False,
                             "message": "list not found in account after upload"
                         })
+                        r["skip_trace"] = {"success": False, "error": "list not found after upload"}
                         continue
                     try:
                         api_resp = client.skip_trace_list(
@@ -3485,6 +3672,7 @@ def _run_scrape_pipeline(args, targets) -> None:
                             "success": False, "status": e.status,
                             "message": e.body[:200],
                         })
+                        r["skip_trace"] = {"success": False, "error": f"HTTP {e.status}: {e.body[:200]}"}
 
                 upload_result["skip_trace_result"] = {
                     "success": all(x.get("success") for x in st_results),
@@ -3496,6 +3684,9 @@ def _run_scrape_pipeline(args, targets) -> None:
                 upload_result["skip_trace_result"] = {
                     "success": False, "message": str(e),
                 }
+                for r in api_results:
+                    if r.get("success") and "skip_trace" not in r:
+                        r["skip_trace"] = {"success": False, "error": f"stage crashed: {e}"}
 
         # If RAWPIPE failed, fall through to the Playwright --upload-datasift
         # path below (if the user passed both flags) or stay in manual mode.
@@ -3505,24 +3696,73 @@ def _run_scrape_pipeline(args, targets) -> None:
                 "Pass --upload-datasift to also try the Playwright path as a fallback."
             )
 
+        # Upload-failure alert (RAWPIPE): Slack + manifest naming every list
+        # that did not fully land and what to do about it.
+        try:
+            import upload_outcome as _uo
+            _up_fail = _uo.failures_from_api(
+                api_results, csv_infos, drive_links, fatal_error=_rawpipe_fatal,
+            )
+            if _up_fail:
+                health.record_event(
+                    "error", "datasift upload",
+                    f"{len(_up_fail)} of {len(csv_infos)} list(s) did not fully land "
+                    f"(api) — see the upload alert",
+                )
+                _uo.report_upload_failures(
+                    _up_fail, out_dir=config.OUTPUT_DIR,
+                    slack=not getattr(args, "no_slack", False) and bool(config.SLACK_WEBHOOK_URL),
+                    total_lists=len(csv_infos),
+                )
+        except Exception:
+            logging.exception("Upload-failure reporting failed (RAWPIPE)")
+
     # Optional Playwright auto-upload to DataSift on top of the Drive flow
     if getattr(args, "upload_datasift", False):
         from datasift_uploader import upload_to_datasift, upload_datasift_split
+        import upload_outcome as _uo
         do_enrich = not getattr(args, "no_enrich", False)
         do_skip_trace = not getattr(args, "no_skip_trace", False)
 
-        if len(csv_infos) > 1:
-            auto_result = asyncio.run(
-                upload_datasift_split(
-                    csv_infos, enrich=do_enrich, skip_trace=do_skip_trace,
+        # A crash inside the uploader used to take the whole run down with it
+        # (no Slack, no health report). Catch it, treat every list as lost,
+        # and let the failure alert below name them.
+        try:
+            if len(csv_infos) > 1:
+                auto_result = asyncio.run(
+                    upload_datasift_split(
+                        csv_infos, enrich=do_enrich, skip_trace=do_skip_trace,
+                    )
                 )
+            else:
+                auto_result = asyncio.run(
+                    upload_to_datasift(
+                        csv_infos[0]["path"], enrich=do_enrich, skip_trace=do_skip_trace,
+                    )
+                )
+        except Exception as e:
+            logging.exception("DataSift Playwright upload crashed: %s", e)
+            auto_result = {"success": False, "message": f"uploader crashed: {e}"}
+            _up_fail = _uo.failures_from_exception(
+                e, csv_infos, drive_links, uploader="playwright",
             )
         else:
-            auto_result = asyncio.run(
-                upload_to_datasift(
-                    csv_infos[0]["path"], enrich=do_enrich, skip_trace=do_skip_trace,
+            _up_fail = _uo.failures_from_playwright(auto_result, csv_infos, drive_links)
+
+        if _up_fail:
+            try:
+                health.record_event(
+                    "error", "datasift upload",
+                    f"{len(_up_fail)} of {len(csv_infos)} list(s) did not fully land "
+                    f"(playwright) — see the upload alert",
                 )
-            )
+                _uo.report_upload_failures(
+                    _up_fail, out_dir=config.OUTPUT_DIR,
+                    slack=not getattr(args, "no_slack", False) and bool(config.SLACK_WEBHOOK_URL),
+                    total_lists=len(csv_infos),
+                )
+            except Exception:
+                logging.exception("Upload-failure reporting failed (Playwright)")
 
         if auto_result.get("success"):
             logging.info("DataSift upload: %s", auto_result.get("message", "OK"))

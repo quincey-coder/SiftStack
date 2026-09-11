@@ -151,21 +151,17 @@ class TravisCodeEnforcementScraper:
     """Open Austin Code complaint cases via the public Socrata SODA API."""
 
     def _since_iso(self, mode: str, since_date: str | None) -> str:
-        """Compute the opened_date lower bound as a SoQL floating timestamp."""
-        if mode == "historical":
-            cutoff = datetime.now() - timedelta(days=HISTORICAL_DAYS)
-        elif since_date:
-            try:
-                cutoff = datetime.strptime(since_date, "%Y-%m-%d")
-            except ValueError:
-                logger.warning(
-                    "Invalid since_date %r — defaulting to last %d days",
-                    since_date, DAILY_DEFAULT_DAYS,
-                )
-                cutoff = datetime.now() - timedelta(days=DAILY_DEFAULT_DAYS)
-        else:
-            cutoff = datetime.now() - timedelta(days=DAILY_DEFAULT_DAYS)
-        return cutoff.strftime("%Y-%m-%dT00:00:00")
+        """Compute the opened_date lower bound as a SoQL floating timestamp.
+
+        Uses the shared rolling lookback (>= 14 days) so cases whose owner
+        lookup failed on first sight are re-hit inside the window.
+        """
+        from scrapers.lookback import since_iso
+
+        return since_iso(
+            mode, since_date, default_days=DAILY_DEFAULT_DAYS,
+            historical_days=HISTORICAL_DAYS, log_label="Travis code enforcement",
+        )
 
     def _fetch_page(self, where: str, offset: int, select: str | None = None) -> list[dict]:
         params = {

@@ -132,6 +132,33 @@ days (date filter silently not applied). The anti-silence layer:
   result-cap/window spikes, Zillow failure share >30%, guardrail trips,
   validator warnings, registry gaps. `Actor.set_status_message` carries the
   verdict; `Actor.fail` only when EVERY target hard-failed.
+- **Warnings are LOG-ONLY in Slack (owner request 2026-09-11).** Only
+  error-level findings (hard fails, parse-zero, guardrail trips, schema
+  alarms, registry gaps) are bullet lines in the health block. Warn-level
+  findings (zero-streaks, result-cap/spike, validator warnings, Zillow
+  failure share) go to `HealthReport.warnings`, are written to the run log
+  by `run_health.log_warnings` (`health warn (log-only…)`) and appear in
+  Slack only as one `N warnings in the run log` count line. Warnings never
+  turn the run red (`healthy` ignores them). `build_health_block(...,
+  include_warnings=True)` is the log/`--no-slack` rendering. Don't add
+  `:warning:` bullets back.
+- **DataSift upload failures alert loudly** (`src/upload_outcome.py`, wired
+  into every upload path: Actor RAWPIPE, CLI `--upload-datasift` Playwright,
+  CLI `--upload-datasift-api`, `csv-import --upload-datasift`). Per-list
+  `UploadFailure` with a stage (`login` / `upload` / `not_attempted` —
+  `upload_datasift_split` STOPS at the first failed CSV — / `enrich` /
+  `skip_trace` / `crash`), an error-level Slack block naming the CSV, list,
+  stage, Drive link and what to do, a JSON manifest
+  (`output/upload_failures/upload_failures_<ts>.json`; Apify KVS
+  `datasift_upload_failures`, newest-first rolling 30), and a
+  `datasift upload` health event so the Actor status reads UNHEALTHY.
+  Retry: `python src/upload_outcome.py retry <manifest.json> [--csv-dir DIR]`
+  re-uploads only the lists whose records never landed and re-runs only the
+  missed bulk action on lists that did. NOTE: the Actor has NO Playwright
+  upload path — cloud runs only upload via RAWPIPE when `upload_datasift_api`
+  is on (it is off in production and blocked by the read-only client), so
+  the CRM upload today is the operator-run Playwright/wizard from the Drive
+  CSVs. Tests: `tests/test_run_health_slack.py`, `tests/test_upload_outcome.py`.
 - **`ScraperError(msg, partial=[...])`** (`scrapers/__init__.py`) — scrapers
   raise instead of returning `[]`; partial results still flow. The per-target
   handler records health and keeps going. One central retry re-runs a scraper
@@ -162,11 +189,54 @@ names** (the Name cell is bare `[R]`/`[E]` markers) for several days until the
 clerk verifies them. A 1-day daily window therefore only ever saw nameless rows
 → parser kept 0 → **Travis probate and lis pendens produced nothing for 30+
 days while "Search returned N records" logged daily.** Fix:
-`tccsearch_common.effective_from_date` widens every daily window by
-`TCC_INDEX_LAG_DAYS` (default 7) so filings are re-scanned once verified —
-cross-run `seen_notice_ids` dedup absorbs the repeats. All four tccsearch
-scrapers use it. The parse-zero alarm stays quiet when ALL returned rows are
-still Temp (`count_temp_rows`) and fires otherwise.
+`tccsearch_common.effective_from_date` widens every daily window to the shared
+rolling lookback (14 days, below); `TCC_INDEX_LAG_DAYS` can only widen it
+further (backfill lever) — cross-run `seen_notice_ids` dedup absorbs the
+repeats. All four tccsearch scrapers use it. The parse-zero alarm stays quiet
+when ALL returned rows are still Temp (`count_temp_rows`) and fires otherwise.
+
+### Rolling 14-day re-scan + completeness seal + PDF memory (2026-09-09)
+
+Clerks post rows INCOMPLETE and fill them in later (Travis Temp index, Bell
+re-posted PDFs, Odyssey/GovOS parties added days after). Three rules, all
+built the same day after the foreclosure audit found the scrapers delivering
+~⅓ of what the courthouses post:
+
+- **Every date-windowed scraper re-scans at least today−14 .. today**
+  (`scrapers/lookback.py::daily_window`, only ever WIDENS; env
+  `SIFT_DAILY_LOOKBACK_DAYS`, actor `daily_lookback_days`, CLI
+  `--lookback-days`). Applied to the 4 tccsearch scrapers, Bell/Williamson
+  probate, lien and lis pendens (publicsearch + Tyler), fire damage and code
+  enforcement. `publicsearch_common.sanity_cap_for` scales the "date filter
+  did NOT apply" probe with the window (500 per started 7-day block, off
+  past 31 days) so the wider window doesn't disable the guard.
+- **A record is sealed into `seen_notice_ids` ONLY when it has BOTH an owner
+  identity AND a property address** (`main._is_complete_for_seen` /
+  `_seal_seen_ids`, used at all four seed sites). Incomplete records stay
+  open and are re-hit inside the window. Sold rows are never sealed.
+  `--rebuild-dedup` seals only complete records too; `--rebuild-seal-all` /
+  actor `rebuild_seal_all` is the escape hatch. Watch the "left OPEN for
+  re-hit" log line — sustained >~25/day means the re-enrichment cost needs a
+  pending tier.
+- **Scanned-PDF foreclosure sources remember every PDF**
+  (`scrapers/pdf_notice_state.py`, KVS `bell_foreclosure_state` /
+  `williamson_foreclosure_state`, local `data/{county}_foreclosure_state/`):
+  sha256+size, pages OCR'd, partial text while unfinished, and the parsed
+  notices, so a daily run REPLAYS known PDFs for free and spends the OCR
+  budget (`scrapers/pdf_ocr.py`, per-`scrape()` object — Bell 900 s via
+  `SIFT_BELL_OCR_BUDGET_S`/`bell_ocr_budget_secs`, Williamson 600 s via
+  `SIFT_WILCO_OCR_BUDGET_S`/`williamson_ocr_budget_secs`) only on new,
+  re-posted or unfinished PDFs. Bell's old 420 s module-global budget was
+  re-spent on the same first ~4 PDFs every run, so PDFs 5+ of the month were
+  NEVER read. Williamson's index is parsed with pdfminer's layout API
+  (`foreclosure_wilco.extract_index_rows`, ENTRY NO self-check; the clerk's
+  2026 layout broke the old text-block zip → 7 garbage rows of 75), and a
+  month with no index yet is read notice-PDF-by-notice-PDF under the budget
+  (`_scrape_notice_pdfs`, shared `scrapers/trustee_notice_parse.py`). Both
+  set `last_meta` (`returned`/`kept`) so run-health's parse-zero alarm can
+  fire. Smoke/`max_notices` runs never write this state. Backfill: one run
+  with `bell_ocr_budget_secs=2400`, `williamson_ocr_budget_secs=3600`,
+  `tcc_lookback_days=60`, `daily_lookback_days=60`.
 
 ### Other hard-won source facts (2026-08-18)
 - **Williamson Tyler portal fronts an AWS WAF "Human Verification" challenge**
@@ -616,11 +686,38 @@ NOT upload (DataSift API is read-only — the CSV goes through the wizard).
   first (invalid → Drop → Dial Fourth → unscored → Dial Third) to fit `--phone-cap`
   (default 30). Same algorithm as `clean_directskip.py` (shared logic, not shared code —
   the skill is a self-contained distributable and can't import `src`).
-- **Money:** `estimate` spends nothing. `run` is gated by a hard `--max-cost` ceiling
-  across all three; SmartSkip's card charge additionally needs `--confirm` (mirrors
-  `smartskip.pay`). DirectSkip no-match is free; Trestle dedupes before billing; if the
-  Trestle budget is short, the cheapest-to-skip numbers stay UNSCORED (logged), never
-  silently dropped. Rates: SmartSkip $0.15, DirectSkip $0.10, Trestle $0.015/number.
+- **Money:** `estimate` spends nothing. **`run` is a code-enforced HARD STOP (owner
+  requirement 2026-09-11) — approval comes only from the owner, in chat or at a
+  terminal:**
+  1. `estimate` writes a PENDING approval (`data/skip_orchestrator/pending_approval.json`:
+     file + ceiling (default = high estimate rounded up) + batch; 60-min TTL).
+  2. The owner replies "yes" (or "yes, cap $X") in chat. The **UserPromptSubmit**
+     hook `.claude/hooks/skip_spend_approve.py` fires ONLY on the owner's own
+     messages, so Claude can't trigger it. It calls `approve_pending()` → one-time
+     `approval_token.json` (15-min TTL) and shows "Skip-trace spend APPROVED".
+     A conditional yes ("yes but only…") does NOT approve; "no"/"cancel" discards
+     the pending.
+  3. `run` → `request_approval()`: at a real TTY the person types the ceiling back;
+     otherwise it needs a fresh token matching the exact file + ceiling + batch +
+     vendor set, and burns it. No token → `STOPPED: Not approved`, nothing spent.
+     Fail-closed: if a hook breaks, no token exists and nothing spends.
+  4. The **PreToolUse** guard `.claude/hooks/skip_spend_gate.py` DENIES shell or
+     Write/Edit access to the pending/token files and the approval internals
+     (`import skip_orchestrator`, `approve_pending`, `SpendApproval`, …), so Claude
+     can't forge a token.
+  Hooks are wired in `.claude/settings.local.json`. `.claude/` is gitignored, so they
+  exist on the operator box only. Why not a permission prompt: the owner's session
+  runs in **auto** mode, where a hook's "ask" isn't guaranteed to prompt (verified
+  live — the hook fired and reported `permission_mode=auto`). `run()` refuses without
+  the `SpendApproval` only `request_approval()` issues. Never add a bypass. The old
+  `--confirm` flag is gone. `--max-cost` is a hard ceiling across all
+  three; SmartSkip's charge is counted the moment `pay()` is attempted, so an order
+  that fails AFTER billing can no longer hand DirectSkip + Trestle the full ceiling
+  again (it overran $0.80 → $1.20 before 2026-09-11). DirectSkip no-match is free;
+  Trestle dedupes before billing; if the Trestle budget is short, the
+  cheapest-to-skip numbers stay UNSCORED (logged), never silently dropped. Rates:
+  SmartSkip $0.15, DirectSkip $0.10, Trestle $0.015/number (+ unpriced litigator add-on,
+  not covered by the ceiling).
 - **Litigator (TCPA):** Trestle's `litigator_checks` add-on is ON for every number
   (`DEFAULT_ADD_LITIGATOR`, verified in the live run). A flagged number is **withheld
   from the dial slots entirely** (never uploaded to a Phone column) but kept in Notes,
@@ -632,9 +729,12 @@ NOT upload (DataSift API is read-only — the CSV goes through the wizard).
   + provider tags (`SmartSkip`/`DirectSkip` — whoever contributed) + `living`/`deceased`.
   Per-number tier/provider/relative labels live in **Notes** (the guaranteed channel;
   DataSift appends behind existing phones, so labels are number-keyed, never slot-keyed).
-- **CLI:** `python src/skip_orchestrator.py estimate --input export.csv` /
-  `... run --input export.csv --max-cost 50 --confirm --out upload.csv`. Skill:
-  `datasift-skiptrace-run`. Tests: `tests/test_skip_orchestrator.py` (11, offline).
+- **CLI:** `python src/skip_orchestrator.py estimate --input export.csv [--max-cost N]`
+  → owner says yes → `... run --input export.csv --max-cost N --out upload.csv`.
+  Skill: project-local `.claude/skills/datasift-skiptrace-run/SKILL.md` (estimate →
+  "Good to go?" → run on the approval context). Tests: `tests/test_skip_orchestrator.py`
+  (25, offline, incl. an unpatched subprocess run proving an unapproved `run` stops) +
+  `tests/test_skip_spend_gate.py` (10, drives both real hook processes).
   `run` continues DirectSkip-only if SmartSkip fails, so output is always produced.
 - **Loader note:** DataSift EXPORTS use Title-first-word headers (`Property address`,
   `Apn`, `First Name`); the loader matches case/punctuation-insensitively, prefers the
