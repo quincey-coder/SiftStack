@@ -19,6 +19,14 @@ The anti-silence layer for the daily pipeline. Three pieces:
    A totally-failed run and a genuinely quiet day must look different, so the
    health message is sent unconditionally — outside the publish gate, even
    (especially) when the run produced zero notices.
+
+   **Warnings are LOG-ONLY (owner request, 2026-09-11).** Only error-level
+   findings (hard scraper failures, parse-zero regressions, guardrail trips,
+   schema alarms, registry gaps) reach Slack. Warn-level findings
+   (zero-streaks vs baseline, result-cap/window spikes, validator warnings,
+   Zillow failure share) are collected on ``HealthReport.warnings``, written
+   to the run log by ``log_warnings()`` so they can always be looked back on,
+   and summarised in Slack as a single count line — never as bullet lines.
 """
 
 from __future__ import annotations
@@ -155,8 +163,9 @@ class HealthReport:
 
     date: str
     scrapers: list[ScraperHealth]
-    flags: list[str] = field(default_factory=list)        # scraper-level alert lines
-    event_lines: list[str] = field(default_factory=list)  # guardrails/validator/alarms
+    flags: list[str] = field(default_factory=list)        # scraper-level ERROR lines (Slack)
+    event_lines: list[str] = field(default_factory=list)  # ERROR events: guardrails/alarms/gaps (Slack)
+    warnings: list[str] = field(default_factory=list)     # warn-level findings — LOG ONLY
     ok: int = 0
     zero: int = 0
     fail: int = 0
@@ -171,7 +180,8 @@ class HealthReport:
 
     @property
     def healthy(self) -> bool:
-        return not self.flags and not self.event_lines and not self.zillow_flagged
+        """Error-level findings only — warnings never turn the run red."""
+        return not self.flags and not self.event_lines
 
 
 def _history_counts(entry: dict) -> list[int]:
@@ -224,8 +234,8 @@ def analyze(health: RunHealth, baselines: dict | None) -> HealthReport:
                     f"(parser/grid regression)"
                 )
             elif median >= 3 and zero_streak + 1 >= 2:
-                report.flags.append(
-                    f":warning: {s.key} — 0 records {zero_streak + 1} days running "
+                report.warnings.append(
+                    f"{s.key} — 0 records {zero_streak + 1} days running "
                     f"(baseline ~{median:.0f}/day)"
                 )
             continue
@@ -242,25 +252,28 @@ def analyze(health: RunHealth, baselines: dict | None) -> HealthReport:
         if smoke_capped:
             pass  # capped by the run's own max_notices — not a source signal
         elif s.evidence.get("hit_cap"):
-            report.flags.append(
-                f":warning: {s.key} — hit the source's result cap ({s.count})"
+            report.warnings.append(
+                f"{s.key} — hit the source's result cap ({s.count})"
                 + (f" for a {window_days}-day window" if window_days else "")
                 + ": date filter likely not applied"
             )
         elif window_days is not None and int(window_days) <= 2 and s.count > spike_threshold:
             base = f"baseline ~{median:.0f}" if median else "no baseline"
-            report.flags.append(
-                f":warning: {s.key} — {s.count} results for a {window_days}-day "
+            report.warnings.append(
+                f"{s.key} — {s.count} results for a {window_days}-day "
                 f"window ({base}): date filter likely not applied"
             )
 
     ran = report.ok + report.zero + report.fail
     report.all_failed = ran > 0 and report.fail == ran
 
-    # Run-level events (guardrail trips, validator warnings, schema alarms, gaps)
+    # Run-level events: errors (guardrail trips, schema alarms) go to Slack;
+    # warn-severity events (validator warnings, …) are log-only.
     for severity, source, message in health.events:
-        icon = ":rotating_light:" if severity == "error" else ":warning:"
-        report.event_lines.append(f"{icon} {source}: {message}")
+        if severity == "error":
+            report.event_lines.append(f":rotating_light: {source}: {message}")
+        else:
+            report.warnings.append(f"{source}: {message}")
     for county, ntype in health.registry_gaps:
         report.event_lines.append(
             f":rotating_light: registry: {county.title()}/{ntype} has NO scraper "
@@ -278,8 +291,9 @@ def analyze(health: RunHealth, baselines: dict | None) -> HealthReport:
             + (f" · {failed} failed ({share:.0%})" if failed else "")
         )
         if share > ZILLOW_FAIL_SHARE and attempted >= ZILLOW_MIN_ATTEMPTS:
+            # The Slack line stays plain; the judgement is a log-only warning.
             report.zillow_flagged = True
-            report.zillow_line = ":warning: " + report.zillow_line + " — failure share high"
+            report.warnings.append(report.zillow_line + " — failure share high")
 
     return report
 
@@ -306,8 +320,13 @@ def update_baselines(baselines: dict | None, health: RunHealth) -> dict:
 # ── Reporting ────────────────────────────────────────────────────────
 
 
-def build_health_block(report: HealthReport) -> str:
-    """Render the health message. NEVER returns "" — that's the whole point."""
+def build_health_block(report: HealthReport, *, include_warnings: bool = False) -> str:
+    """Render the health message. NEVER returns "" — that's the whole point.
+
+    Slack gets ERROR-level lines only. Warn-level findings are summarised as
+    one count line; pass ``include_warnings=True`` for the full text (used
+    when the block goes to the log instead of the channel).
+    """
     ran = report.ok + report.zero + report.fail
     icon = ":white_check_mark:" if report.healthy else ":rotating_light:"
     lines = [
@@ -319,11 +338,17 @@ def build_health_block(report: HealthReport) -> str:
     if report.zillow_line:
         lines.append(report.zillow_line)
     lc = report.log_counts
-    if lc:
-        lines.append(f"Logs: {lc.get('errors', 0)} ERROR · {lc.get('warnings', 0)} WARN")
-        if lc.get("errors") and lc.get("last_errors") and not report.healthy:
+    if lc and lc.get("errors"):
+        lines.append(f"Logs: {lc.get('errors', 0)} ERROR")
+        if lc.get("last_errors") and not report.healthy:
             for msg in list(lc["last_errors"])[-3:]:
                 lines.append(f"    ↳ {msg}")
+    if report.warnings:
+        if include_warnings:
+            lines.extend(f"• warn: {w}" for w in report.warnings)
+        else:
+            n = len(report.warnings)
+            lines.append(f"{n} warning{'s' if n != 1 else ''} in the run log (not shown here)")
     if report.known_gaps:
         gaps = ", ".join(f"{c.title()}/{t}" for c, t in report.known_gaps)
         lines.append(f"Known gaps (no scraper yet): {gaps}")
@@ -334,11 +359,18 @@ def build_health_block(report: HealthReport) -> str:
     return "\n".join(lines)
 
 
+def log_warnings(report: HealthReport) -> None:
+    """Write every warn-level finding to the run log — the only place they go."""
+    for w in report.warnings:
+        logger.warning("health warn (log-only, not sent to Slack): %s", w)
+
+
 def send_health_report(report: HealthReport, webhook_url: str | None = None) -> bool:
     """Send the health block. Returns False on a dead/missing webhook so the
     caller can surface THAT failure too (Actor status message)."""
     from slack_notifier import _send_webhook
 
+    log_warnings(report)
     sent = _send_webhook(build_health_block(report), webhook_url)
     if sent:
         logger.info("Health report sent to Slack (%s)",
@@ -355,15 +387,13 @@ def format_status_message(report: HealthReport) -> str:
         return (f"OK: {ran} targets ({report.ok} ok/{report.zero} zero) · "
                 f"{report.notices_total} notices")
     parts = [f"UNHEALTHY: {report.fail} failed/{report.zero} zero of {ran}"]
-    # Name the first reason — scraper flag, then run-level event, then Zillow —
-    # so the console status is actionable, not just a verdict.
+    # Name the first reason — scraper flag, then run-level event — so the
+    # console status is actionable, not just a verdict.
     first = ""
     if report.flags:
         first = report.flags[0]
     elif report.event_lines:
         first = report.event_lines[0]
-    elif report.zillow_flagged:
-        first = report.zillow_line
     if first:
         for token in (":rotating_light: ", ":warning: "):
             first = first.replace(token, "")

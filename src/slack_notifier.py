@@ -317,7 +317,7 @@ def build_rawpipe_block(
                     f"  :mag: skip-trace queued ({st.get('records', '?')} records, ${st.get('cost', '?')})"
                 )
             else:
-                lines.append(f"  :warning: skip-trace failed: {str(st.get('error', ''))[:80]}")
+                lines.append(f"  ✗ skip-trace failed: {str(st.get('error', ''))[:80]}")
 
         # Drive CSV link (if uploaded to Drive)
         drive_url = drive_by_label.get(list_name)
