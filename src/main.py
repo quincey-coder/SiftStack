@@ -614,10 +614,34 @@ async def actor_main() -> None:
         no_reports = bool(actor_input.get("no_reports", False))
         use_proxy = bool(actor_input.get("use_residential_proxy", False))  # Default OFF on Free plan
 
-        # ── DataSift auto-upload (RAWPIPE) toggles ──
-        upload_datasift_api = bool(actor_input.get("upload_datasift_api", False))
+        # ── DataSift auto-upload (the upload wizard, driven by Playwright) ──
+        # Same path the operator runs by hand: headed Chromium under the
+        # Actor's xvfb-run, one wizard pass per CSV onto the record type's
+        # ESTABLISHED list, then enrich + skip-trace anchored on this run's
+        # batch tag. The internal API stays read-only (owner policy
+        # 2026-08-12); `upload_datasift_api` is the retired RAWPIPE key and
+        # is honoured only as an alias so an old stored schedule input still
+        # means "upload".
+        upload_datasift = bool(actor_input.get("upload_datasift", False))
+        if not upload_datasift and actor_input.get("upload_datasift_api"):
+            Actor.log.warning(
+                "upload_datasift_api is retired (RAWPIPE removed) — treating it as "
+                "upload_datasift=true: the upload goes through the wizard"
+            )
+            upload_datasift = True
         datasift_do_enrich = not bool(actor_input.get("datasift_no_enrich", False))
-        datasift_do_skip_trace = not bool(actor_input.get("datasift_no_skip_trace", True))
+        # Skip-trace is the account's unlimited plan — no per-record cost —
+        # so it defaults ON like the operator's manual batches.
+        datasift_do_skip_trace = not bool(actor_input.get("datasift_no_skip_trace", False))
+        # Per-run batch tag: every uploaded row carries it, and the bulk
+        # actions select by it (never by the established list).
+        from datetime import datetime as _dt_bt
+        _batch_tag = f"upload_{_dt_bt.now().strftime('%Y-%m-%d')}" if upload_datasift else None
+        if upload_datasift and not (config.DATASIFT_EMAIL and config.DATASIFT_PASSWORD):
+            Actor.log.error(
+                "upload_datasift=true but datasift_email / datasift_password are not set — "
+                "the upload will fail at login"
+            )
 
         # ── Filter targets ──
         targets = _filter_targets(counties, types)
@@ -1149,12 +1173,14 @@ async def actor_main() -> None:
             # ── DataSift CSVs (DMs + Heirs) → KVS + Drive ──
             datasift_csv_urls: list[dict] = []
             drive_links: list[dict] = []
+            csv_infos: list[dict] = []
             _publish_ok = True  # set by the output-validation gate below
             try:
                 from datasift_formatter import write_datasift_by_notice_type
                 csv_infos = write_datasift_by_notice_type(
                     notices, keep_government=keep_government,
                     split_by_county=config.DATASIFT_SPLIT_BY_COUNTY,
+                    batch_tag=_batch_tag,
                 )
 
                 # ── Output validation gate (before KVS/Drive/Slack publish) ──
@@ -1262,138 +1288,73 @@ async def actor_main() -> None:
             except Exception as e:
                 Actor.log.warning("Cleanup CSV generation failed: %s", e)
 
-            # ── RAWPIPE: direct API upload to apiv2.reisift.io ──
-            # Runs only when the user explicitly enables it. Each CSV
-            # (one per notice type) becomes its own DataSift list named
-            # "SiftStack {YYYY-MM-DD} - {label}". Skip-trace is opt-in
-            # via datasift_no_skip_trace=False because it costs $0.15/owner
-            # and requires account balance.
-            rawpipe_results: list[dict] = []
-            _rawpipe_fatal = ""  # set when the whole upload stage dies before per-list results
-            if upload_datasift_api and 'csv_infos' in dir() and csv_infos:
-                try:
-                    from datasift_api_client import DataSiftAPIClient, DataSiftAPIError
-                    from datetime import datetime as _dt
-
-                    Actor.log.info("RAWPIPE: connecting to apiv2.reisift.io…")
-                    api_client = DataSiftAPIClient.from_env()
-
-                    for info in csv_infos:
-                        # List name is the bare notice-type label, e.g.
-                        # "Foreclosure", "Tax Delinquent", "Probate". Records
-                        # from different runs merge into a single per-type
-                        # list — the date lives on each record's Date Added
-                        # column, not on the list name.
-                        list_name = info["label"]
-                        try:
-                            r = api_client.upload_csv(
-                                Path(info["path"]),
-                                list_name=list_name,
-                                tags=["Courthouse Data"],
-                                upload_type="new_properties",
-                                enrich_property=datasift_do_enrich,
-                                enrich_owner=False,  # protect PR/DM mapping
-                            )
-                            rawpipe_results.append({
-                                "label": info["label"],
-                                "list_name": list_name,
-                                "success": r.get("success"),
-                                "line_count": r.get("line_count"),
-                                "verified_in_lists": r.get("verified_in_lists"),
-                            })
-                            Actor.log.info(
-                                "RAWPIPE: %s → list=%r records=%s verified=%s",
-                                info["label"], list_name,
-                                r.get("line_count"), r.get("verified_in_lists"),
-                            )
-                        except DataSiftAPIError as e:
-                            Actor.log.error(
-                                "RAWPIPE: %s upload failed (%d): %s",
-                                info["label"], e.status, e.body[:200],
-                            )
-                            rawpipe_results.append({
-                                "label": info["label"],
-                                "list_name": list_name,
-                                "success": False,
-                                "error": f"HTTP {e.status}: {e.body[:200]}",
-                            })
-
-                    # Skip-trace (opt-in). Soft-fails on "Insufficient balance!".
-                    if datasift_do_skip_trace and any(r.get("success") for r in rawpipe_results):
-                        try:
-                            live_lists = api_client.list_lists(limit=200)
-                            by_title = {l["title"]: l["uuid"] for l in live_lists}
-                            st_tag = f"skip_traced_{_dt.now().strftime('%Y-%m')}"
-                            for r in rawpipe_results:
-                                if not r.get("success"):
-                                    continue
-                                uuid = by_title.get(r["list_name"])
-                                if not uuid:
-                                    Actor.log.warning(
-                                        "Skip-trace: list %r not found post-upload",
-                                        r["list_name"],
-                                    )
-                                    continue
-                                try:
-                                    st_resp = api_client.skip_trace_list(
-                                        uuid, tags=[st_tag], estimate=False,
-                                    )
-                                    Actor.log.info(
-                                        "Skip-trace queued for %r: records=%s cost=$%s",
-                                        r["list_name"],
-                                        st_resp.get("number_of_records"),
-                                        st_resp.get("cost"),
-                                    )
-                                    r["skip_trace"] = {
-                                        "success": True,
-                                        "records": st_resp.get("number_of_records"),
-                                        "cost": st_resp.get("cost"),
-                                    }
-                                except DataSiftAPIError as e:
-                                    is_balance = "Insufficient balance" in (e.body or "")
-                                    log_fn = Actor.log.warning if is_balance else Actor.log.error
-                                    log_fn(
-                                        "Skip-trace for %r: HTTP %d — %s",
-                                        r["list_name"], e.status, e.body[:200],
-                                    )
-                                    r["skip_trace"] = {
-                                        "success": False,
-                                        "error": f"HTTP {e.status}: {e.body[:200]}",
-                                    }
-                        except Exception as e:
-                            Actor.log.exception("Skip-trace stage crashed: %s", e)
-                            for r in rawpipe_results:
-                                if r.get("success") and "skip_trace" not in r:
-                                    r["skip_trace"] = {"success": False, "error": f"stage crashed: {e}"}
-
-                except DataSiftAPIError as e:
-                    Actor.log.error(
-                        "RAWPIPE auth failed (%d): %s — manual upload still available via the KVS links",
-                        e.status, e.body[:200],
+            # ── DataSift auto-upload: the upload wizard via Playwright ──
+            # The operator's manual batch procedure (2026-08-23 → 09-16),
+            # automated: login → one wizard pass per CSV onto the record
+            # type's ESTABLISHED list (existing_list=True — never a custom
+            # batch list, owner rule 2026-08-20) → wait for the async import
+            # → ONE enrich + ONE skip-trace anchored on this run's batch tag.
+            # Runs headed under the Actor's xvfb-run (DISPLAY is set). The
+            # cleanup CSV (Sold/Resolved) is deliberately NOT uploaded here.
+            upload_result: dict = {}
+            _up_fail: list = []
+            if upload_datasift and _publish_ok and csv_infos:
+                import upload_outcome as _uo
+                _ds_headed = bool(os.environ.get("DISPLAY")) or sys.platform == "win32"
+                if not _ds_headed:
+                    Actor.log.warning(
+                        "DataSift upload: no DISPLAY — running the wizard HEADLESS "
+                        "(the Actor normally runs under xvfb-run)"
                     )
-                    _rawpipe_fatal = f"auth failed (HTTP {e.status}): {e.body[:200]}"
+                try:
+                    from datasift_uploader import upload_datasift_split
+                    Actor.log.info(
+                        "DataSift upload: %d CSV(s) through the upload wizard "
+                        "(headed=%s, enrich=%s, skip_trace=%s, batch tag %s)",
+                        len(csv_infos), _ds_headed, datasift_do_enrich,
+                        datasift_do_skip_trace, _batch_tag,
+                    )
+                    upload_result = await upload_datasift_split(
+                        csv_infos,
+                        headless=not _ds_headed,
+                        enrich=datasift_do_enrich,
+                        skip_trace=datasift_do_skip_trace,
+                        existing_list=True,
+                        batch_tag=_batch_tag,
+                        launch_args=["--no-sandbox", "--disable-dev-shm-usage"],
+                    )
                 except Exception as e:
-                    Actor.log.exception("RAWPIPE crashed: %s — manual upload still available", e)
-                    _rawpipe_fatal = f"crashed: {type(e).__name__}: {e}"
-            elif upload_datasift_api:
-                Actor.log.warning("upload_datasift_api=true but no DataSift CSVs were generated")
-
-            # ── Upload-failure alert: any list that did not fully land ──
-            # Error-level Slack alert + JSON manifest (KVS rolling history)
-            # naming the CSV, the list, the stage that broke and what to do —
-            # so a failed upload is never just a line in the run log.
-            if upload_datasift_api and 'csv_infos' in dir() and csv_infos:
-                try:
-                    import upload_outcome as _uo
-                    _up_fail = _uo.failures_from_api(
-                        rawpipe_results, csv_infos, drive_links,
-                        fatal_error=_rawpipe_fatal,
+                    Actor.log.exception(
+                        "DataSift upload crashed: %s — the CSVs are still on Drive/KVS "
+                        "for a manual wizard upload", e,
                     )
-                    if _up_fail:
+                    upload_result = {
+                        "success": False, "uploads": [],
+                        "message": f"uploader crashed: {e}",
+                    }
+                    _up_fail = _uo.failures_from_exception(
+                        e, csv_infos, drive_links, uploader="playwright",
+                    )
+                else:
+                    _up_fail = _uo.failures_from_playwright(upload_result, csv_infos, drive_links)
+                    if upload_result.get("success"):
+                        Actor.log.info("DataSift upload: %s", upload_result.get("message"))
+                        for _k, _lbl in (("enrich_result", "Enrich"), ("skip_trace_result", "Skip trace")):
+                            if upload_result.get(_k):
+                                Actor.log.info("  %s: %s", _lbl, upload_result[_k].get("message", ""))
+                    else:
+                        Actor.log.error("DataSift upload failed: %s", upload_result.get("message"))
+
+                # ── Upload-failure alert: any list that did not fully land ──
+                # Error-level Slack alert + JSON manifest (KVS rolling history)
+                # naming the CSV, the list, the stage that broke and what to
+                # do — a failed upload is never just a line in the run log.
+                if _up_fail:
+                    try:
                         health.record_event(
                             "error", "datasift upload",
                             f"{len(_up_fail)} of {len(csv_infos)} list(s) did not "
-                            f"fully land — see the upload alert",
+                            f"fully land (wizard) — see the upload alert",
                         )
                         _manifest = _uo.report_upload_failures(
                             _up_fail, out_dir=config.OUTPUT_DIR,
@@ -1404,8 +1365,14 @@ async def actor_main() -> None:
                         )
                         _hist = await kvs.get_value(_uo.KVS_KEY)
                         await kvs.set_value(_uo.KVS_KEY, _uo.append_history(_hist, _manifest))
-                except Exception:
-                    Actor.log.exception("Upload-failure reporting failed")
+                    except Exception:
+                        Actor.log.exception("Upload-failure reporting failed")
+            elif upload_datasift and not _publish_ok:
+                Actor.log.error(
+                    "DataSift upload SKIPPED — output validation blocked publishing"
+                )
+            elif upload_datasift:
+                Actor.log.warning("upload_datasift=true but no DataSift CSVs were generated")
 
             # ── Drain Travis texdel buffers to KVS (raw CSVs + reports) ──
             try:
@@ -1488,7 +1455,7 @@ async def actor_main() -> None:
                 try:
                     from slack_notifier import (
                         send_slack_notification, _send_webhook,
-                        build_rawpipe_block, build_pdf_block,
+                        build_datasift_upload_block, build_pdf_block,
                         build_drive_csv_block,
                     )
                     # TIGHTFEED message ①: slim daily report. Suppressed
@@ -1503,16 +1470,18 @@ async def actor_main() -> None:
                     drive_csv_block = build_drive_csv_block(drive_links)
                     if drive_csv_block:
                         _send_webhook(drive_csv_block)
-                    # TIGHTFEED message ②: RAWPIPE upload summary with
-                    # clickable list URLs + per-record addresses + Drive
-                    # CSV links. Manual-fallback message (old ③) is gone.
-                    rawpipe_block = build_rawpipe_block(
-                        rawpipe_results,
+                    # TIGHTFEED message ②: DataSift wizard-upload summary —
+                    # per list landed/failed, batch tag, enrich + skip-trace
+                    # status, per-record addresses + Drive CSV links. Only
+                    # sent when an upload was attempted.
+                    upload_block = build_datasift_upload_block(
+                        upload_result,
+                        csv_infos=csv_infos,
                         notices=notices,
                         drive_links=drive_links,
                     )
-                    if rawpipe_block:
-                        _send_webhook(rawpipe_block)
+                    if upload_block:
+                        _send_webhook(upload_block)
                     # TIGHTFEED message ④: Deep Prospecting with Drive
                     # CSV link header + per-record PDF links.
                     pdf_block = build_pdf_block(pdf_urls, drive_links=drive_links)
@@ -3444,10 +3413,19 @@ def _run_scrape_pipeline(args, targets) -> None:
     upload_result = None
     from datasift_formatter import write_datasift_by_notice_type
 
+    # Batch tag only when this run will upload: every row carries it and the
+    # post-upload enrich/skip-trace select by it (never by the established
+    # list). Manual batches stamp their own upload_YYYY-MM-DD the same way.
+    _cli_batch_tag = None
+    if getattr(args, "upload_datasift", False):
+        from datetime import datetime as _dt_bt
+        _cli_batch_tag = f"upload_{_dt_bt.now().strftime('%Y-%m-%d')}"
+
     csv_infos = write_datasift_by_notice_type(
         notices,
         keep_government=getattr(args, "keep_government_records", False),
         split_by_county=config.DATASIFT_SPLIT_BY_COUNTY,
+        batch_tag=_cli_batch_tag,
     )
     for info in csv_infos:
         logging.info("DataSift CSV (%s): %s", info["label"], info["path"])
@@ -3719,7 +3697,7 @@ def _run_scrape_pipeline(args, targets) -> None:
 
     # Optional Playwright auto-upload to DataSift on top of the Drive flow
     if getattr(args, "upload_datasift", False):
-        from datasift_uploader import upload_to_datasift, upload_datasift_split
+        from datasift_uploader import upload_datasift_split
         import upload_outcome as _uo
         do_enrich = not getattr(args, "no_enrich", False)
         do_skip_trace = not getattr(args, "no_skip_trace", False)
@@ -3727,19 +3705,16 @@ def _run_scrape_pipeline(args, targets) -> None:
         # A crash inside the uploader used to take the whole run down with it
         # (no Slack, no health report). Catch it, treat every list as lost,
         # and let the failure alert below name them.
+        # Always the split uploader onto the record type's ESTABLISHED list
+        # (existing_list — never a custom "SiftStack <date>" list, owner rule
+        # 2026-08-20), bulk actions anchored on the batch tag.
         try:
-            if len(csv_infos) > 1:
-                auto_result = asyncio.run(
-                    upload_datasift_split(
-                        csv_infos, enrich=do_enrich, skip_trace=do_skip_trace,
-                    )
+            auto_result = asyncio.run(
+                upload_datasift_split(
+                    csv_infos, enrich=do_enrich, skip_trace=do_skip_trace,
+                    existing_list=True, batch_tag=_cli_batch_tag,
                 )
-            else:
-                auto_result = asyncio.run(
-                    upload_to_datasift(
-                        csv_infos[0]["path"], enrich=do_enrich, skip_trace=do_skip_trace,
-                    )
-                )
+            )
         except Exception as e:
             logging.exception("DataSift Playwright upload crashed: %s", e)
             auto_result = {"success": False, "message": f"uploader crashed: {e}"}
@@ -3833,6 +3808,19 @@ def _run_scrape_pipeline(args, targets) -> None:
             )
             if rawpipe_block:
                 _send_webhook(rawpipe_block)
+
+        # TIGHTFEED ②b: wizard (Playwright) upload summary when --upload-datasift ran.
+        cli_wizard = locals().get("auto_result")
+        if cli_wizard:
+            try:
+                from slack_notifier import build_datasift_upload_block
+                wizard_block = build_datasift_upload_block(
+                    cli_wizard, csv_infos=csv_infos, notices=notices, drive_links=drive_links,
+                )
+                if wizard_block:
+                    _send_webhook(wizard_block)
+            except Exception:
+                logging.exception("DataSift upload Slack block failed")
 
         # Append the Travis tax-delinquent cross-run diff if the scraper ran
         # this cycle. This is the "sold / paid off" signal the user wants —

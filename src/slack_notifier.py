@@ -259,6 +259,7 @@ def build_rawpipe_block(
     notices: list[NoticeData] | None = None,
     drive_links: list[dict] | None = None,
     max_addresses: int = 10,
+    title: str = "RAWPIPE upload to DataSift",
 ) -> str:
     """Build the *RAWPIPE upload to DataSift* webhook block.
 
@@ -297,7 +298,7 @@ def build_rawpipe_block(
                 notices_by_list.setdefault(label, []).append(n)
 
     lines = [
-        f"*RAWPIPE upload to DataSift:* {len(ok)}/{len(rawpipe_results)} "
+        f"*{title}:* {len(ok)}/{len(rawpipe_results)} "
         f"list(s) succeeded · {total_records} record(s) total"
     ]
 
@@ -348,6 +349,74 @@ def build_rawpipe_block(
         lines.append("")
         lines.append(f"  ✗ `{list_name}` — {err}")
 
+    return "\n".join(lines)
+
+
+def build_datasift_upload_block(
+    result: dict | None,
+    *,
+    csv_infos: list[dict],
+    notices: list[NoticeData] | None = None,
+    drive_links: list[dict] | None = None,
+    max_addresses: int = 10,
+) -> str:
+    """Build the *DataSift upload (wizard)* block from a Playwright
+    ``upload_datasift_split`` result.
+
+    ``result`` = ``{success, uploads: [{success, message, label}, ...],
+    message, batch_tag?, enrich_result?, skip_trace_result?}``. The split
+    uploader STOPS at the first failed CSV, so every csv_info past the last
+    ``uploads`` entry was never attempted. Reuses the RAWPIPE renderer (list
+    header, Drive link, address sample) and appends the batch tag and the
+    enrich / skip-trace outcome.
+
+    Returns "" when no upload was attempted — caller should skip the webhook.
+    """
+    if not result or not csv_infos:
+        return ""
+    uploads = result.get("uploads")
+    if uploads is None:
+        uploads = []
+    entries: list[dict] = []
+    stopped_after = ""
+    for i, info in enumerate(csv_infos):
+        ln = info.get("list_name") or info.get("label") or "?"
+        if i < len(uploads):
+            r = uploads[i]
+            ok = bool(r.get("success"))
+            entries.append({
+                "label": info.get("label", ln), "list_name": ln, "success": ok,
+                "line_count": info.get("count"),
+                "error": "" if ok else (r.get("message") or "upload failed"),
+            })
+            if not ok:
+                stopped_after = str(info.get("label", ln))
+        else:
+            reason = result.get("message") or "not attempted"
+            if stopped_after:
+                reason = f"not attempted — uploader stopped after the {stopped_after} failure"
+            entries.append({
+                "label": info.get("label", ln), "list_name": ln, "success": False,
+                "line_count": info.get("count"), "error": reason,
+            })
+
+    text = build_rawpipe_block(
+        entries, notices=notices, drive_links=drive_links,
+        max_addresses=max_addresses, title="DataSift upload (wizard)",
+    )
+    if not text:
+        return ""
+    lines = [text]
+    tag = (result.get("batch_tag") or "").strip()
+    if tag:
+        lines.append("")
+        lines.append(f":label: batch tag `{tag}` — filter Records by this tag to see exactly what landed")
+    for key, label in (("enrich_result", "Enrich"), ("skip_trace_result", "Skip trace")):
+        r = result.get(key)
+        if not r:
+            continue
+        mark = ":white_check_mark:" if r.get("success") else "✗"
+        lines.append(f"{mark} {label}: {str(r.get('message') or '')[:160]}")
     return "\n".join(lines)
 
 

@@ -154,11 +154,11 @@ days (date filter silently not applied). The anti-silence layer:
   `datasift upload` health event so the Actor status reads UNHEALTHY.
   Retry: `python src/upload_outcome.py retry <manifest.json> [--csv-dir DIR]`
   re-uploads only the lists whose records never landed and re-runs only the
-  missed bulk action on lists that did. NOTE: the Actor has NO Playwright
-  upload path — cloud runs only upload via RAWPIPE when `upload_datasift_api`
-  is on (it is off in production and blocked by the read-only client), so
-  the CRM upload today is the operator-run Playwright/wizard from the Drive
-  CSVs. Tests: `tests/test_run_health_slack.py`, `tests/test_upload_outcome.py`.
+  missed bulk action on lists that did. The Actor uploads through the
+  **upload wizard (Playwright)** when `upload_datasift` is on — see "Actor
+  auto-upload" below; the RAWPIPE API path was removed from the Actor on
+  2026-09-17 (the API is read-only). Tests: `tests/test_run_health_slack.py`,
+  `tests/test_upload_outcome.py`, `tests/test_actor_datasift_upload.py`.
 - **`ScraperError(msg, partial=[...])`** (`scrapers/__init__.py`) — scrapers
   raise instead of returning `[]`; partial results still flow. The per-target
   handler records health and keeps going. One central retry re-runs a scraper
@@ -952,6 +952,35 @@ apify push
 - `mode`: "daily" or "historical"
 - `counties` / `types`: arrays to filter sources (empty = all)
 - `google_drive_folder_id`, `google_service_account_key`: optional Google Drive upload
+- `upload_datasift` (+ `datasift_no_enrich`, `datasift_no_skip_trace`): the
+  Actor auto-upload, below. Off in production until the owner flips it.
+
+### Actor auto-upload = the upload wizard, not the API (2026-09-17)
+
+`upload_datasift=true` makes the Actor do exactly what the operator's manual
+batches did (2026-08-23 → 09-16): `datasift_uploader.upload_datasift_split`
+in a **headed** Chromium (the Actor already runs under `xvfb-run`, so
+`DISPLAY` is set; `--no-sandbox`), login, one wizard pass per per-type CSV
+onto the record type's **established** list (`existing_list=True` — Heirs,
+Condemned, Fire Damage etc. all exist; never a custom batch list), every
+row tagged **`upload_YYYY-MM-DD`** (formatter `batch_tag`), a 60 s
+import-settle wait, then **ONE** Enrich Property Information + **ONE** Skip
+Trace anchored on that tag (`_filter_by_tag`: filter block "All Tags (AND)",
+picker "Search for tags...", option = bare tag name — discovered live
+2026-09-17). Anchoring on the tag is what makes bulk actions safe on a list
+like "Foreclosure" holding thousands of old rows; `upload_datasift_split`
+REFUSES `existing_list=True` + a bulk action without a `batch_tag`, and
+`_filter_by_block` is strict (no matched option → False → the bulk action
+aborts instead of selecting the whole account). Skip-trace is the unlimited
+plan — no per-record cost — so `datasift_no_skip_trace` defaults OFF.
+Failures go through `upload_outcome` (Slack alert + manifest + health
+event); a tag-anchored enrich/skip failure applies to every list. The
+Sold/Resolved cleanup CSV is never auto-uploaded (no established list).
+Slack gets a `DataSift upload (wizard)` block (`build_datasift_upload_block`).
+`upload_datasift_api` is retired: the key is honoured as an alias of
+`upload_datasift` (old stored schedule inputs), the RAWPIPE block is gone
+from the Actor. The CLI `--upload-datasift` uses the same
+existing-list + batch-tag path; `--upload-datasift-api` remains dormant.
 
 ### Actor Output
 - **Dataset**: structured records pushed via `Actor.push_data()`
@@ -1070,9 +1099,9 @@ the whole account on 2026-07-14.
   specific one-off.
 - CRM mutations (uploads, tags, sequences, deletes) go through the DataSift
   upload wizard / UI — manually or via `datasift_uploader.py` (Playwright).
-- The API-upload path in `main.py` (`--upload-datasift-api` /
-  `upload_datasift_api`) is dormant: `false` in the production schedule, and
-  the client now blocks it anyway (it falls back to the Playwright path).
+- The CLI API-upload flag (`--upload-datasift-api`) is dormant and blocked
+  by the client; the Actor's RAWPIPE path was removed 2026-09-17 — the
+  Actor's `upload_datasift` runs the upload wizard (Playwright) instead.
 - Read-driven workflow this enables: export records matching a filter (e.g.
   "smart-skipped + direct-skipped" preset) → run SmartSkip/DirectSkip/Trestle
   outside the CRM → build the upload CSV → upload via the wizard.

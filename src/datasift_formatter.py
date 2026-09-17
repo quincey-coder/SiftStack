@@ -456,7 +456,7 @@ NOTICE_TYPE_TO_LIST = {
 }
 
 
-def _build_tags(notice: NoticeData) -> str:
+def _build_tags(notice: NoticeData, extra_tags: list[str] | None = None) -> str:
     """Build comma-separated tags string for DataSift upload.
 
     Tags include:
@@ -634,6 +634,13 @@ def _build_tags(notice: NoticeData) -> str:
     if notice.source_url and notice.source_url.startswith("photo:"):
         tags.append("photo_import")
 
+    # Caller-supplied tags (e.g. the per-run upload batch tag that anchors the
+    # post-upload enrich/skip-trace selection). Cleanup rows returned above
+    # never receive these — they are not new-to-market.
+    for t in extra_tags or []:
+        t = (t or "").strip()
+        if t and t not in tags:
+            tags.append(t)
     return ",".join(tags)
 
 
@@ -1214,19 +1221,25 @@ def clean_datasift_rows(rows: list[dict], label: str = "") -> tuple[list[dict], 
     return out, stats
 
 
-def _build_row(notice: NoticeData, notes_override: str | None = None) -> dict:
+def _build_row(
+    notice: NoticeData,
+    notes_override: str | None = None,
+    extra_tags: list[str] | None = None,
+) -> dict:
     """Build a single CSV row dict for a NoticeData record.
 
     Args:
         notice: The notice to format.
         notes_override: If provided, use this as the Notes value instead of
             calling _build_notes(). Used by write_datasift_split_csvs().
+        extra_tags: Additional Tags appended to lead rows (never to Sold /
+            Resolved cleanup rows), e.g. the upload batch tag.
 
     Returns:
         Dict keyed by DATASIFT_COLUMNS headers.
     """
     contact = _get_contact_info(notice)
-    tags = _build_tags(notice)
+    tags = _build_tags(notice, extra_tags)
     if notice.record_status == "sold":
         # Don't re-add a sold parcel to the Tax Delinquent list — the cleanup
         # sequence removes it from lists. Tax/value fields stay blank so the
@@ -1558,6 +1571,7 @@ def write_datasift_by_notice_type(
     date_str: str | None = None,
     keep_government: bool = False,
     split_by_county: bool = False,
+    batch_tag: str | None = None,
 ) -> list[dict]:
     """One CSV per distress type (notice_type), plus a combined Heirs CSV.
 
@@ -1584,6 +1598,11 @@ def write_datasift_by_notice_type(
         date_str: Unused for list names (bare list names per OCTOLIST), kept
             for call-site parity with write_datasift_split_csvs(). Default: today.
         keep_government: If True, include government-entity records.
+        batch_tag: If set (e.g. "upload_2026-09-17"), appended to the Tags of
+            every lead row (per-type CSVs AND the Heirs CSV). The uploader
+            anchors its post-upload enrich + skip-trace selection on this tag
+            so only this run's records are acted on — never the whole
+            established list they were added to.
 
     Returns:
         List of dicts: [{"path": Path, "label": str, "list_name": str,
@@ -1595,6 +1614,7 @@ def write_datasift_by_notice_type(
 
     timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     results: list[dict] = []
+    extra_tags = [batch_tag] if batch_tag else None
 
     # Filter government-entity owners once up front.
     govt_dropped = 0
@@ -1652,7 +1672,9 @@ def write_datasift_by_notice_type(
         built_rows = []
         for notice in group:
             _check_city_zip(notice)
-            built_rows.append(_build_row(notice, notes_override=_build_dm_notes(notice)))
+            built_rows.append(_build_row(
+                notice, notes_override=_build_dm_notes(notice), extra_tags=extra_tags,
+            ))
         built_rows, _ = clean_datasift_rows(built_rows, label=label_disp)
 
         written = 0
@@ -1700,7 +1722,9 @@ def write_datasift_by_notice_type(
             writer = csv.DictWriter(f, fieldnames=DATASIFT_COLUMNS)
             writer.writeheader()
             for notice in deceased_with_heirs:
-                row = _build_row(notice, notes_override=_build_heir_notes(notice))
+                row = _build_row(
+                    notice, notes_override=_build_heir_notes(notice), extra_tags=extra_tags,
+                )
                 writer.writerow(row)
                 heir_written += 1
 

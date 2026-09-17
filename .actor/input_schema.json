@@ -284,26 +284,26 @@
             "editor": "textfield",
             "default": ""
         },
-        "upload_datasift_api": {
-            "title": "Auto-upload to DataSift (RAWPIPE)",
+        "upload_datasift": {
+            "title": "Auto-upload to DataSift (upload wizard)",
             "type": "boolean",
-            "description": "Push each per-notice-type CSV directly to DataSift via apiv2.reisift.io (REST API, no browser). Uses datasift_email + datasift_password secrets. ~4s/list. Lists are named SiftStack {date} - {notice_type}.",
+            "description": "After the run, upload each per-notice-type CSV into DataSift through the app's upload wizard (Playwright, headed under Xvfb) \u2014 the same path as a manual upload. Each CSV is added to the record type's EXISTING list (Foreclosure, Probate, Liens, ...; no custom batch lists) and every row is tagged upload_YYYY-MM-DD. Then Enrich Property Information + Skip Trace run once on that tag. ~90s per CSV. Uses datasift_email + datasift_password. The Sold/Resolved cleanup CSV is never auto-uploaded.",
             "default": false,
             "editor": "checkbox",
-            "sectionCaption": "DataSift auto-upload (RAWPIPE)"
+            "sectionCaption": "DataSift auto-upload (upload wizard)"
         },
         "datasift_no_enrich": {
             "title": "Skip DataSift Property Enrichment",
             "type": "boolean",
-            "description": "Disable DataSift's server-side property enrichment (free SiftMap data: beds/baths/Zestimate/sqft). Only applies when upload_datasift_api is on.",
+            "description": "After the upload, do NOT run Manage \u2192 Enrich Property Information on this run's records (free SiftMap data: beds/baths/Zestimate/sqft; Enrich/Swap Owners stay OFF either way). Only applies when upload_datasift is on.",
             "default": false,
             "editor": "checkbox"
         },
         "datasift_no_skip_trace": {
             "title": "Skip DataSift Skip-Trace",
             "type": "boolean",
-            "description": "Disable post-upload skip-trace via the API. Skip-trace costs $0.15/owner and requires account balance. Only applies when upload_datasift_api is on.",
-            "default": true,
+            "description": "After the upload, do NOT run Send To \u2192 Skip Trace on this run's records. Skip-trace is the account's unlimited plan (no per-record cost), so leave this OFF unless you want to trace by hand. Only applies when upload_datasift is on.",
+            "default": false,
             "editor": "checkbox"
         },
         "google_drive_folder_id": {
@@ -430,14 +430,14 @@
         "datasift_email": {
             "title": "DataSift Email",
             "type": "string",
-            "description": "app.reisift.io login. Required when upload_datasift_api is on.",
+            "description": "app.reisift.io login. Required when upload_datasift is on.",
             "editor": "textfield",
             "isSecret": true
         },
         "datasift_password": {
             "title": "DataSift Password",
             "type": "string",
-            "description": "app.reisift.io password. Required when upload_datasift_api is on.",
+            "description": "app.reisift.io password. Required when upload_datasift is on.",
             "editor": "textfield",
             "isSecret": true
         },

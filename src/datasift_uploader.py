@@ -664,12 +664,28 @@ async def _select_records_tab(page: Page, tab: str = "All") -> bool:
         return False
 
 
-async def _filter_by_list(page: Page, list_name: str) -> bool:
-    """Filter records page by list name. Returns True if filter applied.
+async def _filter_by_block(
+    page: Page,
+    *,
+    kind: str,
+    search_term: str,
+    block_labels: tuple[str, ...],
+    picker_placeholder: str,
+    value: str,
+) -> bool:
+    """Apply ONE filter block on the Records page. Returns True only when the
+    block was added, the value was matched in the picker AND the filter was
+    applied.
 
-    DataSift filter panel: right-side overlay opened by "Filter Records" link.
-    Has an "Add new filter block" search input. Type "Lists" → select "All Lists (AND)"
-    → pick the list name → close panel.
+    DataSift filter panel: right-side overlay opened by "Filter Records".
+    "Add new filter block" search → pick a block (e.g. "All Lists (AND)" /
+    "All Tags (AND)") → a picker input ("Search for lists..." /
+    "Search for tags...") → click the matching option → "Apply Filters".
+
+    STRICT on purpose: every caller follows this with a select-all, so a
+    filter that silently did not match would select the whole account.
+    (The old list-only version returned True even when the list option was
+    never found — the select-ALL hazard noted 2026-08-17.)
     """
     try:
         await _dismiss_popups(page)
@@ -690,76 +706,94 @@ async def _filter_by_list(page: Page, list_name: str) -> bool:
         await _dismiss_popups(page)
         await _screenshot(page, "filter_opened")
 
-        # Type "Lists" in the "Add new filter block" search input
+        # Type the block family ("Lists" / "Tags") in "Add new filter block"
         filter_search = page.locator('#RecordsFilters__Filter_Blocks__Search')
         if await filter_search.count() == 0:
             filter_search = page.locator('input[placeholder*="filter block"]')
-
-        if await filter_search.count() > 0:
-            await filter_search.first.click()
-            await filter_search.first.fill("Lists")
-            await page.wait_for_timeout(1500)
-
-            # Click "All Lists (AND)" in the suggestions dropdown (inside the overlay)
-            all_lists = page.locator('text="All Lists (AND)"')
-            if await all_lists.count() > 0:
-                await all_lists.first.click()
-                await page.wait_for_timeout(2000)
-                logger.debug("Selected 'All Lists (AND)' filter block")
-            else:
-                # Try "Any Lists (OR)" as fallback
-                any_lists = page.locator('text="Any Lists (OR)"')
-                if await any_lists.count() > 0:
-                    await any_lists.first.click()
-                    await page.wait_for_timeout(2000)
-                    logger.debug("Selected 'Any Lists (OR)' filter block")
-        else:
+        if await filter_search.count() == 0:
             logger.warning("Filter block search input not found")
+            return False
 
-        await _screenshot(page, "filter_lists_block_added")
+        # A suggestion dropdown left open by a previous block intercepts
+        # the click (observed 2026-09-17) — force it.
+        await filter_search.first.click(force=True)
+        await filter_search.first.fill(search_term)
+        await page.wait_for_timeout(1500)
 
-        # Now a list picker appears with "Search for lists..." input and a dropdown.
-        # Type the list name to search, then click the matching option.
-        list_search = page.locator('input[placeholder*="Search for lists"]')
-        if await list_search.count() > 0:
-            await list_search.first.fill(list_name)
-            await page.wait_for_timeout(2000)
+        block_added = False
+        for label in block_labels:
+            opt = page.locator(f'text="{label}"')
+            if await opt.count() > 0:
+                await opt.first.click()
+                await page.wait_for_timeout(2000)
+                logger.debug("Selected %r filter block", label)
+                block_added = True
+                break
+        if not block_added:
+            logger.warning("None of the %s filter blocks %s appeared", kind, block_labels)
+            return False
 
-            await _screenshot(page, "filter_list_searched")
+        await _screenshot(page, f"filter_{kind}_block_added")
 
-            # Click the matching list option in the dropdown
-            list_option = page.locator(f'text="{list_name}"')
-            if await list_option.count() > 0:
-                # Use the last match (the one in the dropdown, not the input field)
-                await list_option.last.click()
-                await page.wait_for_timeout(1000)
-                logger.info("Selected list filter: %s", list_name)
-        else:
-            logger.warning("'Search for lists...' input not found")
+        # Picker: type the value, click the matching option (exact text).
+        picker = page.locator(f'input[placeholder*="{picker_placeholder}"]')
+        if await picker.count() == 0:
+            logger.warning("%r picker input not found", picker_placeholder)
+            return False
+        await picker.first.fill(value)
+        await page.wait_for_timeout(2000)
+        await _screenshot(page, f"filter_{kind}_searched")
 
-        await _screenshot(page, "filter_list_selected")
+        option = page.locator(f'text="{value}"')
+        if await option.count() == 0:
+            logger.warning("%s %r not found in the picker — filter NOT applied", kind, value)
+            return False
+        # Use the last match (the one in the dropdown, not the input field)
+        await option.last.click()
+        await page.wait_for_timeout(1000)
+        logger.info("Selected %s filter: %s", kind, value)
+        await _screenshot(page, f"filter_{kind}_selected")
 
-        # Click "Apply Filters" button at the bottom of the filter panel
+        # "Apply Filters" at the bottom of the panel
         apply_btn = page.locator('text="Apply Filters"')
-        if await apply_btn.count() > 0:
-            await apply_btn.first.click()
-            await page.wait_for_timeout(3000)
-            logger.info("Applied filters")
-        else:
-            # Fallback: close panel with X button
-            close_x = page.locator('[class*="Aside"] button:has-text("×")')
-            if await close_x.count() > 0:
-                await close_x.first.click()
-            else:
-                await page.keyboard.press("Escape")
-            await page.wait_for_timeout(2000)
-
+        if await apply_btn.count() == 0:
+            logger.warning("'Apply Filters' button not found — filter NOT applied")
+            return False
+        await apply_btn.first.click()
+        await page.wait_for_timeout(3000)
+        logger.info("Applied filters")
         await _screenshot(page, "filter_applied")
         return True
     except Exception as e:
-        logger.warning("Filter by list failed: %s", e)
+        logger.warning("Filter by %s failed: %s", kind, e)
         await _screenshot(page, "filter_failed")
         return False
+
+
+async def _filter_by_list(page: Page, list_name: str) -> bool:
+    """Filter the Records page to one list. True only if the filter applied."""
+    return await _filter_by_block(
+        page, kind="list", search_term="Lists",
+        block_labels=("All Lists (AND)", "Any Lists (OR)"),
+        picker_placeholder="Search for lists", value=list_name,
+    )
+
+
+async def _filter_by_tag(page: Page, tag: str) -> bool:
+    """Filter the Records page to one tag. True only if the filter applied.
+
+    Discovered live 2026-09-17: the tag blocks are "All Tags (AND)" /
+    "Any Tags (OR)" and the picker placeholder is "Search for tags...";
+    the option text is the bare tag name. Used to anchor post-upload
+    enrich/skip-trace on the run's batch tag (e.g. ``upload_2026-09-17``)
+    instead of the established list the records were added to — those
+    lists hold thousands of older records.
+    """
+    return await _filter_by_block(
+        page, kind="tag", search_term="Tags",
+        block_labels=("All Tags (AND)", "Any Tags (OR)"),
+        picker_placeholder="Search for tags", value=tag,
+    )
 
 
 async def _select_all_records(page: Page) -> bool:
@@ -848,9 +882,27 @@ async def _select_all_records(page: Page) -> bool:
                 btns[0].b.click();
                 return true;
             }"""
+            # Size the walk from the pager's own "Page x of N" — N is the
+            # PAGE count (verified live 2026-09-17: 253 records → "of 26",
+            # 10 rows/page). The old fixed cap of 20 pages silently selected
+            # only 200 of that 253-record batch.
+            _TOTAL_PAGES_JS = r"""() => {
+                const el = [...document.querySelectorAll('*')].find(e =>
+                    e.children.length === 0 && /^of \d+$/.test((e.textContent||'').trim()));
+                return el ? parseInt(el.textContent.trim().slice(3), 10) : -1;
+            }"""
+            try:
+                total_pages = int(await page.evaluate(_TOTAL_PAGES_JS))
+            except Exception:
+                total_pages = -1
+            max_pages = min(total_pages + 2, 1000) if total_pages > 0 else 50
+            logger.info("Select-all page walk: %s page(s) of filtered records, walking up to %d",
+                        total_pages if total_pages > 0 else "unknown", max_pages)
             total_selected = 0
-            for _pg in range(20):  # safety cap: 20 pages (~200 records)
+            pages_walked = 0
+            for _pg in range(max_pages):
                 total_selected += await page.evaluate(_SELECT_ROWS_JS)
+                pages_walked += 1
                 await page.wait_for_timeout(900)
                 advanced = await page.evaluate(_NEXT_PAGE_JS)
                 if not advanced:
@@ -864,8 +916,13 @@ async def _select_all_records(page: Page) -> bool:
                         .find(t => /^Selecting/.test(t)) || ''""")
             except Exception:
                 indicator = ""
-            logger.info("Selected %d row checkboxes across pages (%s)",
-                        total_selected, indicator or "no indicator")
+            logger.info("Selected %d row checkboxes across %d page(s) (%s)",
+                        total_selected, pages_walked, indicator or "no indicator")
+            if total_pages > 0 and pages_walked < total_pages:
+                logger.warning(
+                    "Walked %d of %d page(s) — the bulk action will be PARTIAL",
+                    pages_walked, total_pages,
+                )
             await page.wait_for_timeout(1000)
 
         await _screenshot(page, "records_selected_header")
@@ -904,7 +961,14 @@ async def _select_all_records(page: Page) -> bool:
         return False
 
 
-async def enrich_records(page: Page, list_name: str) -> dict:
+async def _apply_anchor(page: Page, list_name: str, tag: str | None) -> tuple[bool, str]:
+    """Filter to the bulk-action anchor: the batch TAG when given, else the list."""
+    if tag:
+        return await _filter_by_tag(page, tag), f"tag {tag!r}"
+    return await _filter_by_list(page, list_name), f"list {list_name!r}"
+
+
+async def enrich_records(page: Page, list_name: str, *, tag: str | None = None) -> dict:
     """Enrich uploaded records with DataSift's SiftMap property data.
 
     UI Flow: Records → Filter by list → Select all → Manage → Enrich Data
@@ -916,12 +980,14 @@ async def enrich_records(page: Page, list_name: str) -> dict:
     Args:
         page: Logged-in Playwright page.
         list_name: Name of the list to filter and enrich.
+        tag: If set, filter by this TAG instead of the list (batch anchor —
+            the list may be an established one holding thousands of rows).
 
     Returns:
         Dict with {success, message}.
     """
     result = {"success": False, "message": ""}
-    logger.info("Starting DataSift enrichment for list: %s", list_name)
+    logger.info("Starting DataSift enrichment for %s", f"tag {tag!r}" if tag else f"list {list_name!r}")
 
     try:
         # Navigate to Records
@@ -930,10 +996,10 @@ async def enrich_records(page: Page, list_name: str) -> dict:
         # Filter to the uploaded list. HARD GATE: without a verified filter,
         # the select-all below would grab whatever is showing — potentially
         # every record in the account. Never proceed unfiltered.
-        filtered = await _filter_by_list(page, list_name)
+        filtered, anchor = await _apply_anchor(page, list_name, tag)
         if not filtered:
             result["message"] = (
-                f"List filter for {list_name!r} did not apply — refusing to "
+                f"Filter for {anchor} did not apply — refusing to "
                 "enrich an unfiltered selection")
             logger.error(result["message"])
             return result
@@ -1067,7 +1133,7 @@ async def enrich_records(page: Page, list_name: str) -> dict:
     return result
 
 
-async def skip_trace_records(page: Page, list_name: str) -> dict:
+async def skip_trace_records(page: Page, list_name: str, *, tag: str | None = None) -> dict:
     """Skip trace uploaded records for phone numbers + emails.
 
     UI Flow: Records → Filter by list → Select all → Send To → Skip Trace
@@ -1078,12 +1144,13 @@ async def skip_trace_records(page: Page, list_name: str) -> dict:
     Args:
         page: Logged-in Playwright page.
         list_name: Name of the list to filter and skip trace.
+        tag: If set, filter by this TAG instead of the list (batch anchor).
 
     Returns:
         Dict with {success, message}.
     """
     result = {"success": False, "message": ""}
-    logger.info("Starting DataSift skip trace for list: %s", list_name)
+    logger.info("Starting DataSift skip trace for %s", f"tag {tag!r}" if tag else f"list {list_name!r}")
 
     try:
         # Navigate to Records (may already be there from enrichment)
@@ -1092,10 +1159,10 @@ async def skip_trace_records(page: Page, list_name: str) -> dict:
         # Filter to the uploaded list. HARD GATE: without a verified filter,
         # the select-all below would grab whatever is showing — potentially
         # every record in the account. Never skip-trace unfiltered.
-        filtered = await _filter_by_list(page, list_name)
+        filtered, anchor = await _apply_anchor(page, list_name, tag)
         if not filtered:
             result["message"] = (
-                f"List filter for {list_name!r} did not apply — refusing to "
+                f"Filter for {anchor} did not apply — refusing to "
                 "skip trace an unfiltered selection")
             logger.error(result["message"])
             return result
@@ -1306,6 +1373,8 @@ async def upload_datasift_split(
     enrich: bool = True,
     skip_trace: bool = True,
     existing_list: bool = False,
+    batch_tag: str | None = None,
+    launch_args: list[str] | None = None,
 ) -> dict:
     """Upload multiple CSVs sequentially for split Message Board entries.
 
@@ -1321,6 +1390,13 @@ async def upload_datasift_split(
         enrich: Run enrichment after all uploads (default True).
         skip_trace: Run skip trace after all uploads (default True).
         existing_list: If True, target existing lists instead of creating new ones.
+        batch_tag: The tag every row of these CSVs carries (formatter
+            ``batch_tag``). When set, enrich + skip-trace run ONCE anchored
+            on this tag instead of once per list — so on an established
+            list ("Foreclosure", thousands of rows) only this run's records
+            are selected. Required whenever existing_list=True and a bulk
+            action is on.
+        launch_args: Extra Chromium args (the Actor passes --no-sandbox).
 
     Returns:
         Dict with per-upload results, enrich_result, and skip_trace_result.
@@ -1335,8 +1411,19 @@ async def upload_datasift_split(
             "uploads": [],
         }
 
+    if existing_list and (enrich or skip_trace) and not batch_tag:
+        # Refuse rather than bulk-act on an entire established list.
+        return {
+            "success": False,
+            "message": (
+                "existing_list=True with enrich/skip_trace requires batch_tag — "
+                "refusing to bulk-act on a whole established list"
+            ),
+            "uploads": [],
+        }
+
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=headless)
+        browser = await p.chromium.launch(headless=headless, args=launch_args or [])
         context = await browser.new_context(
             viewport={"width": 1280, "height": 720},
             user_agent=(
@@ -1391,7 +1478,28 @@ async def upload_datasift_split(
                 "success": all_success,
                 "uploads": uploads,
                 "message": f"Uploaded {len(uploads)}/{len(csv_infos)} CSVs",
+                "batch_tag": batch_tag or "",
             }
+
+            # Batch-tag anchor: ONE enrich + ONE skip-trace over exactly the
+            # rows this run uploaded (every CSV carries the tag), regardless
+            # of how many lists they were spread across. No per_list key —
+            # a failure applies to every list (upload_outcome maps that).
+            if all_success and csv_infos and batch_tag and (enrich or skip_trace):
+                logger.info("Waiting 60s for imports to land before bulk actions...")
+                await page.wait_for_timeout(60000)
+                anchor_list = csv_infos[0]["list_name"]
+                if enrich:
+                    er = await enrich_records(page, anchor_list, tag=batch_tag)
+                    er["anchor"] = f"tag:{batch_tag}"
+                    combined["enrich_result"] = er
+                    logger.info("Enrichment [tag %s]: %s", batch_tag, er.get("message", ""))
+                if skip_trace:
+                    sr = await skip_trace_records(page, anchor_list, tag=batch_tag)
+                    sr["anchor"] = f"tag:{batch_tag}"
+                    combined["skip_trace_result"] = sr
+                    logger.info("Skip trace [tag %s]: %s", batch_tag, sr.get("message", ""))
+                return combined
 
             # Enrich + skip trace EVERY uploaded list. (This previously ran
             # once on csv_infos[0]'s list on the assumption it "has all
