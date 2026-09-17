@@ -45,6 +45,45 @@
             "editor": "textfield",
             "default": ""
         },
+        "max_notices": {
+            "title": "Max Notices (smoke-test cap)",
+            "type": "integer",
+            "description": "Stop scraping after this many raw notices across all sources. 0 = no cap (default). Useful for smoke-testing the full pipeline without scraping thousands of records.",
+            "default": 0,
+            "minimum": 0,
+            "maximum": 10000,
+            "editor": "number"
+        },
+        "daily_lookback_days": {
+            "title": "Daily rolling lookback (days)",
+            "type": "integer",
+            "description": "Every daily run re-scans today minus N days .. today on every date-windowed scraper, so rows the clerk posts nameless/addressless are re-hit once completed; cross-run dedup absorbs the repeats. 0 = default (14).",
+            "default": 0,
+            "minimum": 0,
+            "maximum": 120
+        },
+        "tcc_lookback_days": {
+            "title": "TCC lookback days (backfill)",
+            "type": "integer",
+            "description": "Widen the Travis tccsearch scrape window beyond the shared daily lookback (only widens, never narrows). Use e.g. 60 for a one-off backfill; leave 0 for normal runs.",
+            "default": 0
+        },
+        "bell_ocr_budget_secs": {
+            "title": "Bell foreclosure OCR budget (seconds/run)",
+            "type": "integer",
+            "description": "Wall-clock budget for OCR-ing Bell County's scanned foreclosure PDFs each run (default 900). Already-read PDFs are remembered and replayed for free, so only new/re-posted/unfinished PDFs spend it. Raise (e.g. 2400) for a one-off backfill.",
+            "default": 900,
+            "minimum": 0,
+            "maximum": 3600
+        },
+        "williamson_ocr_budget_secs": {
+            "title": "Williamson foreclosure OCR budget (seconds/run)",
+            "type": "integer",
+            "description": "Wall-clock budget for OCR-ing Williamson County's individual trustee-sale notice PDFs when the clerk has not posted a month's index yet (default 600). Remembered PDFs replay for free. Raise (e.g. 3600) for a one-off backfill.",
+            "default": 600,
+            "minimum": 0,
+            "maximum": 3600
+        },
         "rebuild_dedup_only": {
             "title": "Rebuild Dedup Only",
             "type": "boolean",
@@ -59,15 +98,6 @@
             "default": false,
             "editor": "checkbox"
         },
-        "max_notices": {
-            "title": "Max Notices (smoke-test cap)",
-            "type": "integer",
-            "description": "Stop scraping after this many raw notices across all sources. 0 = no cap (default). Useful for smoke-testing the full pipeline without scraping thousands of records.",
-            "default": 0,
-            "minimum": 0,
-            "maximum": 10000,
-            "editor": "number"
-        },
         "force_scraper_fail": {
             "title": "Force Scraper Fail (alert drill)",
             "type": "string",
@@ -75,166 +105,48 @@
             "editor": "textfield",
             "default": ""
         },
-        "enable_obituary": {
-            "title": "Enable Obituary / Deceased-Owner Detection",
+        "standardize_addresses": {
+            "title": "Standardize addresses (Smarty)",
             "type": "boolean",
-            "description": "Search obituaries via Google + DuckDuckGo to detect deceased owners, then run heir verification + DM address lookup. Adds ~5-10 min/run. Uses Anthropic (Haiku) and Serper credits.",
+            "description": "ON: every address goes through Smarty USPS standardization (Step 6). OFF: addresses are used as scraped.",
             "default": true,
             "editor": "checkbox",
-            "sectionCaption": "Enrichment toggles"
+            "sectionCaption": "Enrichment (on = the Actor runs it)",
+            "sectionDescription": "Every switch here is positive: checked means the step runs. Obituary / Ancestry / heir research were removed from the Actor on 2026-09-17 (DataSift pulls obituaries itself on import); skip tracing runs from the operator box."
         },
-        "enable_ancestry": {
-            "title": "Enable Ancestry.com Lookup",
+        "geocode_retry": {
+            "title": "Reverse-geocode retry",
             "type": "boolean",
-            "description": "Query Ancestry.com SSDI for heir DOD verification. Requires ANCESTRY credentials. Off by default.",
-            "default": false,
+            "description": "ON: addresses Smarty could not match get a reverse-geocode + Smarty retry (Step 7). OFF: they stay unmatched.",
+            "default": true,
             "editor": "checkbox"
         },
-        "enable_directskip": {
-            "title": "Enable DirectSkip Skip Trace",
+        "enrich_cad_tax": {
+            "title": "CAD tax enrichment",
             "type": "boolean",
-            "description": "Run DirectSkip on deep-prospecting candidates (deceased owners / heir maps / DMs). Requires directskip_api_key. NOTE: the DirectSkip API is IP-allowlisted and Apify has no static egress IP — cloud runs will fail auth; run DirectSkip from the operator box (skip_orchestrator) instead.",
-            "default": false,
+            "description": "ON: Travis / Bell / Williamson appraisal-district lookup fills owner, parcel, assessed value and delinquency (Step 5). OFF: skipped.",
+            "default": true,
             "editor": "checkbox"
         },
-        "enable_tracerfy": {
-            "title": "[deprecated] Enable Skip Trace (legacy toggle name)",
+        "enrich_zillow": {
+            "title": "Zillow enrichment",
             "type": "boolean",
-            "description": "Legacy alias for enable_directskip, kept so old schedule runInputs still validate. Tracerfy was retired 2026-08-20.",
-            "default": false,
-            "editor": "checkbox"
-        },
-        "enable_trestle": {
-            "title": "Enable Trestle Phone Tier Scoring",
-            "type": "boolean",
-            "description": "Score every discovered phone (DM #1 + heirs) with Trestle's 5-tier dial priority. Requires trestle_api_key and enable_directskip.",
-            "default": false,
+            "description": "ON: Zestimate, beds/baths, sqft and MLS status per record (Step 8). This is the slowest enrichment step (~6 s/record). OFF: skipped, and the listed-property filter has nothing to act on.",
+            "default": true,
             "editor": "checkbox"
         },
         "research_entities": {
-            "title": "Research Entity-Owned Properties",
+            "title": "Research entity owners (LLC / trust / corp)",
             "type": "boolean",
-            "description": "For LLC/Corp/Trust owners, run web search + LLM to find the real person behind the entity.",
+            "description": "ON: for LLC / Corp / Trust owners, run web search + Claude to find the real person behind the entity (Step 3a). Uses Anthropic credits. OFF: entity owners keep the entity name.",
             "default": false,
             "editor": "checkbox"
         },
-        "skip_smarty": {
-            "title": "Skip Smarty Address Standardization",
+        "travis_texdel_cleaner": {
+            "title": "Travis tax-delinquent cleaner",
             "type": "boolean",
-            "description": "Skip USPS address standardization. Normally ON.",
-            "default": false,
-            "editor": "checkbox"
-        },
-        "skip_zillow": {
-            "title": "Skip Zillow Enrichment",
-            "type": "boolean",
-            "description": "Skip Zillow property enrichment (Zestimate, beds/baths, MLS status). Biggest compute consumer at ~6s/record \u2014 disable for cheaper runs.",
-            "default": false,
-            "editor": "checkbox"
-        },
-        "skip_tax": {
-            "title": "Skip Tax Delinquency Enrichment",
-            "type": "boolean",
-            "description": "Skip Travis/Bell/Williamson CAD tax enrichment step.",
-            "default": false,
-            "editor": "checkbox"
-        },
-        "skip_geocode": {
-            "title": "Skip Reverse-Geocode Retry",
-            "type": "boolean",
-            "description": "Skip the reverse-geocode retry for addresses Smarty couldn't match.",
-            "default": false,
-            "editor": "checkbox"
-        },
-        "skip_zip_filter": {
-            "title": "Skip Investor-ZIP Filter",
-            "type": "boolean",
-            "description": "Disable the investor-active ZIP code filter. Keeps records from all ZIPs.",
-            "default": false,
-            "editor": "checkbox"
-        },
-        "skip_condo_filter": {
-            "title": "Skip Condo/Townhouse Filter",
-            "type": "boolean",
-            "description": "Keep condo/townhouse records instead of dropping them.",
-            "default": false,
-            "editor": "checkbox"
-        },
-        "keep_listed": {
-            "title": "Keep Listed Properties",
-            "type": "boolean",
-            "description": "Keep Active/Pending/Sold/For-Rent records. Default OFF \u2014 Zillow-listed properties get filtered out post-enrichment.",
-            "default": false,
-            "editor": "checkbox"
-        },
-        "keep_government_records": {
-            "title": "Keep Government-Owned Records",
-            "type": "boolean",
-            "description": "Keep records owned by City Of, Travis County, State Of, etc. in the DataSift CSV. Default OFF \u2014 government records get dropped.",
-            "default": false,
-            "editor": "checkbox"
-        },
-        "skip_heir_verification": {
-            "title": "Skip Heir Alive/Dead Verification",
-            "type": "boolean",
-            "description": "Skip the heir verification loop (still runs obituary search).",
-            "default": false,
-            "editor": "checkbox"
-        },
-        "skip_dm_address": {
-            "title": "Skip DM Address Lookup",
-            "type": "boolean",
-            "description": "Skip the decision-maker mailing-address lookup.",
-            "default": false,
-            "editor": "checkbox"
-        },
-        "max_heir_depth": {
-            "title": "Max Heir Recursion Depth",
-            "type": "integer",
-            "description": "Max depth for heir verification (default 2).",
-            "default": 2,
-            "minimum": 0,
-            "maximum": 5,
-            "editor": "number"
-        },
-        "obituary_workers": {
-            "title": "Obituary Workers",
-            "type": "integer",
-            "description": "Concurrent workers for obituary Phase A (default 4). Higher = faster but more rate-limit risk.",
-            "default": 4,
-            "minimum": 1,
-            "maximum": 16,
-            "editor": "number"
-        },
-        "obituary_deadline_secs": {
-            "title": "Obituary Time Budget (secs from start)",
-            "type": "integer",
-            "description": "Wall-clock ceiling for the obituary step, measured from actor start. Past this, obituary enrichment stops and remaining records flow through unenriched (they still upload) \u2014 prevents the sequential Phase B from blowing the actor timeout. Set below your run timeout minus ~15min for upload/reports. 0 = unbounded.",
-            "default": 2700,
-            "minimum": 0,
-            "maximum": 7200,
-            "editor": "number"
-        },
-        "exclude_vacant": {
-            "title": "Exclude Vacant Land",
-            "type": "boolean",
-            "description": "Remove vacant land parcels. Default OFF \u2014 kept.",
-            "default": false,
-            "editor": "checkbox",
-            "sectionCaption": "Buy-box filters"
-        },
-        "exclude_commercial": {
-            "title": "Exclude Commercial Properties",
-            "type": "boolean",
-            "description": "Remove commercial properties. Default OFF \u2014 kept.",
-            "default": false,
-            "editor": "checkbox"
-        },
-        "exclude_entities": {
-            "title": "Exclude Entity-Owned Properties",
-            "type": "boolean",
-            "description": "Remove LLC/Corp/Trust owners (unless research_entities found a person). Default OFF \u2014 kept.",
-            "default": false,
+            "description": "ON: the Travis roll goes through the skill cleaner (overflow-row merge, address-contamination strip, blank-ZIP resolver). OFF is a safety valve only.",
+            "default": true,
             "editor": "checkbox"
         },
         "min_delinquent_years": {
@@ -244,8 +156,7 @@
             "default": 2,
             "minimum": 0,
             "maximum": 20,
-            "editor": "number",
-            "sectionCaption": "Travis tax-delinquent filters"
+            "editor": "number"
         },
         "min_delinquent_amount": {
             "title": "Min $ Owed (Travis Tax)",
@@ -255,20 +166,84 @@
             "minimum": 0,
             "editor": "number"
         },
-        "skip_texdel_cleaner": {
-            "title": "Skip Travis Tax-Delinquent Skill Cleaner",
+        "filter_investor_zips": {
+            "title": "Investor-ZIP filter",
             "type": "boolean",
-            "description": "Bypass the skill cleaner (overflow merge, address contamination strip, blank-zip resolver). Safety valve.",
+            "description": "ON: only records in the 34 investor-active ZIPs (target_zips.json) pass (Steps 2a / 8c). OFF: every ZIP is kept.",
+            "default": true,
+            "editor": "checkbox",
+            "sectionCaption": "Filters (on = matching records are dropped)"
+        },
+        "filter_condos": {
+            "title": "Condo / townhouse / unit filter",
+            "type": "boolean",
+            "description": "ON: condos, townhouses and unit-designated addresses (Ste / Unit / Apt / #) are dropped (Step 8a). OFF: kept.",
+            "default": true,
+            "editor": "checkbox"
+        },
+        "filter_listed_properties": {
+            "title": "Listed-property filter",
+            "type": "boolean",
+            "description": "ON: records Zillow shows as Active / Pending / Sold / For Rent are dropped after enrichment (Step 8b). OFF: kept.",
+            "default": true,
+            "editor": "checkbox"
+        },
+        "drop_government_owned": {
+            "title": "Drop government-owned records",
+            "type": "boolean",
+            "description": "ON: owners like City Of, Travis County, State Of are left out of the DataSift CSV. OFF: kept.",
+            "default": true,
+            "editor": "checkbox"
+        },
+        "drop_vacant_land": {
+            "title": "Drop vacant land",
+            "type": "boolean",
+            "description": "ON: vacant-land parcels are dropped (Step 3). OFF: kept.",
             "default": false,
             "editor": "checkbox"
         },
-        "use_residential_proxy": {
-            "title": "Use Residential Proxy",
+        "drop_commercial": {
+            "title": "Drop commercial properties",
             "type": "boolean",
-            "description": "Route requests through Apify residential proxies. Default OFF on Free plan (saves quota). TX county sites don't require it.",
+            "description": "ON: commercial properties are dropped (Step 6a). OFF: kept.",
+            "default": false,
+            "editor": "checkbox"
+        },
+        "drop_entity_owners": {
+            "title": "Drop entity-owned properties",
+            "type": "boolean",
+            "description": "ON: LLC / Corp / Trust owners are dropped unless entity research found a person (Step 3b). OFF: kept.",
+            "default": false,
+            "editor": "checkbox"
+        },
+        "upload_datasift": {
+            "title": "Auto-upload to DataSift (upload wizard)",
+            "type": "boolean",
+            "description": "After the run, upload each per-notice-type CSV into DataSift through the app's upload wizard (Playwright, headed under Xvfb) \u2014 the same path as a manual upload. Each CSV is added to the record type's EXISTING list (Foreclosure, Probate, Liens, ...; no custom batch lists) and every row is tagged upload_YYYY-MM-DD. Then Enrich Property Information + Skip Trace run once on that tag. ~90s per CSV. Uses datasift_email + datasift_password. The Sold/Resolved cleanup CSV is never auto-uploaded.",
             "default": false,
             "editor": "checkbox",
-            "sectionCaption": "Operational"
+            "sectionCaption": "Output & DataSift"
+        },
+        "datasift_enrich_after_upload": {
+            "title": "Enrich in DataSift after upload",
+            "type": "boolean",
+            "description": "ON: after the wizard upload, Manage \u2192 Enrich Property Information runs on this run's records (free SiftMap data: beds/baths/Zestimate/sqft; Enrich/Swap Owners stay OFF). Only applies when the upload is on.",
+            "default": true,
+            "editor": "checkbox"
+        },
+        "datasift_skip_trace_after_upload": {
+            "title": "Skip-trace in DataSift after upload",
+            "type": "boolean",
+            "description": "ON: after the wizard upload, Send To \u2192 Skip Trace runs on this run's records. Unlimited plan, no per-record cost. Only applies when the upload is on.",
+            "default": true,
+            "editor": "checkbox"
+        },
+        "datasift_split_by_county": {
+            "title": "Split lead CSVs per county",
+            "type": "boolean",
+            "description": "Write one lead CSV per county+type (e.g. Travis_probate, Bell_probate) for per-county tracking, instead of one combined CSV per type. DataSift list names stay per-type.",
+            "editor": "checkbox",
+            "default": false
         },
         "notify_slack": {
             "title": "Send Slack Notification",
@@ -277,47 +252,10 @@
             "default": true,
             "editor": "checkbox"
         },
-        "state_kvs_name": {
-            "title": "Cross-run State KVS Name",
-            "type": "string",
-            "description": "Named key-value store for cross-run state (last_run_date, seen_notice_ids, *_texdel_state). Leave empty for the production default 'sift-stack-state'. Set to a throwaway name (e.g. 'sift-stack-state-test') to verify state round-trips without perturbing production.",
-            "editor": "textfield",
-            "default": ""
-        },
-        "upload_datasift": {
-            "title": "Auto-upload to DataSift (upload wizard)",
-            "type": "boolean",
-            "description": "After the run, upload each per-notice-type CSV into DataSift through the app's upload wizard (Playwright, headed under Xvfb) \u2014 the same path as a manual upload. Each CSV is added to the record type's EXISTING list (Foreclosure, Probate, Liens, ...; no custom batch lists) and every row is tagged upload_YYYY-MM-DD. Then Enrich Property Information + Skip Trace run once on that tag. ~90s per CSV. Uses datasift_email + datasift_password. The Sold/Resolved cleanup CSV is never auto-uploaded.",
-            "default": false,
-            "editor": "checkbox",
-            "sectionCaption": "DataSift auto-upload (upload wizard)"
-        },
-        "datasift_no_enrich": {
-            "title": "Skip DataSift Property Enrichment",
-            "type": "boolean",
-            "description": "After the upload, do NOT run Manage \u2192 Enrich Property Information on this run's records (free SiftMap data: beds/baths/Zestimate/sqft; Enrich/Swap Owners stay OFF either way). Only applies when upload_datasift is on.",
-            "default": false,
-            "editor": "checkbox"
-        },
-        "datasift_no_skip_trace": {
-            "title": "Skip DataSift Skip-Trace",
-            "type": "boolean",
-            "description": "After the upload, do NOT run Send To \u2192 Skip Trace on this run's records. Skip-trace is the account's unlimited plan (no per-record cost), so leave this OFF unless you want to trace by hand. Only applies when upload_datasift is on.",
-            "default": false,
-            "editor": "checkbox"
-        },
         "google_drive_folder_id": {
             "title": "Google Drive Folder ID (raw records \u2192 00_Inbox/daily)",
             "type": "string",
             "description": "Drive folder ID for the raw scraped record CSVs \u2014 point this at 00_Inbox/daily (these are records, not leads). Leave empty to skip Drive upload.",
-            "editor": "textfield",
-            "default": "",
-            "sectionCaption": "Google Drive"
-        },
-        "google_drive_reports_folder_id": {
-            "title": "Google Drive Reports Folder ID (PDFs \u2192 05_Deep-Prospecting-Reports)",
-            "type": "string",
-            "description": "Drive folder ID for deep-prospecting PDF reports. Leave empty to send PDFs to the same folder as the CSVs.",
             "editor": "textfield",
             "default": ""
         },
@@ -342,27 +280,27 @@
             "editor": "checkbox",
             "default": false
         },
-        "datasift_split_by_county": {
-            "title": "Split lead CSVs per county",
+        "use_residential_proxy": {
+            "title": "Use Residential Proxy",
             "type": "boolean",
-            "description": "Write one lead CSV per county+type (e.g. Travis_probate, Bell_probate) for per-county tracking, instead of one combined CSV per type. DataSift list names stay per-type.",
+            "description": "ON: requests route through Apify US residential proxies. Travis tccsearch (foreclosure / probate / lien / lis pendens) sits behind Cloudflare and only clears from a US residential IP, so OFF means Travis returns nothing.",
+            "default": true,
             "editor": "checkbox",
-            "default": false
+            "sectionCaption": "Platform & secrets"
         },
-        "google_service_account_key": {
-            "title": "Google Service Account Key (base64)",
+        "state_kvs_name": {
+            "title": "Cross-run State KVS Name",
             "type": "string",
-            "description": "Base64-encoded service account JSON. Required if google_drive_folder_id is set.",
-            "editor": "textarea",
-            "isSecret": true
+            "description": "Name of the cross-run state store. Leave blank for production (sift-stack-state). Set to sift-stack-state-test for a smoke run that must not touch production dedup / sold baselines.",
+            "editor": "textfield",
+            "default": ""
         },
         "apify_token": {
             "title": "Apify Personal API Token",
             "type": "string",
             "description": "Your Apify Personal API token (Console \u2192 Settings \u2192 Integrations \u2192 Personal API token). Required \u2014 Apify's auto-injected run token cannot access the cross-run state KVS. Paste once; scheduled runs inherit it.",
             "editor": "textfield",
-            "isSecret": true,
-            "sectionCaption": "API keys (secrets)"
+            "isSecret": true
         },
         "anthropic_api_key": {
             "title": "Anthropic API Key",
@@ -392,39 +330,11 @@
             "editor": "textfield",
             "isSecret": true
         },
-        "serper_api_key": {
-            "title": "Serper.dev API Key",
+        "google_service_account_key": {
+            "title": "Google Service Account Key (base64)",
             "type": "string",
-            "description": "Google search (obituary lookup + DM address). Free tier 2,500 queries.",
-            "editor": "textfield",
-            "isSecret": true
-        },
-        "firecrawl_api_key": {
-            "title": "Firecrawl API Key",
-            "type": "string",
-            "description": "JS-rendered page scraping for DM address extraction. Free tier 500 pages.",
-            "editor": "textfield",
-            "isSecret": true
-        },
-        "directskip_api_key": {
-            "title": "DirectSkip API Key",
-            "type": "string",
-            "description": "Single-record skip-trace service ($0.10/hit, no-match free). Required only if enable_directskip is true. The API is IP-allowlisted — it will NOT authenticate from Apify.",
-            "editor": "textfield",
-            "isSecret": true
-        },
-        "tracerfy_api_key": {
-            "title": "[deprecated] Tracerfy API Key",
-            "type": "string",
-            "description": "Retired 2026-08-20 — ignored. Kept only so old schedule runInputs still validate.",
-            "editor": "textfield",
-            "isSecret": true
-        },
-        "trestle_api_key": {
-            "title": "Trestle API Key",
-            "type": "string",
-            "description": "Phone validation + 5-tier dial priority. Required only if enable_trestle is true.",
-            "editor": "textfield",
+            "description": "Base64-encoded service account JSON. Required if google_drive_folder_id is set.",
+            "editor": "textarea",
             "isSecret": true
         },
         "datasift_email": {
@@ -447,36 +357,6 @@
             "description": "Webhook URL for run summary notifications.",
             "editor": "textfield",
             "isSecret": true
-        },
-        "tcc_lookback_days": {
-            "title": "TCC lookback days (backfill)",
-            "type": "integer",
-            "description": "Widen the Travis tccsearch scrape window beyond the shared daily lookback (only widens, never narrows). Use e.g. 60 for a one-off backfill; leave 0 for normal runs.",
-            "default": 0
-        },
-        "daily_lookback_days": {
-            "title": "Daily rolling lookback (days)",
-            "type": "integer",
-            "description": "Every daily run re-scans today minus N days .. today on every date-windowed scraper, so rows the clerk posts nameless/addressless are re-hit once completed; cross-run dedup absorbs the repeats. 0 = default (14).",
-            "default": 0,
-            "minimum": 0,
-            "maximum": 120
-        },
-        "bell_ocr_budget_secs": {
-            "title": "Bell foreclosure OCR budget (seconds/run)",
-            "type": "integer",
-            "description": "Wall-clock budget for OCR-ing Bell County's scanned foreclosure PDFs each run (default 900). Already-read PDFs are remembered and replayed for free, so only new/re-posted/unfinished PDFs spend it. Raise (e.g. 2400) for a one-off backfill.",
-            "default": 900,
-            "minimum": 0,
-            "maximum": 3600
-        },
-        "williamson_ocr_budget_secs": {
-            "title": "Williamson foreclosure OCR budget (seconds/run)",
-            "type": "integer",
-            "description": "Wall-clock budget for OCR-ing Williamson County's individual trustee-sale notice PDFs when the clerk has not posted a month's index yet (default 600). Remembered PDFs replay for free. Raise (e.g. 3600) for a one-off backfill.",
-            "default": 600,
-            "minimum": 0,
-            "maximum": 3600
         }
     }
 }

@@ -478,18 +478,22 @@ async def actor_main() -> None:
             "SMARTY_AUTH_ID": actor_input.get("smarty_auth_id", ""),
             "SMARTY_AUTH_TOKEN": actor_input.get("smarty_auth_token", ""),
             "OPENWEBNINJA_API_KEY": actor_input.get("openwebninja_api_key", ""),
-            "SERPER_API_KEY": actor_input.get("serper_api_key", ""),
-            "FIRECRAWL_API_KEY": actor_input.get("firecrawl_api_key", ""),
-            "DIRECTSKIP_API_KEY": actor_input.get("directskip_api_key", ""),
             "DATASIFT_EMAIL": actor_input.get("datasift_email", ""),
             "DATASIFT_PASSWORD": actor_input.get("datasift_password", ""),
             "SLACK_WEBHOOK_URL": actor_input.get("slack_webhook_url", ""),
-            "TRESTLE_API_KEY": actor_input.get("trestle_api_key", ""),
         }
         for key, val in _cred_map.items():
             if val:
                 setattr(config, key, val)
                 os.environ[key] = val
+        # Retired from the Actor 2026-09-17 (owner decision): obituary /
+        # Ancestry / Serper / Firecrawl (DataSift pulls obituaries itself on
+        # import), DirectSkip + Trestle (IP-allowlisted API — can never run
+        # from Apify; skip tracing is the operator-box orchestrator). Blank
+        # the keys so no key-presence gate can fire them in the cloud.
+        for _k in ("SERPER_API_KEY", "FIRECRAWL_API_KEY", "DIRECTSKIP_API_KEY", "TRESTLE_API_KEY"):
+            setattr(config, _k, "")
+            os.environ.pop(_k, None)
 
         # Alert-system drill: makes one named scraper raise intentionally so
         # the 🚨 health alert path can be verified end-to-end on the platform.
@@ -531,12 +535,9 @@ async def actor_main() -> None:
         types = actor_input.get("types") or None
         since_date_override = (actor_input.get("since_date") or "").strip()
         drive_folder_id = actor_input.get("google_drive_folder_id", "")
-        drive_reports_folder_id = actor_input.get("google_drive_reports_folder_id", "")
         drive_key_b64 = actor_input.get("google_service_account_key", "")
         if drive_folder_id:
             config.GOOGLE_DRIVE_FOLDER_ID = drive_folder_id
-        if drive_reports_folder_id:
-            config.GOOGLE_DRIVE_REPORTS_FOLDER_ID = drive_reports_folder_id
         drive_cleanup_folder_id = actor_input.get("google_drive_cleanup_folder_id", "")
         if drive_cleanup_folder_id:
             config.GOOGLE_DRIVE_CLEANUP_FOLDER_ID = drive_cleanup_folder_id
@@ -553,86 +554,48 @@ async def actor_main() -> None:
         # ── Scraper kwargs (tax-delinquent thresholds + skill cleaner knobs) ──
         min_years = int(actor_input.get("min_delinquent_years", 2) or 2)
         min_amount = float(actor_input.get("min_delinquent_amount", 3000.0) or 3000.0)
-        skip_texdel_cleaner = bool(actor_input.get("skip_texdel_cleaner", False))
+        # Every switch below is POSITIVE: on = the Actor does the thing
+        # (owner rule 2026-09-17 — the old skip_* / no_* / keep_* names read
+        # backwards). Defaults are "on" for everything that runs in production.
         max_notices = int(actor_input.get("max_notices", 0) or 0) or None
         scraper_kwargs = {"min_years": min_years, "min_amount": min_amount}
-        if skip_texdel_cleaner:
+        if not bool(actor_input.get("travis_texdel_cleaner", True)):
             scraper_kwargs["skip_cleaner"] = True
 
-        # ── Enrichment flags (mirror CLI) ──
-        enable_obituary = bool(actor_input.get("enable_obituary", False))
-        enable_ancestry = bool(actor_input.get("enable_ancestry", False))
-        # `enable_tracerfy` is the legacy toggle name kept for old schedule
-        # runInputs — same switch, DirectSkip is the vendor now.
-        enable_directskip = bool(actor_input.get(
-            "enable_directskip", actor_input.get("enable_tracerfy", False)))
-        enable_trestle = bool(actor_input.get("enable_trestle", False))
-        # enable_directskip=false must mean NO DirectSkip calls at all — but the
-        # obituary enricher's inline tier-3 + Phase C DM-address lookups gate on
-        # key PRESENCE (cfg.DIRECTSKIP_API_KEY), not this toggle. Any input that
-        # carries the key secret would fire them (the same silent-spend class as
-        # the 2026-07-22 Tracerfy Phase C incident). Blank the key so every
-        # DirectSkip path is dead when the toggle is off. (Note: the DirectSkip
-        # API is IP-allowlisted and Apify has no static egress IP, so cloud
-        # calls fail auth anyway — this keeps them from even being attempted.)
-        if not enable_directskip:
-            config.DIRECTSKIP_API_KEY = ""
-            os.environ.pop("DIRECTSKIP_API_KEY", None)
+        # ── Enrichment + filter switches (positive names, on = it runs) ──
+        standardize_addresses = bool(actor_input.get("standardize_addresses", True))
+        enrich_zillow = bool(actor_input.get("enrich_zillow", True))
+        enrich_cad_tax = bool(actor_input.get("enrich_cad_tax", True))
+        geocode_retry = bool(actor_input.get("geocode_retry", True))
         research_entities = bool(actor_input.get("research_entities", False))
-        keep_government = bool(actor_input.get("keep_government_records", False))
-        keep_listed = bool(actor_input.get("keep_listed", False))
-        skip_smarty = bool(actor_input.get("skip_smarty", False))
-        skip_zillow = bool(actor_input.get("skip_zillow", False))
-        skip_tax = bool(actor_input.get("skip_tax", False))
-        skip_geocode = bool(actor_input.get("skip_geocode", False))
-        skip_zip_filter = bool(actor_input.get("skip_zip_filter", False))
-        skip_condo_filter = bool(actor_input.get("skip_condo_filter", False))
-        skip_heir_verification = bool(actor_input.get("skip_heir_verification", False))
-        skip_dm_address = bool(actor_input.get("skip_dm_address", False))
-        max_heir_depth = int(actor_input.get("max_heir_depth", 2) or 2)
-        obituary_workers = int(actor_input.get("obituary_workers", 4) or 4)
-        # Wall-clock ceiling (seconds from actor start) for the obituary step.
-        # Keeps the sequential Phase B from blowing the actor timeout: past this
-        # point it stops enriching and lets remaining records flow through and
-        # upload. 0 disables. Default 2700s (45min) leaves margin under the 3600s
-        # actor timeout for scraping + upload/Drive/Slack/reports.
-        obituary_deadline_secs = int(actor_input.get("obituary_deadline_secs", 2700) or 0)
-        obituary_deadline = (
-            _PROCESS_START + obituary_deadline_secs
-            if obituary_deadline_secs > 0 else None
-        )
-
-        # Legacy buy-box toggles (kept for backwards compatibility)
-        exclude_vacant = bool(actor_input.get("exclude_vacant", False))
-        exclude_commercial = bool(actor_input.get("exclude_commercial", False))
-        exclude_entities = bool(actor_input.get("exclude_entities", False))
+        filter_investor_zips = bool(actor_input.get("filter_investor_zips", True))
+        filter_condos = bool(actor_input.get("filter_condos", True))
+        filter_listed_properties = bool(actor_input.get("filter_listed_properties", True))
+        drop_government_owned = bool(actor_input.get("drop_government_owned", True))
+        drop_vacant_land = bool(actor_input.get("drop_vacant_land", False))
+        drop_commercial = bool(actor_input.get("drop_commercial", False))
+        drop_entity_owners = bool(actor_input.get("drop_entity_owners", False))
+        keep_government = not drop_government_owned
 
         # ── Operational toggles ──
         do_notify_slack = bool(actor_input.get("notify_slack", True))
         rebuild_dedup_only = bool(actor_input.get("rebuild_dedup_only", False))
         rebuild_seal_all = bool(actor_input.get("rebuild_seal_all", False))
-        no_reports = bool(actor_input.get("no_reports", False))
-        use_proxy = bool(actor_input.get("use_residential_proxy", False))  # Default OFF on Free plan
+        # Default ON: Travis tccsearch sits behind Cloudflare and only clears
+        # from a US residential IP (see tccsearch_common). Off = Travis dark.
+        use_proxy = bool(actor_input.get("use_residential_proxy", True))
 
         # ── DataSift auto-upload (the upload wizard, driven by Playwright) ──
         # Same path the operator runs by hand: headed Chromium under the
         # Actor's xvfb-run, one wizard pass per CSV onto the record type's
         # ESTABLISHED list, then enrich + skip-trace anchored on this run's
         # batch tag. The internal API stays read-only (owner policy
-        # 2026-08-12); `upload_datasift_api` is the retired RAWPIPE key and
-        # is honoured only as an alias so an old stored schedule input still
-        # means "upload".
+        # 2026-08-12); the RAWPIPE path and its `upload_datasift_api` key are
+        # gone (2026-09-17).
         upload_datasift = bool(actor_input.get("upload_datasift", False))
-        if not upload_datasift and actor_input.get("upload_datasift_api"):
-            Actor.log.warning(
-                "upload_datasift_api is retired (RAWPIPE removed) — treating it as "
-                "upload_datasift=true: the upload goes through the wizard"
-            )
-            upload_datasift = True
-        datasift_do_enrich = not bool(actor_input.get("datasift_no_enrich", False))
-        # Skip-trace is the account's unlimited plan — no per-record cost —
-        # so it defaults ON like the operator's manual batches.
-        datasift_do_skip_trace = not bool(actor_input.get("datasift_no_skip_trace", False))
+        datasift_do_enrich = bool(actor_input.get("datasift_enrich_after_upload", True))
+        # Skip-trace is the account's unlimited plan — no per-record cost.
+        datasift_do_skip_trace = bool(actor_input.get("datasift_skip_trace_after_upload", True))
         # Per-run batch tag: every uploaded row carries it, and the bulk
         # actions select by it (never by the established list).
         from datetime import datetime as _dt_bt
@@ -668,11 +631,7 @@ async def actor_main() -> None:
                 # ones (a foreign IP hitting a Texas clerk site is itself a bot
                 # signal). country_code="US" is overridable via the SIFT_PROXY_COUNTRY
                 # input/env for experimentation.
-                country = (
-                    actor_input.get("proxy_country")
-                    or os.environ.get("SIFT_PROXY_COUNTRY")
-                    or "US"
-                ).strip().upper() or None
+                country = (os.environ.get("SIFT_PROXY_COUNTRY") or "US").strip().upper() or None
                 proxy_config = await Actor.create_proxy_configuration(
                     groups=["RESIDENTIAL"], country_code=country,
                 )
@@ -912,27 +871,30 @@ async def actor_main() -> None:
             # ── Enrichment pipeline (full CLI parity) ──
             from enrichment_pipeline import PipelineOptions, run_enrichment_pipeline
 
+            # Obituary / Ancestry / heir verification / DM address are
+            # permanently OFF in the Actor (2026-09-17): DataSift pulls
+            # nationwide obituaries itself on import, and the step had not
+            # actually run in any September scheduled run anyway (its 45-min
+            # budget was gone before Phase A). The modules stay for the
+            # operator-side deep-prospecting skill.
             opts = PipelineOptions(
                 skip_parcel_lookup=True,
-                skip_vacant_filter=not exclude_vacant,
-                skip_commercial_filter=not exclude_commercial,
-                skip_entity_filter=not exclude_entities,
-                skip_smarty=skip_smarty,
-                skip_zillow=skip_zillow,
-                skip_tax=skip_tax,
-                skip_geocode=skip_geocode,
-                skip_obituary=not enable_obituary,
-                skip_ancestry=not enable_ancestry,
+                skip_vacant_filter=not drop_vacant_land,
+                skip_commercial_filter=not drop_commercial,
+                skip_entity_filter=not drop_entity_owners,
+                skip_smarty=not standardize_addresses,
+                skip_zillow=not enrich_zillow,
+                skip_tax=not enrich_cad_tax,
+                skip_geocode=not geocode_retry,
+                skip_obituary=True,
+                skip_ancestry=True,
                 skip_entity_research=not research_entities,
-                skip_heir_verification=skip_heir_verification,
-                max_heir_depth=max_heir_depth,
-                skip_dm_address=skip_dm_address,
+                skip_heir_verification=True,
+                skip_dm_address=True,
                 directskip_tier1=False,
-                obituary_workers=obituary_workers,
-                obituary_deadline=obituary_deadline,
-                skip_zip_filter=skip_zip_filter,
-                skip_condo_filter=skip_condo_filter,
-                skip_mls_filter=keep_listed,
+                skip_zip_filter=not filter_investor_zips,
+                skip_condo_filter=not filter_condos,
+                skip_mls_filter=not filter_listed_properties,
                 source_label="Apify Actor",
             )
             notices = run_enrichment_pipeline(notices, opts)
@@ -1001,117 +963,11 @@ async def actor_main() -> None:
 
             total = len(notices)
 
-            # ── DirectSkip (opt-in) ──
-            directskip_stats: dict = {}
-            tiers_map: dict = {}
-            if enable_directskip and config.DIRECTSKIP_API_KEY:
-                dp_for_directskip = [
-                    n for n in notices
-                    if n.owner_deceased == "yes" or n.heir_map_json or n.decision_maker_name
-                ]
-                if dp_for_directskip:
-                    Actor.log.info(
-                        "DirectSkip: running on %d DP candidates (%d basic records skipped)",
-                        len(dp_for_directskip), total - len(dp_for_directskip),
-                    )
-                    try:
-                        from directskip_batch import batch_skip_trace
-                        directskip_stats = batch_skip_trace(dp_for_directskip)
-                        if directskip_stats.get("auth_failed"):
-                            Actor.log.error(
-                                "DIRECTSKIP AUTH FAILED — the API is IP-allowlisted and "
-                                "Apify has no static egress IP; run DirectSkip from the "
-                                "operator box (skip_orchestrator) instead."
-                            )
-                        Actor.log.info(
-                            "DirectSkip: %d/%d matched, %d phones, %d emails, $%.2f",
-                            directskip_stats.get("matched", 0),
-                            directskip_stats.get("submitted", 0),
-                            directskip_stats.get("phones_found", 0),
-                            directskip_stats.get("emails_found", 0),
-                            directskip_stats.get("cost", 0.0),
-                        )
-                    except Exception as e:
-                        Actor.log.warning("DirectSkip skip trace failed: %s — continuing", e)
-                else:
-                    Actor.log.info("DirectSkip: no DP candidates — skipped")
-
-                # Trestle tier scoring (only after DirectSkip — needs phones)
-                if enable_trestle and config.TRESTLE_API_KEY:
-                    dp_cands = [
-                        n for n in notices
-                        if n.owner_deceased == "yes" or n.heir_map_json or n.decision_maker_name
-                    ]
-                    if dp_cands:
-                        try:
-                            from phone_validator import score_record_phones
-                            tiers_map = score_record_phones(dp_cands, config.TRESTLE_API_KEY)
-                            Actor.log.info(
-                                "Trestle scored %d unique phones across %d DP records",
-                                len(tiers_map), len(dp_cands),
-                            )
-                        except Exception as e:
-                            Actor.log.warning("Per-record Trestle scoring failed: %s", e)
-
-            # ── Deep Prospecting PDFs → Google Drive ──
-            # Uploaded to the same Drive folder as the DataSift CSVs so the Slack
-            # links are clickable webViewLinks (Apify KVS records are now Restricted
-            # by default and their raw API URLs fail with auth errors).
-            pdf_urls: list[dict] = []
-            dp_candidates = [] if no_reports else [
-                n for n in notices
-                if n.owner_deceased == "yes" or n.heir_map_json or n.decision_maker_name
-            ]
-            if no_reports:
-                Actor.log.info("Deep-prospecting reports disabled (no_reports=True)")
-            # Deep-prospecting PDFs go to the dedicated reports folder
-            # (05_Deep-Prospecting-Reports); falls back to the main lead
-            # folder if a separate reports folder isn't configured.
-            reports_folder = config.GOOGLE_DRIVE_REPORTS_FOLDER_ID or config.GOOGLE_DRIVE_FOLDER_ID
-            if dp_candidates and not (
-                reports_folder and config.GOOGLE_SERVICE_ACCOUNT_KEY
-            ):
-                Actor.log.warning(
-                    "Drive creds not set — skipping %d deep-prospecting PDF link(s)",
-                    len(dp_candidates),
-                )
-            elif dp_candidates:
-                try:
-                    from report_generator import generate_record_pdf
-                    from drive_uploader import upload_file
-                    from datetime import datetime as _dt
-                    report_dir = Path("output/reports")
-                    _rpt_now = _dt.now()
-                    _rpt_year = _rpt_now.strftime("%Y")
-                    _rpt_month = _rpt_now.strftime("%m-%B")
-                    for n in dp_candidates:
-                        try:
-                            pdf_path = generate_record_pdf(
-                                n, output_dir=report_dir, phone_tiers=tiers_map,
-                            )
-                        except Exception:
-                            Actor.log.exception("PDF generation failed for %s", n.address)
-                            continue
-                        rsub = (
-                            [_rpt_year, _rpt_month, n.county or "Unknown", n.notice_type or "unknown"]
-                            if config.GOOGLE_DRIVE_AUTO_FOLDER else None
-                        )
-                        link = upload_file(
-                            pdf_path,
-                            reports_folder,
-                            config.GOOGLE_SERVICE_ACCOUNT_KEY,
-                            subfolder_parts=rsub,
-                        )
-                        if link:
-                            pdf_urls.append({"address": n.address, "url": link})
-                        else:
-                            Actor.log.error("PDF Drive upload failed for %s", n.address)
-                    Actor.log.info(
-                        "Generated %d deep-prospecting PDFs → Drive (%d records without DP data)",
-                        len(pdf_urls), total - len(dp_candidates),
-                    )
-                except Exception as e:
-                    Actor.log.warning("PDF generator import failed: %s", e)
+            # Deep-prospecting (DirectSkip / Trestle / per-record PDFs) left the
+            # Actor on 2026-09-17 with the obituary step — every candidate
+            # needed a deceased flag, heir map or decision maker, and only the
+            # obituary step produced those. Skip tracing runs from the
+            # operator box (skip_orchestrator); DataSift enriches on import.
 
             # NOTE: drop-off cleanup records (Sold + Code Violation Resolved) are
             # NOT merged into `notices`. They go to their own cleanup CSV below
@@ -1442,8 +1298,6 @@ async def actor_main() -> None:
                     _llm_usage["calls"], _llm_usage["input_tokens"],
                     _llm_usage["output_tokens"], _llm_usage["by_model"],
                 )
-            if directskip_stats and directskip_stats.get("cost", 0) > 0:
-                cost_breakdown["DirectSkip"] = round(directskip_stats["cost"], 2)
             smarty_count = sum(1 for n in notices if n.dpv_match_code)
             if smarty_count > 250:
                 cost_breakdown["Smarty"] = round((smarty_count - 250) * 0.01, 2)
@@ -1455,7 +1309,7 @@ async def actor_main() -> None:
                 try:
                     from slack_notifier import (
                         send_slack_notification, _send_webhook,
-                        build_datasift_upload_block, build_pdf_block,
+                        build_datasift_upload_block,
                         build_drive_csv_block,
                     )
                     # TIGHTFEED message ①: slim daily report. Suppressed
@@ -1482,12 +1336,6 @@ async def actor_main() -> None:
                     )
                     if upload_block:
                         _send_webhook(upload_block)
-                    # TIGHTFEED message ④: Deep Prospecting with Drive
-                    # CSV link header + per-record PDF links.
-                    pdf_block = build_pdf_block(pdf_urls, drive_links=drive_links)
-                    if pdf_block:
-                        _send_webhook(pdf_block)
-
                     # Travis tax-delinquent NEW/REPEAT/DROPPED diff block
                     try:
                         from scrapers import tax_delinquent_travis as _tx_tex
@@ -1590,6 +1438,15 @@ async def actor_main() -> None:
             )
             await kvs.set_value("seen_notice_ids", sorted(seen_ids))
             await kvs.set_value("last_run_date", datetime.now().strftime("%Y-%m-%d"))
+
+            # ── State-store retention (2026-09-17) ──
+            # The raw-roll archives only ever accumulated (469 MB by Sept);
+            # keep the newest 7 per county + PDFs <= 30 days, never state keys.
+            try:
+                import kvs_retention as _kvr
+                await _kvr.sweep(_state_kvs, log=Actor.log)
+            except Exception:
+                Actor.log.exception("KVS retention sweep failed (non-fatal)")
             await kvs.set_value(
                 "travis_texdel_state",
                 _texdel_state.snapshot_apify_state(),

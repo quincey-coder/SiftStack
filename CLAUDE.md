@@ -952,8 +952,50 @@ apify push
 - `mode`: "daily" or "historical"
 - `counties` / `types`: arrays to filter sources (empty = all)
 - `google_drive_folder_id`, `google_service_account_key`: optional Google Drive upload
-- `upload_datasift` (+ `datasift_no_enrich`, `datasift_no_skip_trace`): the
-  Actor auto-upload, below. Off in production until the owner flips it.
+- `upload_datasift` (+ `datasift_enrich_after_upload`,
+  `datasift_skip_trace_after_upload`): the Actor auto-upload, below. Off in
+  production until the owner flips it.
+
+### Actor input cleanup — every switch is POSITIVE (2026-09-17, owner decision)
+
+The Console went from 66 inputs (63 + 3 hidden) to 47 in five sections
+(Scrape scope · Enrichment · Filters · Output & DataSift · Platform &
+secrets). Rule: a switch is named for what the Actor does, ON means it does
+it, defaults are ON for everything that runs in production. Renames:
+`skip_smarty`→`standardize_addresses`, `skip_zillow`→`enrich_zillow`,
+`skip_tax`→`enrich_cad_tax`, `skip_geocode`→`geocode_retry`,
+`skip_zip_filter`→`filter_investor_zips`, `skip_condo_filter`→`filter_condos`,
+`keep_listed`→`filter_listed_properties`,
+`keep_government_records`→`drop_government_owned`,
+`skip_texdel_cleaner`→`travis_texdel_cleaner`,
+`datasift_no_enrich`→`datasift_enrich_after_upload`,
+`datasift_no_skip_trace`→`datasift_skip_trace_after_upload`,
+`exclude_*`→`drop_vacant_land` / `drop_commercial` / `drop_entity_owners`.
+`use_residential_proxy` now defaults ON (Travis tccsearch needs it).
+REMOVED from the Actor (the modules stay for CLI/skills): the whole obituary
+family (`enable_obituary`, `enable_ancestry`, `skip_heir_verification`,
+`skip_dm_address`, `max_heir_depth`, `obituary_workers`,
+`obituary_deadline_secs`, `serper_api_key`, `firecrawl_api_key`,
+`google_drive_reports_folder_id`, hidden `no_reports`) — DataSift pulls
+nationwide obituaries itself on import, and the step had not actually run in
+any September scheduled run (its 45-min budget was gone before Phase A: the
+24 scrape targets take 40-53 min, Zillow 8-20 min); DirectSkip + Trestle
+(`enable_directskip`, `directskip_api_key`, `enable_trestle`,
+`trestle_api_key` — IP-allowlisted API, can never run from Apify); Tracerfy
+(`enable_tracerfy`, `tracerfy_api_key` — never read by code); the RAWPIPE
+alias `upload_datasift_api`; hidden `proxy_country`. The Actor pins
+`skip_obituary/skip_ancestry/skip_heir_verification/skip_dm_address=True`
+and no longer generates deep-prospecting PDFs or a Heirs CSV. The CLI flags
+are untouched. Old schedule inputs are re-synced with
+`scripts/apify_resync_schedule_input.py` (dry run by default, `--apply`);
+Apify ignores unknown keys, so a stale schedule silently runs on defaults.
+`src/kvs_retention.py` sweeps the state store at the end of every run
+(newest 7 raw rolls per county, deep-prospecting PDFs ≤ 30 days; state /
+diff / CSV keys never touched) — the archives had grown to 278 rolls /
+469 MB because "keep 7" was a comment, not code. Rollback point: git tag
+`pre-actor-cleanup-2026-09-17` = build 1.1.89, schedule + input backups in
+`state_backups/apify_rollback_2026-09-17/`, purged rolls in
+`state_backups/kvs_raw_rolls_2026-09-17/`.
 
 ### Actor auto-upload = the upload wizard, not the API (2026-09-17)
 

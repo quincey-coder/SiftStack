@@ -10,7 +10,7 @@
     "minMemoryMbytes": 2048,
     "maxMemoryMbytes": 4096,
     "defaultRunOptions": {
-        "memoryMbytes": 2048,
+        "memoryMbytes": 4096,
         "timeoutSecs": 7200
     },
     "storages": {
