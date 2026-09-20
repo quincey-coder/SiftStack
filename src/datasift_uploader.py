@@ -8,6 +8,7 @@ DataSift has no public REST API, so we automate the web UI:
 Requires: DATASIFT_EMAIL and DATASIFT_PASSWORD in .env or environment.
 """
 
+import hashlib
 import logging
 import os
 import re
@@ -1365,6 +1366,15 @@ async def upload_to_datasift(
             await browser.close()
 
 
+def _csv_sha256(path) -> str:
+    """Content hash of an upload CSV ("" when unreadable → never treated as
+    already-uploaded, so the safe direction is a re-upload)."""
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return ""
+
+
 async def upload_datasift_split(
     csv_infos: list[dict],
     email: str | None = None,
@@ -1375,6 +1385,8 @@ async def upload_datasift_split(
     existing_list: bool = False,
     batch_tag: str | None = None,
     launch_args: list[str] | None = None,
+    resume: dict | None = None,
+    on_progress=None,
 ) -> dict:
     """Upload multiple CSVs sequentially for split Message Board entries.
 
@@ -1397,12 +1409,60 @@ async def upload_datasift_split(
             are selected. Required whenever existing_list=True and a bulk
             action is on.
         launch_args: Extra Chromium args (the Actor passes --no-sandbox).
+        resume: Progress from an earlier attempt IN THE SAME RUN (the Actor
+            restarts from scratch when Apify migrates it to a new host):
+            ``{"uploaded": {label: sha256}, "enrich_done", "skip_trace_done"}``.
+            A CSV is skipped only when its label AND content hash match — a
+            re-scrape that changed the file re-uploads it (DataSift merges by
+            address), so no row is lost. Bulk-action flags apply to the
+            batch-tag path only.
+        on_progress: ``async fn(state_dict)`` called after every CSV that
+            lands and every bulk action that succeeds, so the caller can
+            persist the state ``resume`` reads back.
 
     Returns:
         Dict with per-upload results, enrich_result, and skip_trace_result.
     """
     email = email or os.environ.get("DATASIFT_EMAIL", "")
     password = password or os.environ.get("DATASIFT_PASSWORD", "")
+
+    state = {
+        "uploaded": dict((resume or {}).get("uploaded") or {}),
+        "enrich_done": bool((resume or {}).get("enrich_done")),
+        "skip_trace_done": bool((resume or {}).get("skip_trace_done")),
+    }
+
+    async def _report_progress() -> None:
+        if on_progress is None:
+            return
+        try:
+            await on_progress(dict(state, uploaded=dict(state["uploaded"])))
+        except Exception:
+            logger.exception("upload progress callback failed (upload continues)")
+
+    hashes = {str(info["label"]): _csv_sha256(info["path"]) for info in csv_infos}
+
+    def _already_uploaded(label: str) -> bool:
+        return bool(hashes.get(label)) and state["uploaded"].get(label) == hashes[label]
+
+    _resumed_msg = "already uploaded earlier in this run (before a host restart)"
+    if (
+        csv_infos and batch_tag
+        and all(_already_uploaded(str(i["label"])) for i in csv_infos)
+        and (not enrich or state["enrich_done"])
+        and (not skip_trace or state["skip_trace_done"])
+    ):
+        logger.info("DataSift upload already completed earlier in this run — nothing to redo")
+        return {
+            "success": True,
+            "resumed": True,
+            "uploads": [
+                {"success": True, "label": i["label"], "resumed": True, "message": _resumed_msg}
+                for i in csv_infos
+            ],
+            "message": f"All {len(csv_infos)} CSVs + bulk actions already done before a host restart",
+            "batch_tag": batch_tag,
+        }
 
     if not email or not password:
         return {
@@ -1449,6 +1509,12 @@ async def upload_datasift_split(
             all_success = True
             for i, info in enumerate(csv_infos):
                 label = info["label"]
+                if _already_uploaded(str(label)):
+                    logger.info("Skipping CSV %d/%d (%s): %s",
+                                i + 1, len(csv_infos), label, _resumed_msg)
+                    uploads.append({"success": True, "label": label,
+                                    "resumed": True, "message": _resumed_msg})
+                    continue
                 logger.info("Uploading CSV %d/%d (%s): %s",
                             i + 1, len(csv_infos), label, info["path"])
 
@@ -1463,6 +1529,10 @@ async def upload_datasift_split(
                     logger.error("Upload %s failed: %s", label, result.get("message"))
                     all_success = False
                     break
+
+                if hashes.get(str(label)):
+                    state["uploaded"][str(label)] = hashes[str(label)]
+                    await _report_progress()
 
                 # Reset page state between uploads: dismiss popups + navigate
                 # back to records URL + dismiss again. Without this, the Beamer
@@ -1486,19 +1556,34 @@ async def upload_datasift_split(
             # of how many lists they were spread across. No per_list key —
             # a failure applies to every list (upload_outcome maps that).
             if all_success and csv_infos and batch_tag and (enrich or skip_trace):
-                logger.info("Waiting 60s for imports to land before bulk actions...")
-                await page.wait_for_timeout(60000)
+                do_enrich = enrich and not state["enrich_done"]
+                do_skip = skip_trace and not state["skip_trace_done"]
+                _done_before = {"success": True, "resumed": True, "anchor": f"tag:{batch_tag}",
+                                "message": "already submitted earlier in this run (before a host restart)"}
+                if enrich and not do_enrich:
+                    combined["enrich_result"] = dict(_done_before)
+                if skip_trace and not do_skip:
+                    combined["skip_trace_result"] = dict(_done_before)
+                if do_enrich or do_skip:
+                    logger.info("Waiting 60s for imports to land before bulk actions...")
+                    await page.wait_for_timeout(60000)
                 anchor_list = csv_infos[0]["list_name"]
-                if enrich:
+                if do_enrich:
                     er = await enrich_records(page, anchor_list, tag=batch_tag)
                     er["anchor"] = f"tag:{batch_tag}"
                     combined["enrich_result"] = er
                     logger.info("Enrichment [tag %s]: %s", batch_tag, er.get("message", ""))
-                if skip_trace:
+                    if er.get("success"):
+                        state["enrich_done"] = True
+                        await _report_progress()
+                if do_skip:
                     sr = await skip_trace_records(page, anchor_list, tag=batch_tag)
                     sr["anchor"] = f"tag:{batch_tag}"
                     combined["skip_trace_result"] = sr
                     logger.info("Skip trace [tag %s]: %s", batch_tag, sr.get("message", ""))
+                    if sr.get("success"):
+                        state["skip_trace_done"] = True
+                        await _report_progress()
                 return combined
 
             # Enrich + skip trace EVERY uploaded list. (This previously ran

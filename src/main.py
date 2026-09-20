@@ -1162,6 +1162,29 @@ async def actor_main() -> None:
                         "DataSift upload: no DISPLAY — running the wizard HEADLESS "
                         "(the Actor normally runs under xvfb-run)"
                     )
+                # Restart guard: Apify migrates runs to a new host mid-flight
+                # and the Actor then restarts from scratch (2 of 3 scheduled
+                # runs, 09-17..09-19). Progress lives in THIS RUN's default
+                # KVS — it survives the migration, never touches cross-run
+                # state — so a restart skips CSVs/bulk actions already done.
+                _UP_PROGRESS_KEY = "DATASIFT_UPLOAD_PROGRESS"
+                _up_resume: dict = {}
+                try:
+                    _saved = await Actor.get_value(_UP_PROGRESS_KEY)
+                    if isinstance(_saved, dict) and _saved.get("batch_tag") == _batch_tag:
+                        _up_resume = _saved
+                        Actor.log.warning(
+                            "DataSift upload: resuming after a restart — %d CSV(s) already "
+                            "uploaded, enrich_done=%s, skip_trace_done=%s",
+                            len(_saved.get("uploaded") or {}),
+                            bool(_saved.get("enrich_done")), bool(_saved.get("skip_trace_done")),
+                        )
+                except Exception:
+                    Actor.log.exception("Could not read upload progress (uploading everything)")
+
+                async def _save_upload_progress(state: dict) -> None:
+                    await Actor.set_value(_UP_PROGRESS_KEY, {**state, "batch_tag": _batch_tag})
+
                 try:
                     from datasift_uploader import upload_datasift_split
                     Actor.log.info(
@@ -1178,6 +1201,8 @@ async def actor_main() -> None:
                         existing_list=True,
                         batch_tag=_batch_tag,
                         launch_args=["--no-sandbox", "--disable-dev-shm-usage"],
+                        resume=_up_resume,
+                        on_progress=_save_upload_progress,
                     )
                 except Exception as e:
                     Actor.log.exception(
