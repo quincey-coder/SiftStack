@@ -420,6 +420,55 @@ def build_datasift_upload_block(
     return "\n".join(lines)
 
 
+def build_auction_block(notices: list, horizon_days: int = 60, limit: int = 20) -> str:
+    """UPCOMING AUCTIONS block for this run — soonest first.
+
+    Built from the run's own notices (no API calls). Shows each sale-dated
+    record within ``horizon_days``, flags re-posted (moved) and newly completed
+    postings, and counts anything whose date has already passed. Empty string
+    when there is nothing to show so the caller can skip the webhook.
+    """
+    from datetime import datetime as _dt
+    rows = []
+    passed = 0
+    for n in notices or []:
+        ad = getattr(n, "auction_date", "") or ""
+        if not ad:
+            continue
+        try:
+            d = _dt.strptime(ad[:10], "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        days = (d - _dt.now().date()).days
+        if days < 0:
+            passed += 1
+            continue
+        if days > horizon_days:
+            continue
+        rows.append((days, d, n))
+    if not rows and not passed:
+        return ""
+    rows.sort(key=lambda r: (r[0], (getattr(r[2], "county", "") or ""), (getattr(r[2], "address", "") or "")))
+    lines = [f"*UPCOMING AUCTIONS* — {len(rows)} within {horizon_days}d"
+             + (f" · {passed} already passed" if passed else "")]
+    for days, d, n in rows[:limit]:
+        who = (getattr(n, "owner_name", "") or getattr(n, "business_name", "") or "—")
+        flag = ""
+        if getattr(n, "auction_moved_from", ""):
+            flag = f"  ↪ moved from {n.auction_moved_from}"
+        elif getattr(n, "watch_reason", "") == "completed":
+            flag = "  ✚ completed"
+        if getattr(n, "auction_date_source", "") == "folder_month":
+            flag += "  (date assumed)"
+        lines.append(
+            f"• {d.strftime('%a %m/%d')} ({days}d)  {getattr(n, 'address', '') or '(no address)'}, "
+            f"{getattr(n, 'city', '') or ''}  [{(getattr(n, 'county', '') or '')}]  {who}{flag}"
+        )
+    if len(rows) > limit:
+        lines.append(f"… +{len(rows) - limit} more")
+    return "\n".join(lines)
+
+
 def build_drive_csv_block(drive_links: list[dict] | None) -> str:
     """Build the standalone *Drive CSVs* webhook block.
 

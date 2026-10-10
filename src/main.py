@@ -730,6 +730,13 @@ async def actor_main() -> None:
             seen_ids: set[str] = set(stored_seen)
             Actor.log.info("Loaded %d previously-seen notice IDs from KVS", len(seen_ids))
 
+            # Auction watch: per-key memory that lets a seen foreclosure
+            # posting back through when it completes (Temp-index lag) or its
+            # sale date moves (postponement). See auction_watch.py.
+            import auction_watch as _aw
+            auction_watch_state = _aw.coerce(await kvs.get_value(_aw.KVS_KEY))
+            Actor.log.info("Loaded %d auction-watch entries from KVS", len(auction_watch_state))
+
             # ── Load Travis tax-delinquent state ──
             stored_texdel = await kvs.get_value("travis_texdel_state") or _texdel_state._empty_state()
             _texdel_state.inject_apify_state(stored_texdel)
@@ -857,15 +864,15 @@ async def actor_main() -> None:
                 Actor.log.info("Rebuild complete — exiting without running pipeline")
                 return
 
-            # ── Incremental dedup filter ──
+            # ── Incremental dedup filter (+ auction-watch upgrades) ──
             if seen_ids and notices:
                 before = len(notices)
-                notices = [n for n in notices if n._dedup_key not in seen_ids]
+                notices, _aw_stats = _aw.apply(notices, seen_ids, auction_watch_state)
                 filtered = before - len(notices)
-                if filtered:
+                if filtered or _aw_stats["completed"] or _aw_stats["moved"]:
                     Actor.log.info(
-                        "Incremental dedup: filtered %d already-seen notices (%d remain)",
-                        filtered, len(notices),
+                        "Incremental dedup: filtered %d already-seen notices (%d remain); %s",
+                        filtered, len(notices), _aw.format_stats(_aw_stats),
                     )
 
             # ── Enrichment pipeline (full CLI parity) ──
@@ -914,6 +921,7 @@ async def actor_main() -> None:
                 Actor.log.warning("No notices found after enrichment")
                 # Still persist state so next run's window narrows
                 await kvs.set_value("seen_notice_ids", sorted(seen_ids))
+                await kvs.set_value(_aw.KVS_KEY, auction_watch_state)
                 await kvs.set_value(
                     "last_run_date", datetime.now().strftime("%Y-%m-%d"),
                 )
@@ -1349,6 +1357,14 @@ async def actor_main() -> None:
                     drive_csv_block = build_drive_csv_block(drive_links)
                     if drive_csv_block:
                         _send_webhook(drive_csv_block)
+                    # TIGHTFEED ①c: this run's sale-dated records, soonest first.
+                    try:
+                        from slack_notifier import build_auction_block
+                        auction_block = build_auction_block(notices)
+                        if auction_block:
+                            _send_webhook(auction_block)
+                    except Exception:
+                        Actor.log.exception("Auction Slack block failed")
                     # TIGHTFEED message ②: DataSift wizard-upload summary —
                     # per list landed/failed, batch tag, enrich + skip-trace
                     # status, per-record addresses + Drive CSV links. Only
@@ -1462,6 +1478,8 @@ async def actor_main() -> None:
                 _sealed, _left_open,
             )
             await kvs.set_value("seen_notice_ids", sorted(seen_ids))
+            _aw.record(notices, auction_watch_state)
+            await kvs.set_value(_aw.KVS_KEY, auction_watch_state)
             await kvs.set_value("last_run_date", datetime.now().strftime("%Y-%m-%d"))
 
             # ── State-store retention (2026-09-17) ──
@@ -3000,6 +3018,8 @@ def _run_scrape_pipeline(args, targets) -> None:
     # last_run_date. Load the persisted seen-IDs set so we can filter
     # already-processed notices before they hit the pipeline.
     cli_last_run, cli_seen_ids = _load_cli_state()
+    import auction_watch as _aw
+    cli_auction_watch = _aw.load_file()
     since_arg = getattr(args, "since", None)
     if args.mode == "daily" and since_arg is None and cli_last_run:
         since_arg = cli_last_run
@@ -3072,12 +3092,13 @@ def _run_scrape_pipeline(args, targets) -> None:
     # downstream pipeline mutations to notice.address don't poison the match.
     if cli_seen_ids and notices:
         before = len(notices)
-        notices = [n for n in notices if n._dedup_key not in cli_seen_ids]
+        notices, _aw_stats = _aw.apply(notices, cli_seen_ids, cli_auction_watch)
         filtered = before - len(notices)
-        if filtered:
+        if filtered or _aw_stats["completed"] or _aw_stats["moved"]:
             logging.info(
                 "Incremental dedup: filtered %d already-seen notices "
-                "(%d remain for processing)", filtered, len(notices),
+                "(%d remain for processing); %s",
+                filtered, len(notices), _aw.format_stats(_aw_stats),
             )
 
     # Run unified enrichment pipeline
@@ -3213,6 +3234,8 @@ def _run_scrape_pipeline(args, targets) -> None:
             _sealed, _left_open,
         )
         _save_cli_state(cli_seen_ids)
+        _aw.record(notices, cli_auction_watch)
+        _aw.save_file(cli_auction_watch)
 
     # Generate deep-prospecting PDFs for deceased/DM/heir records.
     # Matches the Apify branch behavior so CLI runs get the same reports —
@@ -3680,6 +3703,14 @@ def _run_scrape_pipeline(args, targets) -> None:
                 _send_webhook(drive_csv_block)
         except Exception:
             logging.exception("Drive CSV Slack block failed")
+        # TIGHTFEED ①c: this run's sale-dated records, soonest first.
+        try:
+            from slack_notifier import build_auction_block
+            auction_block = build_auction_block(notices)
+            if auction_block:
+                _send_webhook(auction_block)
+        except Exception:
+            logging.exception("Auction Slack block failed")
 
         # TIGHTFEED ②: RAWPIPE upload summary (CLI-side, fired when
         # --upload-datasift-api was used and produced api_results).

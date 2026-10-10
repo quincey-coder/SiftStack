@@ -89,3 +89,7 @@ youtube_transcripts.py
 owner_purge_poll.log
 purge_all_*.log
 scraper_health_state.json
+
+# auction_watch local state (cloud copy lives in the Apify KVS)
+auction_watch.json
+auction_watch.json.tmp

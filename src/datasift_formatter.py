@@ -13,7 +13,7 @@ import csv
 import json
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from config import OUTPUT_DIR
@@ -565,14 +565,25 @@ def _build_tags(notice: NoticeData, extra_tags: list[str] | None = None) -> str:
     else:
         tags.append("living")
 
-    # Upcoming auction
+    # Auction timing. `has_auction` is the legacy upcoming flag (kept — presets
+    # filter on it). The dated tag + bucket make the sale date sortable in
+    # DataSift without a custom field: a preset on `auction_in_30d` IS the hot
+    # list, and `auction_2026-11-03` isolates one sale day.
     if notice.auction_date:
         try:
-            auction_dt = datetime.strptime(notice.auction_date, "%Y-%m-%d")
-            if auction_dt >= datetime.now():
+            auction_dt = datetime.strptime(notice.auction_date[:10], "%Y-%m-%d")
+            if auction_dt.date() >= datetime.now().date():
                 tags.append("has_auction")
+            tags.append(f"auction_{auction_dt.strftime('%Y-%m-%d')}")
+            bucket = auction_bucket(auction_days_out(notice.auction_date))
+            if bucket:
+                tags.append(bucket)
         except ValueError:
             pass
+        if notice.auction_moved_from:
+            tags.append("auction_moved")
+        if notice.auction_date_source == "folder_month":
+            tags.append("auction_date_assumed")
 
     # Tax delinquent flag
     if notice.tax_delinquent_amount:
@@ -944,6 +955,89 @@ def _build_caretaker_section(notice: NoticeData) -> str:
     return "\n".join(lines)
 
 
+def _first_tuesday_check(d: datetime) -> bool:
+    """True when ``d`` is a lawful TX trustee-sale day (Tex. Prop. Code §51.002):
+    the first Tuesday of its month, or the first Wednesday when that Tuesday
+    falls on Jan 1 / Jul 4."""
+    first = d.replace(day=1)
+    tue = first + timedelta(days=(1 - first.weekday()) % 7)
+    if (tue.month, tue.day) in ((1, 1), (7, 4)):
+        return d.date() == (tue + timedelta(days=1)).date()
+    return d.date() == tue.date()
+
+
+def auction_days_out(auction_date: str, today: datetime | None = None) -> int | None:
+    """Days from today to the sale date (negative = already passed)."""
+    if not auction_date:
+        return None
+    try:
+        dt = datetime.strptime(auction_date[:10], "%Y-%m-%d")
+    except ValueError:
+        return None
+    today = today or datetime.now()
+    return (dt.date() - today.date()).days
+
+
+def auction_bucket(days: int | None) -> str:
+    """Tag bucket for a sale date — the hot-list ordering in one token."""
+    if days is None:
+        return ""
+    if days < 0:
+        return "auction_passed"
+    if days <= 30:
+        return "auction_in_30d"
+    if days <= 60:
+        return "auction_in_60d"
+    return "auction_90d_plus"
+
+
+def _build_auction_section(notice: NoticeData) -> str:
+    """=== AUCTION === block that leads the Notes on every sale-dated record.
+
+    The sale date is the single most time-critical fact on a foreclosure, and
+    the wizard has no built-in date target for it (every date target is a
+    custom field), so Notes is the channel that is guaranteed to survive the
+    upload. Carries: the sale day with days-to-go, the filing date, where the
+    posting came from, how sure the date is, and — on a re-emit — the prior
+    date it moved from.
+    """
+    if not notice.auction_date:
+        return ""
+    lines = []
+    days = auction_days_out(notice.auction_date)
+    try:
+        sale_dt = datetime.strptime(notice.auction_date[:10], "%Y-%m-%d")
+        sale_str = f"{sale_dt.strftime('%a')} {sale_dt.month}/{sale_dt.day}/{sale_dt.year}"
+    except ValueError:
+        sale_dt, sale_str = None, notice.auction_date
+    when = ""
+    if days is not None:
+        when = ("today" if days == 0 else f"in {days} days" if days > 0
+                else f"{-days} days ago")
+    lines.append(f"Sale: {sale_str}" + (f" ({when})" if when else ""))
+    if sale_dt is not None and not _first_tuesday_check(sale_dt):
+        lines.append("CHECK DATE: not a first-Tuesday sale day (TX Prop. Code §51.002)")
+    src = {
+        "record": "sale date indexed on the county record",
+        "notice_text": "sale date read from the posted notice",
+        "folder_month": "sale date ASSUMED from the posting month (not read from the notice)",
+    }.get(notice.auction_date_source, "")
+    if src:
+        lines.append(f"Date source: {src}")
+    if notice.date_added:
+        lines.append(f"Posted: {_format_date(notice.date_added)}")
+    if notice.source_url:
+        lines.append(f"Posting: {notice.source_url}")
+    if notice.auction_moved_from:
+        lines.append(
+            f"MOVED: was {_format_date(notice.auction_moved_from)} -> "
+            f"{_format_date(notice.auction_date)} (postponed/re-posted)"
+        )
+    elif notice.watch_reason == "completed":
+        lines.append("Posting completed by the clerk after the Temp-index lag (now has owner/address/date)")
+    return "=== AUCTION ===\n" + "\n".join(lines)
+
+
 def _build_property_section(notice: NoticeData) -> str:
     """Build the property/notice details section for Notes."""
     parts = []
@@ -1017,6 +1111,11 @@ def _build_notes(notice: NoticeData) -> str:
     if notice.owner_deceased == "yes":
         sections = []
 
+        # Section 0: sale date first — nothing on the record is more urgent
+        auction_section = _build_auction_section(notice)
+        if auction_section:
+            sections.append(auction_section)
+
         # Section 1: Deceased owner header
         deceased_parts = []
         if notice.decedent_name:
@@ -1064,8 +1163,11 @@ def _build_notes(notice: NoticeData) -> str:
 
         return "\n\n".join(sections)
 
-    # Living owner — caretaker (RAWCALL) on top, then property + optional legal owner
+    # Living owner — auction first, caretaker (RAWCALL), then property + legal owner
     parts = []
+    auction_section = _build_auction_section(notice)
+    if auction_section:
+        parts.append(auction_section)
     caretaker_section = _build_caretaker_section(notice)
     if caretaker_section:
         parts.append(caretaker_section)
@@ -1085,6 +1187,12 @@ def _build_dm_notes(notice: NoticeData) -> str:
     """
     if notice.owner_deceased != "yes":
         parts = []
+        # Sale date first — this is the per-type CSV every foreclosure
+        # actually uploads through, so the AUCTION block must lead HERE,
+        # not only in _build_notes() (which this path never calls).
+        auction_section = _build_auction_section(notice)
+        if auction_section:
+            parts.append(auction_section)
         caretaker_section = _build_caretaker_section(notice)
         if caretaker_section:
             parts.append(caretaker_section)
@@ -1095,6 +1203,9 @@ def _build_dm_notes(notice: NoticeData) -> str:
         return "\n\n".join(p for p in parts if p)
 
     sections = []
+    auction_section = _build_auction_section(notice)
+    if auction_section:
+        sections.append(auction_section)
 
     # Deceased owner header
     deceased_parts = []

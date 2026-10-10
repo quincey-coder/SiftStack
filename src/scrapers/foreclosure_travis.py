@@ -62,13 +62,40 @@ REQUEST_DELAY_MAX = 2.0
 # Regex to extract address from legal description "LOC" field
 # e.g. "LOC 16800 AVOLA CV PFLUGERVILLE TX 78660 PDV 5"
 # or   "LOC 6006 PALM CIR AUSTIN TX 78741"
+# Street-type suffixes, used WORD-BOUNDED. Without \b these alternatives match
+# INSIDE words and silently truncate the street, spilling the tail into the city:
+#   "16201 ARROW HEAD DRIVE LEANDER" -> ROW inside ARROW  -> ('16201 Arrow',
+#                                                            'Head Drive Leander')
+#   "9114 CANTER A RIDGE ROAD TEMPLE" -> TER inside CANTER
+#   "2323 BENBRIDGE TRL AUSTIN"       -> RIDGE inside BENBRIDGE
+#   "1205 EAST 13TH STREET AUSTIN"    -> ST inside EAST
+#   "2317 ... VALLEY APT 625 AUSTIN"  -> PT inside APT
+# Those corrupted addresses reach DataSift, which rejects the row outright or
+# "repairs" it into a different property. Found live 2026-10-08.
+_STREET_SUFFIXES = (
+    r"ST|AVE|RD|DR|LN|BLVD|WAY|CIR|CT|PL|CV|LOOP|RUN|PATH|TRL|PKWY|TER|HWY|PIKE"
+    r"|XING|PASS|PT|BND|VW|HOLW|GLN|CRES|SPUR|CMN"
+    r"|STREET|AVENUE|ROAD|DRIVE|LANE|BOULEVARD|CIRCLE|COURT|PLACE|COVE|TRAIL"
+    r"|TERRACE|PARKWAY|HIGHWAY|CROSSING|BEND|POINT|VIEW|RIDGE|ROW|WALK|KNOLL"
+    r"|OVERLOOK"
+)
+
+# Optional unit/apt designator that may follow the street type
+# ("... VIEW DR B AUSTIN", "... MAIN ST APT 4 AUSTIN").
+# A bare unit token after the street type is a SINGLE letter or a number only
+# ("VIEW DR B AUSTIN", "MAIN ST 2 AUSTIN"). Allowing 1-4 letters ate the first
+# word of two-word cities: "BEND LAGO VISTA" -> unit "LAGO", city "Vista".
+_UNIT_PART = r"(?:\s+(?:APT|UNIT|STE|SUITE|BLDG|LOT|#)\s*[\w-]+|\s+(?:[A-Z]|\d{1,4}))?"
+
+# The street part is GREEDY on purpose: it makes the engine prefer the
+# RIGHTMOST street suffix, which is the real one. Non-greedy stops at the first
+# and mis-splits "CANTER A RIDGE ROAD TEMPLE" after RIDGE. The city group must
+# match at least one character, so a greedy street can never swallow the city.
 _LOC_ADDR_RE = re.compile(
     r"LOC\s+"
-    r"(\d{1,5}\s+[\w\s.'-]+?"  # house number + street
-    r"(?:ST|AVE|RD|DR|LN|BLVD|WAY|CIR|CT|PL|CV|LOOP|RUN|PATH|TRL|PKWY|TER|HWY|PIKE|XING|PASS|PT|BND|VW|HOLW|GLN|CRES|SPUR|CMN"
-    r"|STREET|AVENUE|ROAD|DRIVE|LANE|BOULEVARD|CIRCLE|COURT|PLACE|COVE|TRAIL|TERRACE|PARKWAY|HIGHWAY|CROSSING|BEND|POINT|VIEW|RIDGE|ROW|WALK|KNOLL|OVERLOOK))"
+    r"(\d{1,5}\s+[\w\s.'-]*\b(?:" + _STREET_SUFFIXES + r")\b" + _UNIT_PART + r")"
     r"\s+"
-    r"([\w\s]+?)"  # city name
+    r"([A-Za-z][\w\s]*?)"  # city name (non-empty)
     r"\s+TX\s+"
     r"(\d{5})",  # zip
     re.IGNORECASE,
@@ -298,6 +325,7 @@ def _parse_record(row_num: str, record_text: str, lines: list[str]) -> NoticeDat
             try:
                 dt = datetime.strptime(m.group(1), "%m/%d/%Y")
                 notice.auction_date = dt.strftime("%Y-%m-%d")
+                notice.auction_date_source = "record"   # indexed in the [E] cell
             except ValueError:
                 pass
             break
