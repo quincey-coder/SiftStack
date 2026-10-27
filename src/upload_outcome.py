@@ -24,7 +24,7 @@ Stages, in pipeline order:
   crash          the uploader raised before producing per-list results
 
 Retry: ``python src/upload_outcome.py retry <manifest.json> [--csv-dir DIR]
-[--no-enrich] [--no-skip-trace]`` re-runs the Playwright uploader on the
+[--no-enrich] [--skip-trace]`` re-runs the Playwright uploader on the
 lists whose records never landed (login / upload / not_attempted / crash),
 and re-runs only the bulk action on lists that landed but missed enrich or
 skip trace. It never re-uploads a list that already landed — DataSift merges
@@ -509,13 +509,13 @@ def _main(argv=None) -> int:
     r.add_argument("manifest")
     r.add_argument("--csv-dir", help="folder holding the CSVs if not at their original paths")
     r.add_argument("--no-enrich", action="store_true")
-    r.add_argument("--no-skip-trace", action="store_true")
+    r.add_argument("--skip-trace", action="store_true", help="also re-run skip trace (off by default)")
     r.add_argument("--no-slack", action="store_true")
     args = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     return retry(
         args.manifest, csv_dir=args.csv_dir,
-        enrich=not args.no_enrich, skip_trace=not args.no_skip_trace, slack=not args.no_slack,
+        enrich=not args.no_enrich, skip_trace=args.skip_trace, slack=not args.no_slack,
     )
 
 

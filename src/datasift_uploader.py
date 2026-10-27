@@ -211,6 +211,12 @@ async def upload_csv(
             # GATE: never commit an upload whose required columns did not map.
             # Tags drive the niche-sequential presets, so an untagged upload is
             # worse than no upload — it lands records no sequence will work.
+            if result.get("mismapped"):
+                result["message"] = ("NOT finished — column(s) sit under the WRONG DataSift field: "
+                                     f"{result['mismapped'][:10]}")
+                logger.error(result["message"])
+                await _screenshot(page, "wizard_review_blocked")
+                return result
             if result.get("unmapped_required"):
                 result["message"] = (
                     "NOT finished — required column(s) never mapped: "
@@ -273,6 +279,7 @@ async def upload_csv(
             result["columns_mapped"] = mapped
             result["columns_unmapped"] = unmapped
             result["unmapped_required"] = [c for c in REQUIRED_MAPPED_COLUMNS if c in unmapped]
+            result["mismapped"] = list(_LAST_MISMAPPED)
             map_done = True
             await _screenshot(page, "wizard_mapped")
 
@@ -517,6 +524,45 @@ async def _fill_wizard_setup(page: Page, mode: str, list_name: str | None,
             await page.wait_for_timeout(400)
 
 
+_OWN_WRAPPER = '[class*="UploadModalOwnColumnWrapper"]'
+_OWN_INNER = '[class*="UploadModalOwnColumnPreview"]'   # the draggable mapped-column card
+_OWN_PREVIEW = _OWN_INNER
+# Legitimate auto-maps where our CSV header and DataSift's field differ by name.
+_MAPPING_ALIASES = {("Property Street", "Property Street Address"),
+                    ("Mailing Street", "Mailing Street Address"),
+                    # DataSift names the mailing block "Owner ..." (seen 2026-10-21)
+                    ("Owner Street", "Mailing Street Address"), ("Owner City", "Mailing City"),
+                    ("Owner State", "Mailing State"), ("Owner ZIP Code", "Mailing ZIP Code"),
+                    # DataSift's "Status" field takes our MSL Status column (seen 2026-10-22)
+                    ("Status", "MSL Status")}
+_NUMBERED_FIELD_RE = re.compile(r"^(Phone|Email) (\d+)(?: Number| Address)?$", re.I)
+_LAST_MISMAPPED: list = []
+
+
+def _mapping_ok(own: str, got: str) -> bool:
+    """True when CSV column `got` legitimately sits under DataSift field `own`:
+    same name (case-insensitive), a known alias, or the same NUMBER on a numbered
+    field ("Phone 3 Number" <- "Phone 3" is right; "Phone 10 Number" <- "Phone 1" is
+    the auto-mapper trap this check exists for)."""
+    if not got or got == own or got.lower() == own.lower() or (own, got) in _MAPPING_ALIASES:
+        return True
+    a, b = _NUMBERED_FIELD_RE.match(own), _NUMBERED_FIELD_RE.match(got)
+    return bool(a and b and a.group(1).lower() == b.group(1).lower() and a.group(2) == b.group(2))
+
+
+async def _mapping_pairs(page: Page) -> list[tuple[str, str]]:
+    """(DataSift field, CSV column currently mapped onto it) for every field.
+    A mapped field renders an OwnColumnPreview whose <strong> is the CSV column
+    name (DOM dump 2026-10-21); an unmapped field has no preview and yields ''."""
+    return [tuple(x) for x in await page.evaluate(
+        """([w, n, pv]) => [...document.querySelectorAll(w)].map(el => {
+            // custom fields render a "Custom" badge glued onto the field name
+            const own = (el.querySelector(n)?.textContent || '').trim().replace(/Custom$/, '').trim();
+            const got = (el.querySelector(pv + ' strong')?.textContent || '').trim();
+            return [own, got];
+        }).filter(p => p[0])""", [_OWN_WRAPPER, _OWN_NAME, _OWN_PREVIEW])]
+
+
 async def _unmapped_column_names(page: Page) -> list[str]:
     """Names still sitting in the left 'your CSV columns' list."""
     return await page.evaluate(
@@ -565,6 +611,15 @@ async def _drag_card(page: Page, source, target) -> bool:
     return True
 
 
+async def _dump_mapping(page: Page, stage: str) -> None:
+    """Debug: SIFT_MAP_DUMP=<path> writes every field card's HTML (before/after drags)."""
+    base = os.environ.get("SIFT_MAP_DUMP")
+    if not base:
+        return
+    html = await page.evaluate("(w) => [...document.querySelectorAll(w)].map(el => el.outerHTML)", _OWN_WRAPPER)
+    Path(f"{base}_{stage}.html").write_text("\n\n=====\n\n".join(html), encoding="utf-8")
+
+
 async def _map_wizard_columns(page: Page) -> tuple[list[str], list[str]]:
     """Drag every unmapped CSV column onto the DataSift field of the same name.
 
@@ -579,29 +634,71 @@ async def _map_wizard_columns(page: Page) -> tuple[list[str], list[str]]:
     returned True as soon as it obtained a bounding box and logged
     "Mapped column: Tags" after dragging the wrong element to the wrong place.
     """
+    await _dump_mapping(page, "before")
     mapped: list[str] = []
-    pending = await _unmapped_column_names(page)
-    logger.info("Column mapping: %d unmapped column(s) on the left: %s",
-                len(pending), pending[:12])
+    no_target: set[str] = set()
+    # The left column list renders lazily: a wide file (60 phone columns on the
+    # phones-by-address path, 2026-10-21) only exposes part of it at first, and
+    # the rest appears as cards are consumed. One pass left Phone 8 Tags..15
+    # unmapped, so keep passing until a pass maps nothing.
+    for _pass in range(6):
+        pending = [n for n in await _unmapped_column_names(page) if n not in no_target]
+        if not pending:
+            break
+        before = len(mapped)
+        logger.info("Column mapping pass %d: %d unmapped column(s) on the left: %s",
+                    _pass + 1, len(pending), pending[:12])
 
-    for name in list(pending):
-        source = page.locator(f'{_FOREIGN_NAME}:text-is("{name}")')
-        target = page.locator(f'{_OWN_NAME}:text-is("{name}")')
-        if await source.count() == 0:
-            continue
-        if await target.count() == 0:
-            logger.info("  %s: no DataSift field of that name — leaving unmapped", name)
-            continue
-
-        for attempt in (1, 2):
-            if not await _drag_card(page, source.first, target.first):
+        for name in pending:
+            source = page.locator(f'{_FOREIGN_NAME}:text-is("{name}")')
+            target = page.locator(f'{_OWN_NAME}:text-is("{name}")')
+            if await source.count() == 0:
                 continue
-            remaining = await _unmapped_column_names(page)
-            if name not in remaining:
-                mapped.append(name)
-                logger.info("  mapped %r (verified: consumed from the CSV column list)", name)
-                break
-            logger.warning("  %s: drop did not register (attempt %d/2)", name, attempt)
+            if await target.count() == 0:
+                no_target.add(name)
+                logger.info("  %s: no DataSift field of that name — leaving unmapped", name)
+                continue
+
+            for attempt in (1, 2):
+                if not await _drag_card(page, source.first, target.first):
+                    continue
+                remaining = await _unmapped_column_names(page)
+                if name not in remaining:
+                    mapped.append(name)
+                    logger.info("  mapped %r (verified: consumed from the CSV column list)", name)
+                    break
+                logger.warning("  %s: drop did not register (attempt %d/2)", name, attempt)
+        if len(mapped) == before:
+            break
+
+    # DataSift's AUTO-mapper matches numbered names loosely ("Phone 1 Number"
+    # can land on "Phone 10 Number"), so "nothing left unmapped" does not prove
+    # every column sits under the right field. Read the actual pairs and
+    # re-drag any column that sits under a field of a different name.
+    for _fix in range(3 if not os.environ.get("SIFT_MAP_DUMP") else 0):
+        wrong = [(own, got) for own, got in await _mapping_pairs(page) if not _mapping_ok(own, got)]
+        if not wrong:
+            break
+        logger.warning("Mis-mapped column(s) (field <- column): %s", wrong[:10])
+        for own, got in wrong:
+            src = page.locator(f'{_OWN_WRAPPER}:has({_OWN_NAME}:text-is("{own}")) {_OWN_INNER}')
+            dst = page.locator(f'{_OWN_NAME}:text-is("{got}")')
+            if await src.count() and await dst.count():
+                await _drag_card(page, src.first, dst.first)
+        # anything knocked back to the left list gets placed by name again
+        for name in await _unmapped_column_names(page):
+            s = page.locator(f'{_FOREIGN_NAME}:text-is("{name}")')
+            t = page.locator(f'{_OWN_NAME}:text-is("{name}")')
+            if await s.count() and await t.count():
+                await _drag_card(page, s.first, t.first)
+    await _dump_mapping(page, "after")
+    pairs = await _mapping_pairs(page)
+    logger.info("Mapping check: %d fields read, %d with a column mapped; sample %s",
+                len(pairs), sum(1 for _, g in pairs if g), [p for p in pairs if p[1]][:4])
+    mismatched = [(own, got) for own, got in pairs if not _mapping_ok(own, got)]
+    if mismatched:
+        logger.error("Columns still under the WRONG field after repair: %s", mismatched)
+    _LAST_MISMAPPED[:] = mismatched
 
     still = await _unmapped_column_names(page)
     missing_required = [c for c in REQUIRED_MAPPED_COLUMNS if c in still]
@@ -1280,7 +1377,7 @@ async def upload_to_datasift(
     password: str | None = None,
     headless: bool = True,
     enrich: bool = True,
-    skip_trace: bool = True,
+    skip_trace: bool = False,
 ) -> dict:
     """Full DataSift workflow: launch browser → login → upload CSV → enrich → skip trace.
 
@@ -1290,7 +1387,8 @@ async def upload_to_datasift(
         password: DataSift login password (defaults to DATASIFT_PASSWORD env var).
         headless: Run browser in headless mode.
         enrich: Run "Enrich Property Information" after upload (default True).
-        skip_trace: Run "Skip Trace" after upload (default True, uses unlimited plan).
+        skip_trace: Run "Skip Trace" after upload (default False — opt-in only,
+            owner decision 2026-10-21).
 
     Returns:
         Dict with upload results including enrich_result and skip_trace_result.
@@ -1381,7 +1479,7 @@ async def upload_datasift_split(
     password: str | None = None,
     headless: bool = True,
     enrich: bool = True,
-    skip_trace: bool = True,
+    skip_trace: bool = False,
     existing_list: bool = False,
     batch_tag: str | None = None,
     launch_args: list[str] | None = None,
@@ -1400,7 +1498,8 @@ async def upload_datasift_split(
         password: DataSift login password (defaults to DATASIFT_PASSWORD env var).
         headless: Run browser in headless mode.
         enrich: Run enrichment after all uploads (default True).
-        skip_trace: Run skip trace after all uploads (default True).
+        skip_trace: Run skip trace after all uploads (default False — opt-in
+            only, owner decision 2026-10-21).
         existing_list: If True, target existing lists instead of creating new ones.
         batch_tag: The tag every row of these CSVs carries (formatter
             ``batch_tag``). When set, enrich + skip-trace run ONCE anchored

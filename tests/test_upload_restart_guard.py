@@ -92,7 +92,11 @@ def _run(infos, **kw):
         saved.append(state)
 
     res = asyncio.run(up.upload_datasift_split(
-        infos, existing_list=True, batch_tag=TAG, on_progress=_progress, **kw))
+        # skip_trace is OFF by default since 2026-10-21 (owner decision); these
+        # tests exercise the restart bookkeeping of BOTH bulk actions, so ask
+        # for it explicitly.
+        infos, existing_list=True, batch_tag=TAG, on_progress=_progress,
+        **{"skip_trace": True, **kw}))
     return res, saved
 
 

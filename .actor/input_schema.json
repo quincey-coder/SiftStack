@@ -234,8 +234,8 @@
         "datasift_skip_trace_after_upload": {
             "title": "Skip-trace in DataSift after upload",
             "type": "boolean",
-            "description": "ON: after the wizard upload, Send To \u2192 Skip Trace runs on this run's records. Unlimited plan, no per-record cost. Only applies when the upload is on.",
-            "default": true,
+            "description": "ON: after the wizard upload, Send To \u2192 Skip Trace runs on this run's records. OFF by default \u2014 turn on only when you want this run skip-traced. Only applies when the upload is on.",
+            "default": false,
             "editor": "checkbox"
         },
         "datasift_split_by_county": {

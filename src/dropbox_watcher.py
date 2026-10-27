@@ -340,11 +340,11 @@ def run_watcher(
                                 csv_infos = write_datasift_by_notice_type(notices)
                                 if len(csv_infos) > 1:
                                     upload_result = _asyncio.run(
-                                        upload_datasift_split(csv_infos, enrich=True, skip_trace=True)
+                                        upload_datasift_split(csv_infos, enrich=True, skip_trace=False)
                                     )
                                 else:
                                     upload_result = _asyncio.run(
-                                        upload_to_datasift(csv_infos[0]["path"], enrich=True, skip_trace=True)
+                                        upload_to_datasift(csv_infos[0]["path"], enrich=True, skip_trace=False)
                                     )
                                 if upload_result.get("success"):
                                     logger.info("DataSift upload: %s", upload_result.get("message", "OK"))

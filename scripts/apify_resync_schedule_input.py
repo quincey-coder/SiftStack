@@ -67,10 +67,8 @@ def migrate(d: dict) -> dict:
         if old in out:
             out[new] = bool(out.pop(old))
     out.setdefault("use_residential_proxy", True)
-    # The stored `datasift_no_skip_trace: true` dated from the RAWPIPE API
-    # days ("$0.15/owner"). The wizard skip-trace is the unlimited plan, and
-    # the owner wants it ON after every upload — do not carry the old value.
-    out["datasift_skip_trace_after_upload"] = True
+    # Owner decision 2026-10-21: uploads are NEVER skip-traced unless asked.
+    out["datasift_skip_trace_after_upload"] = False
     return out
 
 
