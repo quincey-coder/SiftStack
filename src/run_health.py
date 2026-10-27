@@ -210,7 +210,11 @@ def analyze(health: RunHealth, baselines: dict | None) -> HealthReport:
     for s in health.scrapers:
         entry = baselines.get(s.key, {})
         counts = _history_counts(entry)
-        median = _median_nonzero(counts)
+        # A scraper dark for HISTORY_DAYS+ days has no non-zero count left in
+        # its window, so the live median falls to 0 and the zero-streak
+        # warning silently stops (Williamson/tax_delinquent, 2026-10-21).
+        # Fall back to the median remembered from its last healthy run.
+        median = _median_nonzero(counts) or float(entry.get("last_ok_median") or 0.0)
         zero_streak = int(entry.get("zero_streak", 0))
 
         if s.status == "fail":
@@ -309,6 +313,8 @@ def update_baselines(baselines: dict | None, health: RunHealth) -> dict:
         entry["history"] = history[-HISTORY_DAYS:]
         if s.status == "ok":
             entry["zero_streak"] = 0
+            # Remembered across any later blackout (see analyze()).
+            entry["last_ok_median"] = _median_nonzero(_history_counts(entry))
         else:  # zero or fail both extend the streak
             entry["zero_streak"] = int(entry.get("zero_streak", 0)) + 1
         entry["last_status"] = s.status

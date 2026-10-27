@@ -5,7 +5,7 @@ and property → tax status lookups for delinquency enrichment.
 
 Supported counties:
   Williamson (WCAD): Real-time SODA REST API at data.wcad.org
-  Bell (BCAD):       Bulk Excel download from bellcad.org (local cache)
+  Bell (BCAD):       Bulk Excel download from bellcad.org (local cache); live per-parcel via src/bell_gsa.py
   Travis (TCAD):     Bulk ZIP export from traviscad.org (local cache)
 
 The WCAD SODA API is the gold standard — instant, no auth, SQL-like queries.

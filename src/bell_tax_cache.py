@@ -23,6 +23,8 @@ from __future__ import annotations
 import logging
 import os
 import re
+from datetime import date, datetime, timezone
+import json
 import time
 from pathlib import Path
 from typing import Iterable
@@ -46,6 +48,11 @@ def _fetch_portal_html() -> str:
     r = requests.get(config.BELLCAD_DATA_PORTAL_URL, timeout=30)
     r.raise_for_status()
     return r.text
+
+
+# pattern -> URL discovered this process; lets delinquent_meta() answer without
+# a second portal GET when the sidecar is missing (pre-sidecar cache files).
+_DISCOVERED: dict[str, str] = {}
 
 
 def discover_latest_url(pattern: str) -> str | None:
@@ -74,12 +81,86 @@ def discover_latest_url(pattern: str) -> str | None:
         logger.warning("BellCAD portal had no match for %s", pattern)
         return None
 
-    def _date_key(url: str) -> str:
-        m = re.search(r"(\d{8})\.xlsx", url)
-        return m.group(1) if m else ""
-
-    candidates.sort(key=_date_key, reverse=True)
+    candidates.sort(key=_url_sort_key, reverse=True)
+    _DISCOVERED[pattern] = candidates[0]
     return candidates[0]
+
+
+_FILENAME_DATE_RE = re.compile(r"(\d{8})\.(?:xlsx|rar|zip)$", re.I)
+
+
+def filename_datestamp(name: str) -> str:
+    """Return the YYYYMMDD export stamp at the end of a portal filename ("" if none)."""
+    m = _FILENAME_DATE_RE.search((name or "").rsplit("/", 1)[-1])
+    return m.group(1) if m else ""
+
+
+def _url_sort_key(url: str) -> tuple[str, int]:
+    """Newest export date first; on a tie the highest roll year.
+
+    2026-09-22 posted `...Condensed-2026-20260922.xlsx` AND
+    `...Condensed-2027-20260922.xlsx` (next-year working roll). The 2027 file
+    carries the latest ownership, which is what the cross-reference needs.
+    """
+    base = url.rsplit("/", 1)[-1]
+    date = filename_datestamp(base)
+    rest = base.replace(date, "") if date else base
+    years = [int(y) for y in re.findall(r"(?<!\d)(20\d{2})(?!\d)", rest)]
+    return (date, max(years) if years else 0)
+
+
+def _meta_path(path: Path) -> Path:
+    return path.with_name(path.name + ".meta.json")
+
+
+def _write_meta(path: Path, url: str) -> None:
+    """Sidecar next to a cached file: where it came from and the export stamp."""
+    meta = {
+        "url": url,
+        "datestamp": filename_datestamp(url),
+        "downloaded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    try:
+        _meta_path(path).write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    except Exception as e:  # pragma: no cover - best effort
+        logger.debug("meta sidecar write failed for %s: %s", path, e)
+
+
+def _read_meta(path: Path) -> dict:
+    try:
+        return json.loads(_meta_path(path).read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def delinquent_meta(refresh_if_missing: bool = True) -> dict:
+    """{url, datestamp, downloaded_at} for the cached delinquent roll.
+
+    A cache file written before the sidecar existed has no meta; with
+    `refresh_if_missing` the portal index is fetched once to recover the
+    current URL/date (one small GET, no download).
+    """
+    path = _cache_dir() / "BellCAD_Delinquent_Roll_Condensed_latest.xlsx"
+    meta = _read_meta(path)
+    if not meta.get("datestamp"):
+        pattern = config.BELLCAD_DELINQUENT_ROLL_PATTERN
+        url = _DISCOVERED.get(pattern)
+        if not url and refresh_if_missing:
+            url = discover_latest_url(pattern)
+        if url:
+            meta = {"url": url, "datestamp": filename_datestamp(url), "downloaded_at": ""}
+    return meta
+
+
+def roll_age_days(datestamp: str, today: date | None = None) -> int | None:
+    """Days between a YYYYMMDD export stamp and today (None if unparseable)."""
+    if not datestamp or len(datestamp) != 8 or not datestamp.isdigit():
+        return None
+    try:
+        d = date(int(datestamp[:4]), int(datestamp[4:6]), int(datestamp[6:8]))
+    except ValueError:
+        return None
+    return ((today or date.today()) - d).days
 
 
 # ── Cache I/O ────────────────────────────────────────────────────────
@@ -131,6 +212,7 @@ def download_if_stale(force: bool = False) -> tuple[Path | None, Path | None]:
     if delq_url:
         try:
             _download(delq_url, delq_path)
+            _write_meta(delq_path, delq_url)
         except Exception as e:
             logger.warning("Bell delinquent download failed: %s", e)
             if not delq_path.exists():
@@ -138,6 +220,7 @@ def download_if_stale(force: bool = False) -> tuple[Path | None, Path | None]:
     if appr_url:
         try:
             _download(appr_url, appr_path)
+            _write_meta(appr_path, appr_url)
         except Exception as e:
             logger.warning("Bell appraisal download failed: %s", e)
             if not appr_path.exists():

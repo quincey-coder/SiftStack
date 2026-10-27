@@ -188,7 +188,8 @@ TX_COUNTIES = ["Travis", "Bell", "Williamson"]
 # County → Appraisal District portal URLs (for property data enrichment)
 CAD_URLS: dict[str, str] = {
     "Travis": "https://traviscad.org/propertysearch/",
-    "Bell": "https://esearch.bellcad.org/",
+    # Bell CAD moved to the GSA portal in 2026; esearch.bellcad.org is a 404.
+    "Bell": "https://belltx-search.gsacorp.io/",
     "Williamson": "https://search.wcad.org/",
 }
 
@@ -221,9 +222,39 @@ BELL_FORECLOSURES_URL = "https://www.bellcountytx.com/county_government/county_c
 #   for probate/foreclosure address backfill (BellCAD has no live API).
 BELLCAD_DATA_PORTAL_URL = "https://bellcad.org/data-portal/"
 BELLCAD_DELINQUENT_ROLL_PATTERN = r"BellCAD_Delinquent_Roll_Condensed_\d{8}\.xlsx"
-BELLCAD_APPRAISAL_ROLL_PATTERN = r"\d{4}_BellCAD_Appraisal_Data_Condensed_\d{8}\.xlsx"
+# The appraisal export was renamed on 2026-09-22 from
+# `2025_BellCAD_Appraisal_Data_Condensed_20260407.xlsx` to
+# `BellCAD-Appraisal-Data-Condensed-2026-20260922.xlsx` (hyphens, year after
+# the name). Both shapes match; `bell_tax_cache.discover_latest_url` picks the
+# newest date stamp, then the highest roll year.
+BELLCAD_APPRAISAL_ROLL_PATTERN = (
+    r"(?:\d{4}_BellCAD_Appraisal_Data_Condensed_\d{8}"
+    r"|BellCAD-Appraisal-Data-Condensed-\d{4}-\d{8})\.xlsx"
+)
 BELL_TAX_CACHE_DIR = "data/bell_tax_cache"
 BELL_TAX_CACHE_TTL_HOURS = 24
+# The delinquent XLSX carries its export date in the filename. The CAD re-posted
+# it roughly monthly through 2026-07-17 and then stopped; the cloud run
+# re-downloaded the identical file (same sha256) every day for 3 months with
+# 0 NEW / 0 DROPPED and no alarm. Past this many days the scraper raises an
+# error-level health alarm. Env `SIFT_BELL_ROLL_STALE_DAYS` overrides.
+def _env_int(name: str, default: int) -> int:
+    """Read an integer env knob; a malformed value falls back instead of killing import."""
+    raw = (os.getenv(name) or "").strip()
+    try:
+        return int(raw) if raw else default
+    except ValueError:
+        return default
+
+
+BELLCAD_DELINQUENT_STALE_DAYS = _env_int("SIFT_BELL_ROLL_STALE_DAYS", 45)
+# Live per-parcel portal (GSA Corp, replaced esearch.bellcad.org in 2026):
+#   /parcel/<10-digit prop_id>  owner + mailing, situs, legal, deed history,
+#                               buildings, value history
+#   /tax/<10-digit prop_id>     per-year original/penalty/interest/paid/balance
+#   /api/livesearch/<query>     owner / address / prop_id autocomplete
+# No receipts and no payer name anywhere. See src/bell_gsa.py.
+BELL_GSA_BASE_URL = "https://belltx-search.gsacorp.io"
 
 # Williamson County data sources
 WILCO_TRUSTEE_SALES_URL = "https://apps.wilco.org/countyclerk/trustee_sales/"

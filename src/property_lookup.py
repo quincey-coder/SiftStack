@@ -6,7 +6,7 @@ databases by the decedent's name to find their property address(es).
 
 Texas CAD portals:
   Travis (TCAD):     https://traviscad.org/propertysearch/
-  Bell (BCAD):       https://esearch.bellcad.org/
+  Bell (BCAD):       https://belltx-search.gsacorp.io/ (GSA portal; esearch.bellcad.org is gone)
   Williamson (WCAD): https://search.wcad.org/
 
 Phase 1 stub — CAD lookup implementations come in Phase 4.

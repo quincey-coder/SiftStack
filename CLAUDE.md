@@ -352,6 +352,26 @@ broke Travis tax-delinquent AND the whole Travis CAD cache for two days
   with a bare leading dot (`.00`). `normalize_delq_row()` collapses interior
   whitespace on every value; `_parse_address` collapses again for direct callers.
 - **`TaxCurOpenData.csv` headers did NOT change** (`PARCEL`, `NAMELF`,
+### Bell CAD portal migration — GSA replaced esearch, roll went stale (2026-10-27)
+
+Bell CAD moved its property portal to **GSA Corp** (`belltx-search.gsacorp.io`;
+`esearch.bellcad.org` is a 404 on every path) and stopped re-posting the
+delinquent-roll XLSX after `..._Condensed_20260717.xlsx`. The cloud run
+re-downloaded that identical file (same sha256) every day for 3 months with
+0 NEW / 0 DROPPED and no alarm, so Bell Sold tagging was dead since July. The
+appraisal export was also renamed (`BellCAD-Appraisal-Data-Condensed-2026-20260922.xlsx`)
+and the old regex silently kept the April roll. Fixed: dual-shape
+`BELLCAD_APPRAISAL_ROLL_PATTERN` (newest date, then highest year),
+`bell_tax_cache` meta sidecars + `roll_age_days`, the scraper's
+`_check_roll_staleness` → `LAST_ALARMS` (error-level in Slack) past
+`BELLCAD_DELINQUENT_STALE_DAYS` (45, env `SIFT_BELL_ROLL_STALE_DAYS`), Source URL
+→ `…/parcel/<10-digit id>`. **`src/bell_gsa.py`** reads the live site per parcel
+(`/parcel/<id>`: owner, mailing, situs, DEED HISTORY, buildings, values;
+`/tax/<id>`: per-year original/penalty/interest/paid/balance; no receipts, no
+payer). Props IDs are 10-digit zero-padded. Full audit, direct links and the
+new bulk files worth parsing (MortgageProcessFile, certified PACS export with
+exemption/deed/mortgage fields, Collections RAR): `docs/BELL_PORTAL_MIGRATION.md`.
+
   `MAILINGADDRESS`, …) — but the county began emitting rows with an
   **unbalanced quote** (a `ZIPCODE` of literal `"""78`). That opens a quoted
   field that never closes, so `csv` swallows the remaining ~170 MB into one
@@ -431,6 +451,7 @@ enrichment **Step 3c-lien**.
   Docker/Apify (Linux, no display) run under Xvfb (`xvfb-run -a …`). Override
   with `LIEN_PUBLICSEARCH_HEADLESS=1` (will likely return 0). Flow = Advanced
   Search: add lien doc types to `#docTypes-input` (react-select: type + Enter)
+| Bell | Tax Delinquent | BellCAD data-portal XLSX (batch) + belltx-search.gsacorp.io (live per parcel, `src/bell_gsa.py`) |
   **before** filling `#recordedDateRange-start/-end` (date picker overlays the
   doc-type field otherwise) → click the **exact** "Search" button (NOT
   "Search Criteria", a section toggle) → parse the tab-separated results table.

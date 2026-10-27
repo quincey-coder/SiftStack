@@ -30,7 +30,9 @@ from pathlib import Path
 
 import openpyxl
 
+import bell_gsa
 import bell_tax_cache
+import config
 from notice_parser import NoticeData, normalize_court_name
 from scrapers import register
 from scrapers import tax_delinquent_state as state_mod
@@ -48,6 +50,12 @@ LAST_RUN_RAW_PATH: Path | None = None
 # Collected by main.py after enrichment and appended to the upload CSV tagged
 # "Sold" so DataSift applies the tag to the matching record by address.
 LAST_RUN_SOLD: list | None = None
+# Source-staleness / drift alarms raised this run. Polled by
+# main._collect_health_events so they reach Slack as error-level findings.
+# Added 2026-10-27: the CAD stopped re-posting the delinquent XLSX after
+# 2026-07-17 and the daily cloud run compared the same file to itself for
+# three months (0 NEW / 0 DROPPED, Sold tagging dead) without a word.
+LAST_ALARMS: list[str] = []
 
 
 # ── Filter thresholds (CLI-overridable) ───────────────────────────────
@@ -284,8 +292,68 @@ class BellTaxDelinquentScraper:
     ):
         self.min_years = min_years
         self.min_amount = min_amount
+        # Health evidence for run_health (roll age, unchanged-sha streak, ...).
+        self.last_meta: dict = {}
         self.fixture_xlsx = Path(fixture_xlsx) if fixture_xlsx else None
         self.skip_target_zip = skip_target_zip
+
+    def _check_roll_staleness(self, raw_sha: str) -> None:
+        """Alarm when the CAD's delinquent export has not been re-posted.
+
+        The export date lives in the filename (`..._Condensed_YYYYMMDD.xlsx`,
+        recorded in the cache sidecar). A roll older than
+        `config.BELLCAD_DELINQUENT_STALE_DAYS` is an error-level health event:
+        every NEW/DROPPED/Sold claim built from it is a comparison of the same
+        file to itself. The unchanged-bytes streak (same sha256 as the prior
+        runs) is logged as supporting evidence and surfaced in `last_meta`.
+        """
+        meta: dict = {}
+        try:
+            meta = bell_tax_cache.delinquent_meta()
+        except Exception as e:  # pragma: no cover - network/IO guard
+            logger.debug("Bell roll meta unavailable: %s", e)
+        datestamp = str(meta.get("datestamp") or "")
+        age = bell_tax_cache.roll_age_days(datestamp)
+        streak = 0
+        try:
+            runs = (state_mod.load_state(self.COUNTY) or {}).get("runs") or []
+            for r in reversed(runs):
+                if raw_sha and r.get("raw_sha256") == raw_sha:
+                    streak += 1
+                else:
+                    break
+        except Exception as e:  # pragma: no cover
+            logger.debug("Bell roll streak check skipped: %s", e)
+        self.last_meta.update({
+            "roll_url": meta.get("url", ""),
+            "roll_datestamp": datestamp,
+            "roll_age_days": age,
+            "roll_unchanged_runs": streak,
+        })
+        if streak:
+            logger.info(
+                "Bell delinquent roll bytes unchanged for the last %d run(s) (sha %s)",
+                streak, (raw_sha or "")[:12],
+            )
+        limit = config.BELLCAD_DELINQUENT_STALE_DAYS
+        if age is not None and age > limit:
+            msg = (
+                f"Bell delinquent roll is {age} days old (CAD export dated {datestamp}, "
+                f"limit {limit}; {meta.get('url', '?')}). The daily diff has been "
+                f"comparing the same file to itself"
+                + (f" for {streak} runs" if streak else "")
+                + " — NEW/DROPPED/Sold from this source are not evidence. Verify "
+                f"balances per parcel on {config.BELL_GSA_BASE_URL}/tax/<prop_id> "
+                "(src/bell_gsa.py) and raise SIFT_BELL_ROLL_STALE_DAYS if the CAD's "
+                "posting cadence is known."
+            )
+            logger.error(msg)
+            LAST_ALARMS.append(msg)
+        elif age is None:
+            logger.warning(
+                "Bell delinquent roll: export date unknown (no YYYYMMDD stamp in %r)",
+                meta.get("url", ""),
+            )
 
     async def scrape(
         self,
@@ -301,6 +369,8 @@ class BellTaxDelinquentScraper:
         LAST_RUN_REPORT_PATH = None
         LAST_RUN_RAW_PATH = None
         LAST_RUN_SOLD = None
+        LAST_ALARMS.clear()
+        self.last_meta = {}
 
         logger.info(
             "Bell tax delinquent: filters %d+ years, $%.0f+ owed, target-zip=%s",
@@ -331,6 +401,10 @@ class BellTaxDelinquentScraper:
         except Exception as e:
             logger.warning("Raw XLSX archival failed: %s", e)
             raw_archive_path, raw_sha = None, ""
+
+        # ── Source staleness (the silent-failure class of 2026-07..10) ──
+        if not self.fixture_xlsx:
+            self._check_roll_staleness(raw_sha)
 
         # ── Parse rows ──
         notices: list[NoticeData] = []
@@ -479,7 +553,9 @@ class BellTaxDelinquentScraper:
                 zip=zip5,
                 owner_name=owner_name_out,
                 parcel_id=prop_id,
-                source_url=f"https://esearch.bellcad.org/Property/View/{prop_id}",
+                # GSA portal (2026); esearch.bellcad.org/Property/View/<id> is a 404.
+                # One padding rule for the whole portal lives in bell_gsa.pad_id.
+                source_url=bell_gsa.parcel_url(prop_id),
             )
             notice.business_name = business_name
             notice.tax_owner_name = owner_raw
