@@ -251,6 +251,22 @@ built the same day after the foreclosure audit found the scrapers delivering
   `publicsearch_common.verify_window_applied` reads the results back
   (total-results header + page-1 row dates) and retries once, then raises —
   the silent "2500 rows for a 1-day window" class can't recur.
+- **wilcotx.gov (Williamson tax-delinquent XLSX) is behind Cloudflare and
+  403s Apify's datacenter IP** — index page AND `DocumentCenter/View/8553`
+  alike, on every daily run from 2026-10-06 through 10-27, while the same
+  plain `requests` GET returns 200 from a residential IP (verified through the
+  Actor's own RESIDENTIAL/US group). `wilco_tax_cache._get` now fetches
+  direct first and retries once through `SCRAPER_PROXY_URL` (the residential
+  proxy main.py already provisions for tccsearch; ~30 MB ≈ $0.25/run when the
+  fallback fires). The scraper **raises `ScraperError`** on a failed download
+  instead of returning `[]` — for 21 days it logged "0 notices" and Slack
+  stayed "healthy": the zero-streak finding is warn-level (log-only) and its
+  baseline median decayed to 0 once the 14-day history held no non-zero day,
+  so even the log warning vanished on 10-21. `run_health` now remembers
+  `last_ok_median` per scraper so a blackout longer than the window keeps
+  warning. Cloud `williamson_texdel_state` is still the clean 2026-10-05
+  baseline (3,487 APNs); deploy this together with the Williamson current-year
+  rows fix (Tax-Delinquent section below) before the next run.
 - **Travis tax sale = RealAuction, plain HTTP, no login** (`tax_sale_travis.py`):
   calendar (`dayid=` on TAX SALE cells) → PREVIEW page primes a server-side
   session → `FNC=LOAD&AREA=W` returns JSON with Cause #, Adjudged Value, Est.
@@ -920,6 +936,21 @@ All three tax-delinquent scrapers (Travis CSV, Bell/Williamson XLSX) diff each p
   Anything rehydrated from it (Sold rows) therefore carries raw scrape values,
   not what was uploaded. Fixing the city at scrape time (above) keeps the
   snapshot honest; don't assume snapshot == CRM.
+- **Williamson's file is "CURRENT Year and Prior Taxes Due" — current-year
+  bills are NOT delinquent** (Tex. Tax Code §31.02: delinquent Feb 1 of the
+  following year). From the October certification until February it carries a
+  row for nearly every parcel in the county (277K rows / $2.5B on 2026-10-26 vs
+  ~10K prior-year rows). `tax_delinquent_wilco.latest_delinquent_tax_year()`
+  (year−1, or year−2 in January) gates every row BEFORE bucketing: a
+  current-year-only parcel never enters the roll set, and the current bill
+  never counts toward years (`latest − first + 1`, the Travis/Bell yardstick)
+  or dollars. Fixed 2026-10-27 — the old `max(now.year − first, distinct
+  years)` + sum-everything rule read a 2025+2026 parcel as "2 years" and
+  shipped 1,255 "buy-box" parcels where 500 were real; it would also have
+  ballooned the diff baseline 3.5K → 278K in October and tripped the volume
+  guardrail forever when the file collapsed in February. Travis (SINCE column,
+  current-roll-only rows excluded) and Bell (`years_owed` ends at the last
+  delinquent year) never had the problem. Test: `tests/test_tax_delinquent_wilco.py`.
 - **Diff terms:** `NEW` = current − previous, `REPEAT` = current ∩ previous, `DROPPED` = previous − current (off the roll = paid off / sold).
 - **Guardrails** (`check_guardrails`) suppress false "sold" claims: empty file, APN-format drift (<85–90% match), or >50% volume shrinkage trips the guardrail — the prior baseline + snapshot are preserved and no drop/sold claims are reported.
 - **`last_run_records` snapshot:** each successful run stores `parcel_id → {address, city, state, zip, owner_name}` for the records it actually **uploaded** (post-filter). This lets the next run rehydrate any dropped parcel into a full record (not just an APN).

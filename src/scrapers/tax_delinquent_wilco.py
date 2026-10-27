@@ -8,13 +8,28 @@ tax year as the first delinquent year.
 
 Source: https://www.wilcotx.gov/761/Property-Tax-Roll-Information-Request
 Refresh: ~weekly by Wilco TAC.
-Records: ~30K rows → ~13K unique Real-Property parcels after grouping +
-  filtering Personal/Mobile/Other prefixes.
+Records: ~10K prior-year rows → ~3K unique Real-Property parcels after
+  grouping + filtering Personal/Mobile/Other prefixes.
+
+The file is "CURRENT Year and Prior Taxes Due", and the current year is NOT
+delinquent until February 1 of the following year (Tex. Tax Code §31.02).
+Once the new roll is certified in October the file carries a row for nearly
+every parcel in the county with its freshly-billed current-year tax (277K
+rows / $2.5B on 2026-10-26 vs ~10K rows for 2004-2025). Those rows are
+skipped BEFORE bucketing (`latest_delinquent_tax_year`): a parcel whose only
+balance is the current bill is not delinquent and never enters the roll set,
+and a current-year balance never counts toward years or dollars owed. Before
+this (2026-10-27) a parcel with a 2025 + 2026 balance read "2 years
+delinquent" and its current bill counted toward the $3K floor — 1,255
+"buy-box" parcels vs 500 real. It also keeps the cross-run diff honest: the
+roll set would have jumped 3.5K → 278K in October and collapsed back in
+February, tripping the volume guardrail on every run thereafter.
 
 Filters applied per-parcel (post-grouping):
   1. Quick Ref prefix == 'R' (Real Property; skip P/M/N).
-  2. Years delinquent >= min_years (default 2).
-  3. Total fee balance >= min_amount (default $3,000).
+  2. Tax Year <= latest delinquent year (current-year bills skipped).
+  3. Years delinquent (latest delinquent year − first + 1) >= min_years (default 2).
+  4. Delinquent fee balance >= min_amount (default $3,000).
 
 Cross-run diff: data/williamson_tax_state/, raw archive: data/williamson_tax_raw/.
 Master cross-reference for probate/foreclosure backfill uses the live WCAD
@@ -26,14 +41,14 @@ from __future__ import annotations
 import logging
 import re
 from collections import defaultdict
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 import openpyxl
 
 import wilco_tax_cache
 from notice_parser import NoticeData, normalize_court_name
-from scrapers import register
+from scrapers import ScraperError, register
 from scrapers import tax_delinquent_state as state_mod
 
 logger = logging.getLogger(__name__)
@@ -52,6 +67,20 @@ LAST_RUN_SOLD: list | None = None
 
 DEFAULT_MIN_DELINQUENT_YEARS = 2
 DEFAULT_MIN_DELINQUENT_AMOUNT = 3000.0
+
+
+def latest_delinquent_tax_year(today: date | None = None) -> int:
+    """Most recent tax year whose taxes are actually delinquent on `today`.
+
+    Texas property taxes for tax year Y are due on receipt and become
+    delinquent on February 1 of Y+1 (Tex. Tax Code §31.02). So from Feb 1
+    through Dec 31 the latest delinquent year is last year; in January it is
+    the year before that (last year's bill is still merely due). The Wilco
+    file lists current-year bills alongside the delinquent ones from the
+    October certification on; everything newer than this year is skipped.
+    """
+    today = today or date.today()
+    return today.year - 1 if today.month >= 2 else today.year - 2
 
 
 # Bare `HOA` only counts as an association marker where an entity name puts it
@@ -227,8 +256,16 @@ class WilliamsonTaxDelinquentScraper:
         else:
             xlsx_path = wilco_tax_cache.download_delinquent_xlsx()
             if not xlsx_path:
-                logger.error("Williamson tax delinquent: download failed")
-                return []
+                # Raise, never return []: a swallowed download failure read as
+                # "0 notices" for 21 straight days (2026-10-06 → 10-27, the
+                # Cloudflare 403 on Apify's datacenter IP) and the health
+                # report stayed green — the zero-streak is warn-level and its
+                # baseline decayed to nothing after 14 zero days.
+                raise ScraperError(
+                    "Williamson tax delinquent: download failed — wilcotx.gov "
+                    "refused the direct fetch and no proxied retry succeeded "
+                    "(see wilco_tax_cache warnings above)"
+                )
         raw_bytes = xlsx_path.read_bytes()
 
         try:
@@ -253,15 +290,16 @@ class WilliamsonTaxDelinquentScraper:
                 break
         if ws is None:
             wb.close()
-            logger.error("Williamson XLSX has no data rows")
-            return []
+            raise ScraperError(
+                "Williamson tax delinquent: XLSX has no data rows — "
+                "empty/truncated download"
+            )
 
         rows = ws.iter_rows(values_only=True)
         try:
             header = list(next(rows))
         except StopIteration:
             wb.close()
-            from scrapers import ScraperError
             raise ScraperError(
                 "Williamson tax delinquent: XLSX has no header row — "
                 "empty/corrupt download"
@@ -269,7 +307,6 @@ class WilliamsonTaxDelinquentScraper:
         col = {h: i for i, h in enumerate(header) if h is not None}
         if "Quick Ref" not in col:
             wb.close()
-            from scrapers import ScraperError
             raise ScraperError(
                 f"Williamson tax delinquent: expected column 'Quick Ref' missing "
                 f"from header {header[:10]!r} — schema drift, extend the column "
@@ -296,8 +333,26 @@ class WilliamsonTaxDelinquentScraper:
             "zip": "",
             "legal": "",
         })
+        def _harvest(b: dict, row) -> None:
+            # Take the longest non-empty seen-so-far for descriptive fields
+            for src, dst in (
+                ("Owner Name", "owner"),
+                ("Situs Address", "situs"),
+                ("Addr1", "addr1"),
+                ("Addr2", "addr2"),
+                ("City", "city"),
+                ("State", "state"),
+                ("Zip", "zip"),
+                ("Legal Desc", "legal"),
+            ):
+                v = str(_g(row, src) or "").strip()
+                if v and len(v) > len(b[dst]):
+                    b[dst] = v
+
         non_real = 0
         no_apn = 0
+        current_year_rows = 0
+        latest_delq_year = latest_delinquent_tax_year()
         for row in rows:
             qr_raw = _g(row, "Quick Ref")
             qr = str(qr_raw).strip()
@@ -308,32 +363,37 @@ class WilliamsonTaxDelinquentScraper:
             if not qr.upper().startswith("R"):
                 non_real += 1
                 continue
-            b = bucket[qr]
             try:
                 year = int(_g(row, "Tax Year"))
-                b["years"].append(year)
             except (ValueError, TypeError):
-                pass
+                year = None
+            # A current-year bill is due, not delinquent — it must not create
+            # a parcel, count as a year, or add to the balance (see module doc).
+            # Its owner/mailing/situs ARE the freshest the county has, so when
+            # the parcel already carries a delinquent row (the file lists a
+            # parcel's years oldest-first — 13,158 ascending transitions, 0
+            # descending on the 2026-10-26 roll) harvest those fields anyway.
+            if year is not None and year > latest_delq_year:
+                current_year_rows += 1
+                if qr in bucket:
+                    _harvest(bucket[qr], row)
+                continue
+            b = bucket[qr]
+            if year is not None:
+                b["years"].append(year)
             try:
                 fee = float(_g(row, "Fee Balance") or 0)
                 b["balance"] += fee
             except (ValueError, TypeError):
                 pass
-            # Take the longest non-empty seen-so-far for descriptive fields
-            for src, dst in [
-                ("Owner Name", "owner"),
-                ("Situs Address", "situs"),
-                ("Addr1", "addr1"),
-                ("Addr2", "addr2"),
-                ("City", "city"),
-                ("State", "state"),
-                ("Zip", "zip"),
-                ("Legal Desc", "legal"),
-            ]:
-                v = str(_g(row, src) or "").strip()
-                if v and len(v) > len(b[dst]):
-                    b[dst] = v
+            _harvest(b, row)
         wb.close()
+        logger.info(
+            "Williamson tax delinquent: latest delinquent tax year %d — skipped "
+            "%d current-year (not yet delinquent) rows; %d real-property parcels "
+            "carry a delinquent balance",
+            latest_delq_year, current_year_rows, len(bucket),
+        )
 
         # ── Second pass: build NoticeData per parcel ──
         notices: list[NoticeData] = []
@@ -343,6 +403,7 @@ class WilliamsonTaxDelinquentScraper:
             "no_year": 0, "under_years": 0, "hoa": 0,
             "under_amt": 0, "zip": 0, "no_owner": 0,
             "non_real": non_real, "no_apn": no_apn,
+            "current_year_rows": current_year_rows,
         }
 
         target_zips: set[str] = set()
@@ -353,7 +414,6 @@ class WilliamsonTaxDelinquentScraper:
             except Exception:
                 pass
 
-        this_year = datetime.now().year
         for parcel_id, b in bucket.items():
             if max_notices and len(notices) >= max_notices:
                 break
@@ -363,8 +423,11 @@ class WilliamsonTaxDelinquentScraper:
                 removed["no_year"] += 1
                 continue
             first_year = min(years)
-            # Years delinquent counted from the earliest delinquency to now
-            years_count = max(this_year - first_year, len(set(years)))
+            # Tax years delinquent = span from the first unpaid year through
+            # the latest year that is delinquent today (2024..2025 = 2) — the
+            # same span Bell's `years_owed` encodes. Travis uses now.year − SINCE,
+            # which agrees Feb–Dec and reads one year higher during January.
+            years_count = latest_delq_year - first_year + 1
             if self.min_years > 0 and years_count < self.min_years:
                 removed["under_years"] += 1
                 continue
@@ -430,7 +493,7 @@ class WilliamsonTaxDelinquentScraper:
                 f"Owner: {owner_raw}\n"
                 f"Address: {street}, {city_from_situs}, TX {zip5}\n"
                 f"Mailing: {mailing_full}\n"
-                f"Delinquent: ${owed:,.2f} ({len(set(years))} year{'s' if len(set(years)) != 1 else ''} since {first_year})\n"
+                f"Delinquent: ${owed:,.2f} ({years_count} year{'s' if years_count != 1 else ''} since {first_year})\n"
                 f"Legal: {b['legal']}"
             )
             notices.append(notice)
