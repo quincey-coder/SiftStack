@@ -960,6 +960,17 @@ def _build_property_section(notice: NoticeData) -> str:
     if notice.notice_type:
         parts.append(notice.notice_type.replace("_", " ").title())
 
+    # Court cause number (probate docket / tax suit) — the key a human needs
+    # to look the case up again on the county portal. Skipped when the source
+    # reference line below already spells out the same case number.
+    if notice.case_number and notice.case_number not in _source_ref_label(notice):
+        parts.append(f"Case No. {notice.case_number}")
+    # Williamson docket extras (court-named PR's attorney, docket activity).
+    if notice.case_attorney:
+        parts.append(f"Attorney: {notice.case_attorney}")
+    if notice.case_docket:
+        parts.append(f"Docket: {notice.case_docket}")
+
     # Lien / lis-pendens context: WHY the owner (our lead) is distressed.
     # Lis pendens reuses lien_creditor to carry the PLAINTIFF who filed the suit
     # (the suit type is always "Lis Pendens", already shown via the notice_type
@@ -988,10 +999,47 @@ def _build_property_section(notice: NoticeData) -> str:
             tax_str += f" ({notice.tax_delinquent_years} yrs)"
         parts.append(tax_str)
 
+    ref = _source_ref_label(notice)
+    if ref:
+        parts.append(ref)
+
     if notice.source_url:
         parts.append(f"Source: {notice.source_url}")
 
     return " | ".join(parts)
+
+
+def _source_ref_label(notice: NoticeData) -> str:
+    """Human-readable record identifier for Notes, derived from the source URL.
+
+    The county portals' detail pages cannot be deep-linked (they need a search
+    in the same session), so the link alone does not get a caller to the
+    document. This spells out WHAT to search for and WHERE:
+      Travis Clerk Instrument # 202641242 (tccsearch.org → Real Estate → Instrument #)
+      Bell Clerk Instrument # 2026030172 (bell.tx.publicsearch.us)
+      Williamson CCL4 Case No. 24-0468-CP4 (judicialrecords.wilco.org → Case search)
+    Returns "" when the URL shape is not one of ours.
+    """
+    import re
+    url = notice.source_url or ""
+    if not url:
+        return ""
+    m = re.search(r"InstrumentNumber=(\d+)", url, re.IGNORECASE)
+    if m and "tccsearch.org" in url:
+        return f"Travis Clerk Instrument # {m.group(1)} (tccsearch.org -> Real Estate -> Instrument #)"
+    m = re.search(r"publicsearch\.us/(?:doc/|\?instNum=)(\d+)", url, re.IGNORECASE)
+    if m:
+        county = "Bell" if "bell." in url else ("Williamson" if "williamson." in url else "County")
+        host = re.sub(r"^https?://", "", url).split("/")[0]
+        return f"{county} Clerk Instrument # {m.group(1)} ({host})"
+    if "judicialrecords.wilco.org" in url:
+        case = (notice.case_number or "").strip()
+        if not case:
+            cm = re.search(r"[#&]case=([A-Za-z0-9-]+)", url)
+            case = cm.group(1) if cm else ""
+        if case:
+            return f"Williamson CCL4 Case No. {case} (judicialrecords.wilco.org -> Case search)"
+    return ""
 
 
 def _build_legal_owner_section(notice: NoticeData) -> str:

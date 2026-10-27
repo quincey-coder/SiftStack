@@ -28,6 +28,7 @@ from playwright.async_api import async_playwright, Page
 from notice_parser import NoticeData
 from scrapers import register
 from scrapers.tccsearch_common import (
+    instrument_url,
     click_search,
     count_temp_rows,
     effective_from_date,
@@ -169,7 +170,7 @@ def _parse_probate_record(lines: list[str]) -> NoticeData | None:
             break
 
     if instrument:
-        notice.source_url = f"{BASE_URL}/RealEstate/DocumentDetail.aspx?InstrumentNumber={instrument}"
+        notice.source_url = instrument_url(instrument)
 
     # Find date filed
     for line in lines:

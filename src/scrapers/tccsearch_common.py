@@ -454,3 +454,17 @@ async def safe_check(page: Page, selector: str, timeout_ms: int = 15000) -> bool
             selector, str(e).splitlines()[0],
         )
         return False
+
+
+def instrument_url(instrument: str) -> str:
+    """A WORKING link for a tccsearch instrument, with the number in the fragment.
+
+    `RealEstate/DocumentDetail.aspx?InstrumentNumber=N` — what every Travis
+    record stored until 2026-10-27 — is a dead deep link: the detail view needs
+    ASP.NET session state created by a results-grid click, and a direct GET
+    returns "Fatal System Error: Session state is not available" (verified in a
+    Cloudflare-cleared, disclaimer-accepted session). The search page opens for
+    anyone; the fragment keeps the instrument number machine-readable
+    (data_formatter._notice_id_from_url maps both URL forms to the same id).
+    """
+    return f"https://www.tccsearch.org/RealEstate/SearchEntry.aspx#InstrumentNumber={instrument}"

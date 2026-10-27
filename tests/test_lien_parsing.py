@@ -169,6 +169,95 @@ def test_formatter_lien_wiring():
     assert "Citibank" in row["Notes"]
 
 
+# ── Hospital-lien exclusion (Prop. Code §55.005(d): attaches to the injury
+# claim, NOT real property). 212 of 861 CRM lien records were patients. ──────
+
+HOSPITAL_GRID = "\n".join([
+    "Showing Records 1 through 3 ( 3 records found )",
+    "1\t\t\t2026090001",
+    "07/01/2026\tHOSPITAL LIEN\t[R] ADVENTHEALTH CENTRAL TEXAS",
+    "[E] PEGUES ANITA",
+    "Temp",
+    "2\t\t\t2026090002",
+    "07/01/2026\tABSTRACT OF JUDGMENT\t[R] CITIBANK",
+    "[E] MOLINA RAMON G",
+    "Temp",
+    "3\t\t\t2026090003",
+    "07/01/2026\tCHILD SUPPORT LIEN\t[R] TEXAS ATTORNEY GENERAL",
+    "[E] DOE JOHN",
+    "Temp",
+])
+
+
+def test_default_doc_types_exclude_hospital_56():
+    from scrapers.lien_travis import DEFAULT_LIEN_DOC_TYPES, LIEN_DOC_TYPES
+    assert 56 not in DEFAULT_LIEN_DOC_TYPES
+    assert LIEN_DOC_TYPES[56] == "Hospital Lien"  # label kept for display/debug
+    from scrapers.lien_publicsearch import LIEN_DOC_TYPE_NAMES as PS_NAMES
+    from scrapers.lien_tyler import LIEN_DOC_TYPE_NAMES as TY_NAMES
+    assert not any("HOSPITAL" in n for n in PS_NAMES)
+    assert not any("HOSPITAL" in n for n in TY_NAMES)
+
+
+def test_hospital_lien_row_dropped_travis():
+    stats: dict = {}
+    notices = _parse_body_text(HOSPITAL_GRID, stats)
+    types = [n.lien_type for n in notices]
+    assert "Hospital Lien" not in types, types
+    assert stats.get("excluded_hospital") == 1, stats
+    # Neighbouring real liens survive untouched
+    assert "Abstract Of Judgment" in types
+
+
+def test_child_support_lien_kept():
+    """Child-support liens DO attach to real property (Fam. Code §157.312)."""
+    notices = _parse_body_text(HOSPITAL_GRID)
+    cs = [n for n in notices if n.lien_type == "Child Support Lien"]
+    assert len(cs) == 1 and cs[0].tax_owner_name == "DOE JOHN"
+
+
+def test_hospital_lien_row_dropped_publicsearch():
+    table = "\n".join([
+        "Search results table for Property Records",
+        "\t\t\tGRANTOR\tGRANTEE\tDOC TYPE\tRECORDED DATE\tINST NUMBER\tBOOK\tPROP",
+        "\t\t\tBAYLOR SCOTT & WHITE\tPEGUES ANITA\tHOSPITAL LIEN\t6/1/2026\t2026027010\tOPR/1/2\t$",
+        "\t\t\tVOWIELL RYAN\tMIDLAND CREDIT MANAGEMENT INC\tABSTRACT OF JUDGMENT\t6/1/2026\t2026027004\tOPR/1/2\t$",
+    ])
+    stats: dict = {}
+    notices = _parse_results_text(table, "Bell", stats)
+    assert [n.lien_type for n in notices] == ["Abstract Of Judgment"]
+    assert stats.get("excluded_hospital") == 1, stats
+    # Call without stats still works (no counter requested)
+    assert len(_parse_results_text(table, "Bell")) == 1
+
+
+def test_tyler_is_lien_doctype_excludes_hospital():
+    from scrapers.lien_tyler import _is_lien_doctype
+    assert _is_lien_doctype("ABSTRACT OF JUDGMENT")
+    assert _is_lien_doctype("CHILD SUPPORT LIEN")
+    assert not _is_lien_doctype("HOSPITAL LIEN")
+    assert not _is_lien_doctype("RELEASE OF LIEN")
+
+
+def test_is_excluded_lien_type_helper():
+    from scrapers.lien_common import is_excluded_lien_type
+    assert is_excluded_lien_type("Hospital Lien")
+    assert is_excluded_lien_type("HOSPITAL LIENS")
+    assert not is_excluded_lien_type("Mechanics Lien")
+    assert not is_excluded_lien_type("")
+
+
+def test_pipeline_step3c_candidate_filter_excludes_hospital():
+    """Belt-and-braces: Step 3c-lien's candidate filter must consult
+    is_excluded_lien_type so a stray hospital-lien record never gets the
+    patient's home address from the CAD name lookup."""
+    import enrichment_pipeline as ep
+    src = open(ep.__file__, encoding="utf-8").read()
+    step = src[src.index("Step 3c-lien: Lien / Lis-Pendens Property Lookup"):]
+    cand_block = step[:step.index("if lien_no_addr:")]
+    assert "is_excluded_lien_type(n.lien_type)" in cand_block
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     passed = 0

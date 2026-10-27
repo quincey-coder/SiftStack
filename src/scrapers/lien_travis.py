@@ -42,8 +42,9 @@ from playwright.async_api import async_playwright, Page
 
 from notice_parser import NoticeData, normalize_court_name
 from scrapers import register
-from scrapers.lien_common import pick_debtor
+from scrapers.lien_common import is_excluded_lien_type, pick_debtor
 from scrapers.tccsearch_common import (
+    instrument_url,
     click_search,
     effective_from_date,
     goto_with_retry,
@@ -77,7 +78,11 @@ LIEN_DOC_TYPES: dict[int, str] = {
 # Default doc types to check each run. Tunable — the high-signal residential
 # distress liens lead; State Tax Lien is included but mostly business (filtered
 # out downstream when no in-county home is found for the debtor).
-DEFAULT_LIEN_DOC_TYPES: list[int] = [1, 14, 49, 51, 56, 60, 65, 106, 107]
+# 56 (Hospital Lien) is deliberately NOT requested: it attaches to a personal-
+# injury claim, not real property (Prop. Code §55.005(d)) — see
+# lien_common.is_excluded_lien_type, which also drops any such row the grid
+# still returns.
+DEFAULT_LIEN_DOC_TYPES: list[int] = [1, 14, 49, 51, 60, 65, 106, 107]
 
 SEL_DISCLAIMER_ACCEPT = "#cph1_lnkAccept"
 SEL_DATE_FROM_ID = "cphNoMargin_f_ddcDateFiledFrom"
@@ -174,7 +179,9 @@ async def _submit_search(page: Page) -> int:
     return total
 
 
-def _parse_record(instrument: str, block: list[str]) -> NoticeData | None:
+def _parse_record(
+    instrument: str, block: list[str], stats: dict | None = None,
+) -> NoticeData | None:
     """Parse one lien record block into NoticeData.
 
     block is the set of grid lines after the row/instrument line, up to the
@@ -182,6 +189,7 @@ def _parse_record(instrument: str, block: list[str]) -> NoticeData | None:
         ["06/29/2026\tABSTRACT OF JUDGMENT\t[R] CITIBANK",
          "[E] MOLINA RAMON G",
          "Temp"]
+    `stats` (optional) collects per-run drop counters, e.g. "excluded_hospital".
     """
     date_iso = ""
     lien_type = ""
@@ -213,6 +221,15 @@ def _parse_record(instrument: str, block: list[str]) -> NoticeData | None:
         if "LOC " in line.upper() and not address:
             address, city, zip_code = _parse_address_from_legal(line)
 
+    # Hospital liens attach to an injury claim, not the debtor's real property
+    # (Prop. Code §55.005(d)) — never a property lien lead, even if the grid
+    # returns one despite 56 being unchecked.
+    if is_excluded_lien_type(lien_type):
+        if stats is not None:
+            stats["excluded_hospital"] = stats.get("excluded_hospital", 0) + 1
+        logger.debug("Dropping %s %s (not a real-property lien)", lien_type, instrument)
+        return None
+
     # The institutional creditor may sit on either side of the index; pick the
     # real debtor (the non-creditor party) as the lead.
     debtor, creditor = pick_debtor(grantor=grantor, grantee=grantee)
@@ -221,9 +238,7 @@ def _parse_record(instrument: str, block: list[str]) -> NoticeData | None:
         return None
 
     notice = NoticeData(notice_type="lien", county="Travis", state="TX")
-    notice.source_url = (
-        f"{BASE_URL}/RealEstate/DocumentDetail.aspx?InstrumentNumber={instrument}"
-    )
+    notice.source_url = instrument_url(instrument)
     notice.date_added = date_iso
     notice.lien_type = lien_type
     notice.lien_creditor = _clean_name(creditor)
@@ -243,7 +258,7 @@ def _parse_record(instrument: str, block: list[str]) -> NoticeData | None:
     return notice
 
 
-def _parse_body_text(body_text: str) -> list[NoticeData]:
+def _parse_body_text(body_text: str, stats: dict | None = None) -> list[NoticeData]:
     """Pure parser over the results-grid inner_text (unit-testable).
 
     Anchors on each record's DATE line (present in both the Temp and Perm grid
@@ -280,16 +295,16 @@ def _parse_body_text(body_text: str) -> list[NoticeData]:
             block.append(lines[j])
             j += 1
 
-        notice = _parse_record(instrument, block)
+        notice = _parse_record(instrument, block, stats)
         if notice:
             notices.append(notice)
 
     return notices
 
 
-async def _parse_results_page(page: Page) -> list[NoticeData]:
+async def _parse_results_page(page: Page, stats: dict | None = None) -> list[NoticeData]:
     body_text = await page.inner_text("body")
-    return _parse_body_text(body_text)
+    return _parse_body_text(body_text, stats)
 
 
 async def _go_to_page(page: Page, page_num: int) -> bool:
@@ -337,6 +352,7 @@ class TravisLienScraper:
         # Cover the clerk's Temp-index lag so paper-filed liens that were
         # nameless on day 1 get re-scanned once verified (dedup absorbs repeats).
         from_date = effective_from_date(from_date, to_date, mode)
+        drop_stats: dict = {}   # per-run parser drop counters → last_meta
 
         logger.info(
             "Travis lien scrape: mode=%s, range=%s to %s, doc_types=%s",
@@ -390,7 +406,7 @@ class TravisLienScraper:
                 current_page = 1
                 while True:
                     logger.info("Parsing lien page %d...", current_page)
-                    page_notices = await _parse_results_page(page)
+                    page_notices = await _parse_results_page(page, drop_stats)
                     all_notices.extend(page_notices)
                     logger.info(
                         "  Page %d: %d liens (total so far: %d)",
@@ -416,6 +432,7 @@ class TravisLienScraper:
                 await browser.close()
 
         self.last_meta["kept"] = len(all_notices)
+        self.last_meta.update(drop_stats)
         logger.info(
             "Travis lien scrape complete: %d liens from %d total records",
             len(all_notices), total,

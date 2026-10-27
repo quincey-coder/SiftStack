@@ -49,7 +49,7 @@ from playwright.async_api import async_playwright
 from notice_parser import NoticeData, normalize_court_name
 from scrapers import register
 from scrapers.tccsearch_common import proxy_kwargs as _proxy_kwargs
-from scrapers.lien_common import pick_debtor
+from scrapers.lien_common import is_excluded_lien_type, pick_debtor
 from scrapers import tyler_common as tc
 from scrapers.debug_capture import dump_page, dump_text
 
@@ -66,9 +66,11 @@ LIEN_DOC_TYPE_NAMES = [
     "FEDERAL TAX LIEN",
     "STATE TAX LIEN",
     "MECHANICS LIEN",
-    "HOSPITAL LIEN",
     "CHILD SUPPORT LIEN",
 ]
+# "HOSPITAL LIEN" was removed 2026-10-27: it attaches to the patient's injury
+# claim, not real property (Prop. Code §55.005(d)). Any such row the portal
+# still returns is dropped by lien_common.is_excluded_lien_type below.
 
 # A parsed row's doc-type is KEPT when it reads as a real lien and is NOT a
 # release/assignment/amendment. Anchors on "LIEN" or "ABSTRACT OF JUDGMENT" so
@@ -102,6 +104,8 @@ def _is_lien_doctype(doctype: str) -> bool:
         return False
     if any(x in up for x in _LIEN_EXCLUDE):
         return False
+    if is_excluded_lien_type(up):
+        return False   # hospital liens: not a real-property encumbrance
     return ("LIEN" in up) or ("ABSTRACT OF JUDGMENT" in up)
 
 
@@ -268,6 +272,12 @@ class WilliamsonTylerLienScraper:
                             if docid and docid in seen_docids:
                                 continue
                             instrument, doctype, date_iso = tc.parse_h1(row.get("h1", ""))
+                            if is_excluded_lien_type(doctype):
+                                # Hospital lien: injury-claim lien, not real property.
+                                self.last_meta["excluded_hospital"] = (
+                                    self.last_meta.get("excluded_hospital", 0) + 1
+                                )
+                                continue
                             if not _is_lien_doctype(doctype):
                                 continue  # LIS PENDENS, deeds, releases, etc.
                             grantors = row.get("grantors") or []

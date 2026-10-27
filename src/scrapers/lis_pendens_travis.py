@@ -37,6 +37,7 @@ from notice_parser import NoticeData, normalize_court_name
 from scrapers import register
 from scrapers.lis_pendens_common import pick_defendant
 from scrapers.tccsearch_common import (
+    instrument_url,
     click_search,
     count_temp_rows,
     effective_from_date,
@@ -180,9 +181,7 @@ def _parse_record(instrument: str, block: list[str]) -> NoticeData | None:
         return None
 
     notice = NoticeData(notice_type="lis_pendens", county="Travis", state="TX")
-    notice.source_url = (
-        f"{BASE_URL}/RealEstate/DocumentDetail.aspx?InstrumentNumber={instrument}"
-    )
+    notice.source_url = instrument_url(instrument)
     notice.date_added = date_iso
     # Plaintiff surfaced in Notes as context (WHY they're distressed); the suit
     # type is always "Lis Pendens" so it's left off lien_type to avoid a

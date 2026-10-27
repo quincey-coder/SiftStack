@@ -236,6 +236,9 @@ class NoticeData:
     compliance_deadline: str = ""      # Date owner must comply by (YYYY-MM-DD), if stated
     case_status: str = ""              # e.g. "Active"/"Open"/"Closed"/"In Compliance" — drives closed-case filter
     case_id: str = ""                  # Source case number (Austin Code case_id) — cross-run key for resolution tracking
+    case_number: str = ""              # COURT cause number (probate docket "24-0468-CP4", tax-suit "GN21006856"); surfaced in Notes
+    case_attorney: str = ""            # Counsel of record for the PR/applicant, "Name 512-555-0100" (Williamson docket); Notes only
+    case_docket: str = ""              # Compact docket summary "9 events, last 2026-10-29; Letters: 2025-06-03"; Notes only
     order_class: str = ""              # condemned (Austin BSC) effective order class: "repair"/"vacate"/"demolish" — part of the cross-run dedup key
     # Travis tax-delinquent cleaner outputs (empty for all other scrapers)
     business_name: str = ""            # Entity name when owner_name is business (skill overflow merge result)

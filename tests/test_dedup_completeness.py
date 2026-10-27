@@ -116,6 +116,59 @@ def test_seal_recomputes_key_when_snapshot_missing():
     assert added == 1 and seen == {"parcel:P123"}, seen
 
 
+# ── Degenerate keys (no discriminator) — never sealed, never matched ─────────
+
+def test_is_degenerate_key():
+    from main import _is_degenerate_key
+    assert _is_degenerate_key("addr:probate|williamson||")
+    assert _is_degenerate_key("addr:lien|travis||")
+    assert _is_degenerate_key("addr:lien|bell| |")           # whitespace-only discriminator
+    assert not _is_degenerate_key("addr:lien|travis|john smith|")
+    assert not _is_degenerate_key("addr:foreclosure|travis|1 main st|78701")
+    assert not _is_degenerate_key("parcel:000000007010")
+    assert not _is_degenerate_key("id:www.tccsearch.org/instrument/202641242")
+    assert not _is_degenerate_key("")
+
+
+def test_degenerate_addr_key_never_sealed_even_when_complete():
+    """Snapshot taken before enrichment (no address/name) → degenerate key.
+    Enrichment later fills the address so the record IS complete — the old code
+    sealed `addr:probate|williamson||` here and blanked the whole feed."""
+    n = _n(notice_type="probate", county="Williamson", decedent_name="Joe Doe",
+           address="1 Main St", zip="78664")
+    n._dedup_key = "addr:probate|williamson||"
+    seen: set = set()
+    added, left_open = _seal_seen_ids([n], seen)
+    assert added == 0 and left_open == 1
+    assert seen == set()
+
+
+def test_degenerate_key_not_sealed_by_escape_hatch():
+    n = _n(notice_type="lien", county="Travis", owner_name="Bob Ray", address="9 Elm", zip="78701")
+    n._dedup_key = "addr:lien|travis||"
+    seen: set = set()
+    added, _ = _seal_seen_ids([n], seen, require_complete=False)
+    assert added == 0 and seen == set()
+
+
+def test_purge_degenerate_keys_on_load():
+    from main import _purge_degenerate_keys
+    seen = {"addr:lien|travis||", "addr:lien|bell||", "parcel:1", "addr:lien|travis|bob ray|"}
+    removed = _purge_degenerate_keys(seen)
+    assert removed == 2
+    assert seen == {"parcel:1", "addr:lien|travis|bob ray|"}
+
+
+def test_dedup_key_for_unlocated_probate_is_degenerate_and_recognised():
+    """The key the pipeline actually builds for a probate with no address/owner
+    at snapshot time is degenerate — the guard must recognise that exact shape."""
+    from main import _notice_dedup_key, _is_degenerate_key
+    n = _n(notice_type="probate", county="Williamson", decedent_name="Joe Doe")
+    key = _notice_dedup_key(n)
+    assert key == "addr:probate|williamson||", key
+    assert _is_degenerate_key(key)
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     passed = 0

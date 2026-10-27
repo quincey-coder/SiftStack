@@ -42,6 +42,21 @@ _CREDITOR_RE = re.compile("|".join(re.escape(k) for k in _CREDITOR_KEYWORDS))
 # unsafe — "IRS" inside another word, etc.).
 _CREDITOR_TOKENS = {"IRS", "USA", "TWC", "HOA"}
 
+# Lien doc types that are NOT real-property encumbrances and must never become
+# a "Liens" record. A hospital lien (Tex. Prop. Code ch. 55) attaches to the
+# patient's personal-injury CLAIM, and §55.005(d) requires the recorded notice
+# to state that it "does not attach to real property owned by the individual".
+# Pulling them put 212 accident patients (25% of the CRM's lien records on
+# 2026-10-22) into the Liens list as if their homes were encumbered. Child-
+# support liens DO attach to real property (Fam. Code §157.312) and stay.
+EXCLUDED_LIEN_TYPE_KEYWORDS: tuple[str, ...] = ("HOSPITAL",)
+
+
+def is_excluded_lien_type(lien_type: str) -> bool:
+    """True when a lien doc type must be dropped (not a real-property lien)."""
+    up = (lien_type or "").upper()
+    return bool(up) and any(k in up for k in EXCLUDED_LIEN_TYPE_KEYWORDS)
+
 
 def is_creditor(name: str) -> bool:
     """True if the party name looks like an institutional creditor/filer."""

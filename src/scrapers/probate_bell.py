@@ -170,7 +170,9 @@ class BellProbateScraper:
                         state="TX",
                         decedent_name=decedent,
                         decedent_aka=normalize_court_name(_alias) if _alias else "",
-                        source_url=f"{BASE_URL}/?instNum={row.get('instNum', '')}",
+                        # /doc/{instrument} is the portal's working document page (the
+                        # same form the Bell lien scrapers use); "?instNum=" was not.
+                        source_url=f"{BASE_URL}/doc/{row.get('instNum', '')}",
                     )
 
                     # Parse date

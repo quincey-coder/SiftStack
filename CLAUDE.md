@@ -95,8 +95,8 @@ dedup/sold baselines don't know what the cloud already uploaded.
 - **foreclosure_wilco.py** — Williamson County trustee sales (apps.wilco.org).
 - **tax_delinquent_travis.py** — Direct CSV download from Travis County Tax Office (13K+ delinquent properties). No scraping needed.
 - **tax_sale_mvba.py** — MVBA Law Firm PDF scraper. Handles tax sales for both Bell and Williamson counties from one source.
-- **probate_odyssey.py** — Shared Odyssey (Tyler Tech) portal scraper for court records. Works with all 3 counties via config.
-- **probate_travis.py** / **probate_bell.py** — County-specific Odyssey configuration.
+- **probate_odyssey.py** — Williamson probate from the legacy Odyssey PublicAccess court docket (no CAPTCHA). Filter = case number ENDS in `-CP4` (a `-CP4A` adversary sub-case must qualify by "Estate Of" title or probate type), then opens each kept case's Register of Actions in the same session: the Administrator/Executor/Applicant → `owner_name` (the PR, FIRST LAST from the unambiguous "Last, First" cell), retained attorney + phone → `case_attorney`, decedent `DOD:` → `date_of_death`/`owner_deceased`, Events & Orders → `case_docket` (letters granted / inventory / last activity). Demographics on the decedent row are never read. Sets `last_meta` (returned / probate_candidates / kept / detail_ok / detail_failed) so run_health's parse-zero alarm works. The court-named PR makes the obituary "probate preset" fire. Travis and Bell "probate" are NOT court dockets — see probate_travis / probate_bell.
+- **probate_travis.py** / **probate_bell.py** — County-clerk RECORDED instruments (tccsearch "CERT COPY OF PROBATE" / "AFFIDAVIT OF HEIRSHIP"; publicsearch "PROBATE"), not the estate case; the real Travis/Bell dockets are on reCAPTCHA Odyssey Portals (see docs/CASE_TRACKING_FEASIBILITY.md).
 
 ### Core Files
 - **main.py** — CLI entry point. Parses args (`daily`/`historical`, `--split`, `--counties`, `--types`, `-v`). Orchestrates scrape → dedup → enrichment → export, logs run summary stats.
@@ -218,6 +218,32 @@ built the same day after the foreclosure audit found the scrapers delivering
   actor `rebuild_seal_all` is the escape hatch. Watch the "left OPEN for
   re-hit" log line — sustained >~25/day means the re-enrichment cost needs a
   pending tier.
+- **Identity keys come from the clerk instrument / court case id, never a
+  name (2026-10-27).** `data_formatter._notice_id_from_url` maps every source
+  URL shape we emit — tccsearch `InstrumentNumber=` (query OR fragment), GovOS
+  `/doc/N` and `?instNum=N` (same id), Odyssey PublicAccess `CaseID=`, Tyler
+  `/document/`, legacy `Details.aspx?…ID=` — to a domain-qualified id, so
+  `_notice_dedup_key` yields `id:…` for all five courthouse feeds. Before this,
+  Travis liens/lis pendens were keyed `addr:lien|travis|<debtor name>|` (773
+  such keys in production: a second lien against the same person — or a
+  same-named stranger — was filtered as "seen" forever) and probate sealed
+  only via the type-agnostic `parcel:` key. `_is_degenerate_key` guards the
+  composite fallback: `addr:<type>|<county>||` (no address AND no name at
+  snapshot) is never sealed, never matched, and purged from the stored set on
+  load — sealing one would have blanked a whole feed. First run after deploy
+  re-emits the in-window records once (bounded by the 14-day window; the wizard
+  merges by address, so duplicate notes, not duplicate records). Tests:
+  `tests/test_dedup_keys.py`, `tests/test_dedup_completeness.py`.
+- **Source URLs are WORKING links** (2026-10-27): the stored Travis deep link
+  `DocumentDetail.aspx?InstrumentNumber=N` needs session state and returned
+  "Fatal System Error" to anyone who clicked it; `tccsearch_common.instrument_url`
+  now emits `SearchEntry.aspx#InstrumentNumber=N`, Bell probate uses the
+  `/doc/N` page like the Bell lien scrapers, Williamson probate emits
+  `default.aspx#CaseID=N&case=<case no>` (never `Search.aspx?ID=200` — the
+  legacy `[?&]ID=` regex would key every record on "200"). The formatter adds a
+  human line to Notes (`_source_ref_label`: "Travis Clerk Instrument # N …",
+  "Williamson CCL4 Case No. X …") plus `Case No.` / `Attorney:` / `Docket:`
+  from `case_number` / `case_attorney` / `case_docket`.
 - **Scanned-PDF foreclosure sources remember every PDF**
   (`scrapers/pdf_notice_state.py`, KVS `bell_foreclosure_state` /
   `williamson_foreclosure_state`, local `data/{county}_foreclosure_state/`):
@@ -326,6 +352,26 @@ learned running it down on Apify (the block had killed every Travis pull since
   escalated to an embedded Turnstile widget needing a solved cf-clearance token
   (2captcha, already a dependency), `False` means it's still the IP/pool.
 
+### Bell CAD portal migration — GSA replaced esearch, roll went stale (2026-10-27)
+
+Bell CAD moved its property portal to **GSA Corp** (`belltx-search.gsacorp.io`;
+`esearch.bellcad.org` is a 404 on every path) and stopped re-posting the
+delinquent-roll XLSX after `..._Condensed_20260717.xlsx`. The cloud run
+re-downloaded that identical file (same sha256) every day for 3 months with
+0 NEW / 0 DROPPED and no alarm, so Bell Sold tagging was dead since July. The
+appraisal export was also renamed (`BellCAD-Appraisal-Data-Condensed-2026-20260922.xlsx`)
+and the old regex silently kept the April roll. Fixed: dual-shape
+`BELLCAD_APPRAISAL_ROLL_PATTERN` (newest date, then highest year),
+`bell_tax_cache` meta sidecars + `roll_age_days`, the scraper's
+`_check_roll_staleness` → `LAST_ALARMS` (error-level in Slack) past
+`BELLCAD_DELINQUENT_STALE_DAYS` (45, env `SIFT_BELL_ROLL_STALE_DAYS`), Source URL
+→ `…/parcel/<10-digit id>`. **`src/bell_gsa.py`** reads the live site per parcel
+(`/parcel/<id>`: owner, mailing, situs, DEED HISTORY, buildings, values;
+`/tax/<id>`: per-year original/penalty/interest/paid/balance; no receipts, no
+payer). Props IDs are 10-digit zero-padded. Full audit, direct links and the
+new bulk files worth parsing (MortgageProcessFile, certified PACS export with
+exemption/deed/mortgage fields, Collections RAR): `docs/BELL_PORTAL_MIGRATION.md`.
+
 ### Travis Tax Office CSVs — schema flip + corrupt rows — hard-won 2026-08-06
 
 Both Tax Office bulk CSVs (`TaxDelqOpenData.csv`, `TaxCurOpenData.csv`) are
@@ -352,26 +398,6 @@ broke Travis tax-delinquent AND the whole Travis CAD cache for two days
   with a bare leading dot (`.00`). `normalize_delq_row()` collapses interior
   whitespace on every value; `_parse_address` collapses again for direct callers.
 - **`TaxCurOpenData.csv` headers did NOT change** (`PARCEL`, `NAMELF`,
-### Bell CAD portal migration — GSA replaced esearch, roll went stale (2026-10-27)
-
-Bell CAD moved its property portal to **GSA Corp** (`belltx-search.gsacorp.io`;
-`esearch.bellcad.org` is a 404 on every path) and stopped re-posting the
-delinquent-roll XLSX after `..._Condensed_20260717.xlsx`. The cloud run
-re-downloaded that identical file (same sha256) every day for 3 months with
-0 NEW / 0 DROPPED and no alarm, so Bell Sold tagging was dead since July. The
-appraisal export was also renamed (`BellCAD-Appraisal-Data-Condensed-2026-20260922.xlsx`)
-and the old regex silently kept the April roll. Fixed: dual-shape
-`BELLCAD_APPRAISAL_ROLL_PATTERN` (newest date, then highest year),
-`bell_tax_cache` meta sidecars + `roll_age_days`, the scraper's
-`_check_roll_staleness` → `LAST_ALARMS` (error-level in Slack) past
-`BELLCAD_DELINQUENT_STALE_DAYS` (45, env `SIFT_BELL_ROLL_STALE_DAYS`), Source URL
-→ `…/parcel/<10-digit id>`. **`src/bell_gsa.py`** reads the live site per parcel
-(`/parcel/<id>`: owner, mailing, situs, DEED HISTORY, buildings, values;
-`/tax/<id>`: per-year original/penalty/interest/paid/balance; no receipts, no
-payer). Props IDs are 10-digit zero-padded. Full audit, direct links and the
-new bulk files worth parsing (MortgageProcessFile, certified PACS export with
-exemption/deed/mortgage fields, Collections RAR): `docs/BELL_PORTAL_MIGRATION.md`.
-
   `MAILINGADDRESS`, …) — but the county began emitting rows with an
   **unbalanced quote** (a `ZIPCODE` of literal `"""78`). That opens a quoted
   field that never closes, so `csv` swallows the remaining ~170 MB into one
@@ -425,6 +451,7 @@ Configured in `config.py`:
 | Bell | Tax Sale | MVBA Law Firm PDFs |
 | Bell | Probate | Odyssey portal |
 | Bell | Lien | bell.tx.publicsearch.us (GovOS, **headed**) |
+| Bell | Tax Delinquent | BellCAD data-portal XLSX (batch) + belltx-search.gsacorp.io (live per parcel, `src/bell_gsa.py`) |
 | Williamson | Foreclosure | wilco.org trustee sales |
 | Williamson | Tax Sale | MVBA Law Firm PDFs |
 | Williamson | Probate | Odyssey portal |
@@ -441,9 +468,18 @@ enrichment **Step 3c-lien**.
 
 - **Travis — `tccsearch.org` (same site as foreclosure).** Doc-type checkbox
   indices captured live (130 types): AJ=1, Assessment=14, Estate Tax=49,
-  Federal Tax=51, Hospital=56, Judgement=60, Mechanics=65, State Judgement=106,
+  Federal Tax=51, Judgement=60, Mechanics=65, State Judgement=106,
   State Tax=107 (`DEFAULT_LIEN_DOC_TYPES`). Releases/transfers excluded. Runs
   headless like the other Travis scrapers.
+- **Hospital liens (tccsearch 56, "HOSPITAL LIEN" on GovOS/Tyler) are EXCLUDED
+  (2026-10-27).** A hospital lien attaches to the patient's personal-injury
+  CLAIM, and Prop. Code §55.005(d) makes the recorded notice say it "does not
+  attach to real property". We pulled them for months anyway — 225 accident
+  patients (26% of the CRM's lien records) were marketed as encumbered homes.
+  `lien_common.is_excluded_lien_type` drops the row in all three scrapers
+  (counted in `last_meta["excluded_hospital"]`) and in Step 3c-lien;
+  `scripts/export_hospital_liens.py` (read-only) lists what already landed.
+  Child-support liens DO attach to real property (Fam. Code §157.312) — keep.
 - **Bell + Williamson — `{county}.tx.publicsearch.us` (Kofile/GovOS County
   Fusion). MUST RUN HEADED.** The anti-bot blocks *old headless* chromium
   (results stick on "Loading…" forever, no API fires); a real headed browser
@@ -451,7 +487,6 @@ enrichment **Step 3c-lien**.
   Docker/Apify (Linux, no display) run under Xvfb (`xvfb-run -a …`). Override
   with `LIEN_PUBLICSEARCH_HEADLESS=1` (will likely return 0). Flow = Advanced
   Search: add lien doc types to `#docTypes-input` (react-select: type + Enter)
-| Bell | Tax Delinquent | BellCAD data-portal XLSX (batch) + belltx-search.gsacorp.io (live per parcel, `src/bell_gsa.py`) |
   **before** filling `#recordedDateRange-start/-end` (date picker overlays the
   doc-type field otherwise) → click the **exact** "Search" button (NOT
   "Search Criteria", a section toggle) → parse the tab-separated results table.

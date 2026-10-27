@@ -72,6 +72,17 @@ def test_slack_block_has_no_warning_lines():
     assert "4 warnings in the run log (not shown here)" in block
 
 
+def test_williamson_probate_parse_zero_now_alarms():
+    """probate_odyssey never set last_meta, so a search that returned rows but
+    parsed none could never trip the parse-zero alarm. With returned/kept in
+    evidence it does — same shape the scraper now emits."""
+    h = rh.RunHealth()
+    h.record_scraper("Williamson", "probate", count=0,
+                     evidence={"returned": 1248, "probate_candidates": 48, "kept": 0})
+    r = rh.analyze(h, {})
+    assert any("Williamson/probate" in f and "1248 returned, 0 parsed" in f for f in r.flags), r.flags
+
+
 def test_log_only_block_includes_warnings():
     r = _mixed_run()
     block = rh.build_health_block(r, include_warnings=True)
@@ -119,3 +130,31 @@ def test_send_health_report_logs_warnings_and_sends_errors_only(monkeypatch, cap
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+def test_zero_streak_warning_survives_a_long_blackout():
+    """Williamson/tax_delinquent was 0 from 2026-10-06; by 10-21 the 14-day
+    window held no non-zero day, the live median was 0 and the warning
+    vanished while the scraper was still dark."""
+    h = rh.RunHealth()
+    h.record_scraper("Williamson", "tax_delinquent", count=0)
+    b = _baseline("Williamson/tax_delinquent", [0] * 14, zero_streak=14)
+    assert not rh.analyze(h, b).warnings            # the old behaviour: silent
+    b["Williamson/tax_delinquent"]["last_ok_median"] = 512.0
+    r = rh.analyze(h, b)
+    assert any(
+        "Williamson/tax_delinquent — 0 records 15 days running (baseline ~512/day)" in w
+        for w in r.warnings
+    )
+    assert r.healthy                                 # still warn-level, log-only
+
+
+def test_update_baselines_remembers_the_last_ok_median():
+    h = rh.RunHealth()
+    h.record_scraper("Williamson", "tax_delinquent", count=512)
+    b = rh.update_baselines(_baseline("Williamson/tax_delinquent", [500, 520]), h)
+    assert b["Williamson/tax_delinquent"]["last_ok_median"] == 512
+    h0 = rh.RunHealth()
+    h0.record_scraper("Williamson", "tax_delinquent", count=0)
+    b = rh.update_baselines(b, h0)
+    assert b["Williamson/tax_delinquent"]["last_ok_median"] == 512   # a zero day keeps it

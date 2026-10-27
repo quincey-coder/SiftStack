@@ -52,6 +52,7 @@ def _load_cli_state() -> tuple[str | None, set[str]]:
     if config.SEEN_IDS_FILE.exists():
         try:
             seen = set(json.loads(config.SEEN_IDS_FILE.read_text()))
+            _purge_degenerate_keys(seen)
             logging.info("Loaded %d previously-seen notice IDs from %s",
                          len(seen), config.SEEN_IDS_FILE.name)
         except Exception as e:
@@ -112,24 +113,34 @@ def _notice_dedup_key(notice) -> str:
     return f"addr:{ntype}|{county}|{addr}|{zipc}"
 
 
-def _notice_dedup_key_from_row(row: dict) -> str:
-    """Same logic as _notice_dedup_key, but reads from a CSV DictReader row.
-    Used during the one-time seeding step and for stable comparison."""
-    from data_formatter import _notice_id_from_url
-    url = (row.get("source_url") or "").strip()
-    nid = _notice_id_from_url(url)
-    if nid:
-        return f"id:{nid}"
-    parcel = (row.get("parcel_id") or "").strip()
-    if parcel:
-        return f"parcel:{parcel}"
-    addr = (row.get("address") or "").strip().lower()
-    ntype = (row.get("notice_type") or "").strip().lower()
-    county = (row.get("county") or "").strip().lower()
-    zipc = (row.get("zip") or "").strip()[:5]
-    if not addr:
-        addr = (row.get("owner_name") or "").strip().lower()
-    return f"addr:{ntype}|{county}|{addr}|{zipc}"
+def _is_degenerate_key(key: str) -> bool:
+    """True for a composite key with NO discriminator — `addr:<type>|<county>||`.
+
+    Such a key is produced when a record has neither address nor owner name at
+    snapshot time (an un-located probate, a nameless Temp-index lien). Sealing
+    it would collapse the whole feed onto one key and silently filter every
+    later record of that type/county — so it is never sealed, never matched,
+    and purged from any stored set on load. (Found 2026-10-22: the local state
+    already held `addr:lien|travis||`, `addr:lien|bell||`, `addr:lien|williamson||`.)
+    """
+    if not key or not key.startswith("addr:"):
+        return False
+    parts = key[len("addr:"):].split("|")
+    # addr:{type}|{county}|{discriminator}|{zip}
+    return len(parts) >= 3 and not parts[2].strip()
+
+
+def _purge_degenerate_keys(seen: set) -> int:
+    """Drop degenerate keys from a loaded seen-set in place; return how many."""
+    bad = {k for k in seen if _is_degenerate_key(k)}
+    if bad:
+        seen.difference_update(bad)
+        logging.warning(
+            "Dedup state: purged %d degenerate key(s) with no address/name "
+            "discriminator (they would have blanked whole feeds): %s",
+            len(bad), ", ".join(sorted(bad)[:6]),
+        )
+    return len(bad)
 
 
 # ── Completeness-gated dedup seal (owner rule, 2026-09-09) ───────────
@@ -182,6 +193,14 @@ def _seal_seen_ids(notices, seen_ids: set, *, require_complete: bool = True) -> 
             open_by_type[t] = open_by_type.get(t, 0) + 1
             continue
         key = getattr(n, "_dedup_key", None) or _notice_dedup_key(n)
+        if _is_degenerate_key(key):
+            # The snapshot key carries no discriminator (record had no address
+            # or name when scraped). Even if enrichment has since completed the
+            # record, this key would match EVERY future record of its type —
+            # leave it open; the rolling window re-hits it.
+            t = (getattr(n, "notice_type", "") or "?") + " (degenerate key)"
+            open_by_type[t] = open_by_type.get(t, 0) + 1
+            continue
         if key not in seen_ids:
             seen_ids.add(key)
             added += 1
@@ -594,8 +613,9 @@ async def actor_main() -> None:
         # gone (2026-09-17).
         upload_datasift = bool(actor_input.get("upload_datasift", False))
         datasift_do_enrich = bool(actor_input.get("datasift_enrich_after_upload", True))
-        # Skip-trace is the account's unlimited plan — no per-record cost.
-        datasift_do_skip_trace = bool(actor_input.get("datasift_skip_trace_after_upload", True))
+        # Skip-trace is OPT-IN (owner decision 2026-10-21): never skip-trace
+        # an upload unless the input explicitly turns it on.
+        datasift_do_skip_trace = bool(actor_input.get("datasift_skip_trace_after_upload", False))
         # Per-run batch tag: every uploaded row carries it, and the bulk
         # actions select by it (never by the established list).
         from datetime import datetime as _dt_bt
@@ -728,6 +748,7 @@ async def actor_main() -> None:
                 # Legacy shape tolerance — old runs stored a dict
                 stored_seen = list(stored_seen.keys()) or list(stored_seen.values())
             seen_ids: set[str] = set(stored_seen)
+            _purge_degenerate_keys(seen_ids)
             Actor.log.info("Loaded %d previously-seen notice IDs from KVS", len(seen_ids))
 
             # ── Load Travis tax-delinquent state ──
@@ -860,7 +881,10 @@ async def actor_main() -> None:
             # ── Incremental dedup filter ──
             if seen_ids and notices:
                 before = len(notices)
-                notices = [n for n in notices if n._dedup_key not in seen_ids]
+                # A degenerate key (no address/name discriminator) is never a
+                # match — it would suppress every record of its type/county.
+                notices = [n for n in notices
+                           if n._dedup_key not in seen_ids or _is_degenerate_key(n._dedup_key)]
                 filtered = before - len(notices)
                 if filtered:
                     Actor.log.info(
@@ -1743,10 +1767,15 @@ def _run_csv_import(args) -> None:
         logging.warning("No records found in CSV(s)")
         sys.exit(0)
 
-    # Deduplicate by source_url (notice ID) — keeps most recent
+    # Deduplicate by source identifier (instrument / case id parsed from the
+    # URL, falling back to the raw URL) — keeps the better-enriched copy. The
+    # parsed id makes the legacy dead tccsearch deep link and the current
+    # working URL for the same instrument collapse onto one record.
+    from data_formatter import _notice_id_from_url
     seen_urls = {}
     for n in all_notices:
-        url = getattr(n, "source_url", "") or ""
+        raw_url = getattr(n, "source_url", "") or ""
+        url = _notice_id_from_url(raw_url) or raw_url
         if url and url in seen_urls:
             # Keep the one with more enrichment data
             existing = seen_urls[url]
@@ -1809,7 +1838,7 @@ def _run_csv_import(args) -> None:
         from datasift_uploader import upload_datasift_split, upload_to_datasift
 
         do_enrich = not getattr(args, "no_enrich", False)
-        do_skip_trace = not getattr(args, "no_skip_trace", False)
+        do_skip_trace = bool(getattr(args, "skip_trace", False)) and not getattr(args, "no_skip_trace", False)
 
         csv_infos = write_datasift_by_notice_type(notices)
         for info in csv_infos:
@@ -2365,9 +2394,14 @@ def cli_main() -> None:
         help="Skip DataSift property enrichment after upload",
     )
     parser.add_argument(
+        "--skip-trace",
+        action="store_true",
+        help="Run DataSift skip trace after upload (OFF unless this flag is given)",
+    )
+    parser.add_argument(
         "--no-skip-trace",
         action="store_true",
-        help="Skip DataSift skip trace after upload",
+        help="[kept for old scripts — skip trace is already off by default; always wins over --skip-trace]",
     )
     parser.add_argument(
         "--notify-slack",
@@ -3072,7 +3106,8 @@ def _run_scrape_pipeline(args, targets) -> None:
     # downstream pipeline mutations to notice.address don't poison the match.
     if cli_seen_ids and notices:
         before = len(notices)
-        notices = [n for n in notices if n._dedup_key not in cli_seen_ids]
+        notices = [n for n in notices
+                   if n._dedup_key not in cli_seen_ids or _is_degenerate_key(n._dedup_key)]
         filtered = before - len(notices)
         if filtered:
             logging.info(
@@ -3421,7 +3456,7 @@ def _run_scrape_pipeline(args, targets) -> None:
         do_enrich = not getattr(args, "no_enrich", False)
         # Skip-trace endpoint is not yet captured for the API path. If the
         # user wants skip-trace, fall back to the Playwright path after upload.
-        do_skip_trace = not getattr(args, "no_skip_trace", False)
+        do_skip_trace = bool(getattr(args, "skip_trace", False)) and not getattr(args, "no_skip_trace", False)
         api_failed = False
         api_results: list[dict] = []
         _rawpipe_fatal = ""  # set when the stage dies before per-list results
@@ -3582,7 +3617,7 @@ def _run_scrape_pipeline(args, targets) -> None:
         from datasift_uploader import upload_datasift_split
         import upload_outcome as _uo
         do_enrich = not getattr(args, "no_enrich", False)
-        do_skip_trace = not getattr(args, "no_skip_trace", False)
+        do_skip_trace = bool(getattr(args, "skip_trace", False)) and not getattr(args, "no_skip_trace", False)
 
         # A crash inside the uploader used to take the whole run down with it
         # (no Slack, no health report). Catch it, treat every list as lost,

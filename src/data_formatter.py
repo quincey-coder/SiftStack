@@ -151,29 +151,54 @@ def _split_name(full_name: str) -> tuple[str, str, str]:
 
 
 def _notice_id_from_url(url: str) -> str:
-    """Extract the numeric notice ID from a source URL.
+    """Extract the record identifier from a source URL (the dedup identity).
 
-    Recognized shapes (returns empty string if none match):
-      .../Details.aspx?SID=...&ID=509975          -> "509975" (Odyssey/tccsearch)
-      https://bell.tx.publicsearch.us/doc/2026030172   -> "bell.tx.publicsearch.us/doc/2026030172"
-      .../williamsonweb/document/DOC123           -> "<host>/document/DOC123" (Tyler)
+    Recognized shapes, most specific first (returns "" if none match):
+      tccsearch  ...DocumentDetail.aspx?InstrumentNumber=202641242   (legacy, dead link)
+                 ...SearchEntry.aspx#InstrumentNumber=202641242      (current, working)
+                                              -> "www.tccsearch.org/instrument/202641242"
+      GovOS      https://bell.tx.publicsearch.us/?instNum=2026030172 (Bell probate)
+                 https://bell.tx.publicsearch.us/doc/2026030172      (Bell lien / lis pendens)
+                                              -> "bell.tx.publicsearch.us/doc/2026030172"
+                 (same instrument = same document, so both forms share one id)
+      Odyssey PA ...CaseDetail.aspx?CaseID=2577925 / ...default.aspx#CaseID=2577925
+                                              -> "judicialrecords.wilco.org/case/2577925"
+      Tyler      .../williamsonweb/document/DOC123 -> "<host>/document/DOC123"
+      Odyssey    .../Details.aspx?SID=...&ID=509975 -> "509975"  (legacy tccsearch detail
+                 pages only — anchored to Details.aspx so a search URL such as
+                 PublicAccess/Search.aspx?ID=200 can never become a key)
 
-    The publicsearch/Tyler forms are domain-qualified because instrument
-    numbers repeat across counties. Without these patterns every Bell and
-    Williamson lien/lis-pendens fell through to the address composite —
-    which is EMPTY for name-indexed records pre-enrichment — so they all
-    collapsed onto one degenerate dedup key (addr:lien|bell||) and were
-    silently deduped to zero at export (found 2026-08-19).
+    Every form is domain-qualified because instrument numbers repeat across
+    counties. History: without the /doc/ and /document/ patterns every Bell and
+    Williamson lien/lis-pendens fell through to the address composite — EMPTY
+    for name-indexed records pre-enrichment — so they all collapsed onto one
+    degenerate dedup key (found 2026-08-19). Until 2026-10-27 the SAME gap
+    applied to the InstrumentNumber=, instNum= and CaseID= forms: Travis
+    liens were keyed on the DEBTOR'S NAME (773 such keys in the production
+    seen-set), so a second lien against the same person was filtered forever,
+    and probate records could seal the degenerate `addr:probate|<county>||`.
     """
     import re
     from urllib.parse import urlsplit
-    m = re.search(r"[?&]ID=(\d+)", url)
+    if not url:
+        return ""
+    host = urlsplit(url).netloc.lower()
+    m = re.search(r"InstrumentNumber=(\d+)", url, re.IGNORECASE)
     if m:
-        return m.group(1)
+        return f"{host}/instrument/{m.group(1)}"
+    m = re.search(r"[?&#]instNum=(\d+)", url, re.IGNORECASE)
+    if m:
+        return f"{host}/doc/{m.group(1)}"
+    m = re.search(r"CaseID=(\d+)", url, re.IGNORECASE)
+    if m:
+        return f"{host}/case/{m.group(1)}"
     m = re.search(r"/(doc|document)/([\w.-]+)", url)
     if m:
-        host = urlsplit(url).netloc
         return f"{host}/{m.group(1)}/{m.group(2)}"
+    if re.search(r"Details\.aspx", url, re.IGNORECASE):
+        m = re.search(r"[?&]ID=(\d+)", url)
+        if m:
+            return m.group(1)
     return ""
 
 

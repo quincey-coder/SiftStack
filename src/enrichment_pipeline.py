@@ -497,12 +497,17 @@ def run_enrichment_pipeline(
     # blank address and drop out downstream (ZIP filter / row validation) —
     # which also discards mostly business-owned State Tax Liens and lis pendens
     # against entities automatically (the safety property).
+    from scrapers.lien_common import is_excluded_lien_type
     lien_no_addr = [
         n for n in notices
         if n.notice_type in ("lien", "lis_pendens")
         and not n.address.strip()
         and (n.tax_owner_name.strip() or n.owner_name.strip())
         and n.county.lower() in ("travis", "bell", "williamson")
+        # Hospital liens never encumber the home (Prop. Code §55.005(d)); the
+        # scrapers drop them, and this keeps a stray one from being given the
+        # patient's address and shipped as a property lien.
+        and not is_excluded_lien_type(n.lien_type)
     ]
     if lien_no_addr:
         logger.info("── Step 3c-lien: Lien / Lis-Pendens Property Lookup (%d candidates) ──", len(lien_no_addr))

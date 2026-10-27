@@ -135,6 +135,10 @@ def _parse_items(ret_html: str, sale_date: datetime) -> list[NoticeData]:
             source_url=f"{BASE}/index.cfm?zaction=AUCTION&Zmethod=PREVIEW"
                        f"&AUCTIONDATE={sale_date.strftime('%m/%d/%Y')}#AITEM_{aid}",
         )
+        # The delinquent-tax suit's cause number (district court) — the one
+        # identifier that follows this property through judgment, sale, deed
+        # and redemption. Surfaced in Notes via datasift_formatter.
+        notice.case_number = (fields.get("cause number", "") or "").strip()
         adjudged = _parse_money(fields.get("adjudged value", ""))
         min_bid = _parse_money(fields.get("est. min. bid", ""))
         if adjudged:

@@ -43,7 +43,7 @@ from playwright.async_api import async_playwright, Page
 from notice_parser import NoticeData, normalize_court_name
 from scrapers import register
 from scrapers.tccsearch_common import proxy_kwargs as _proxy_kwargs
-from scrapers.lien_common import pick_debtor
+from scrapers.lien_common import is_excluded_lien_type, pick_debtor
 
 logger = logging.getLogger(__name__)
 
@@ -61,13 +61,19 @@ LIEN_DOC_TYPE_NAMES = [
     "FEDERAL TAX LIEN",
     "STATE TAX LIEN",
     "MECHANICS LIEN",
-    "HOSPITAL LIEN",
     "CHILD SUPPORT",
 ]
+# "HOSPITAL LIEN" was removed 2026-10-27: it attaches to the patient's injury
+# claim, not real property (Prop. Code §55.005(d)). Rows the portal still
+# returns are dropped by lien_common.is_excluded_lien_type in the parser.
 
-# URL codes for the SAME doc types, captured live from the form-built results
-# URL (Bell 2026-08-19). Used by the direct results-URL primary path; the form
-# flow remains the fallback that would surface any future code drift.
+# URL codes for the doc types, captured live from the form-built results URL
+# (Bell 2026-08-19). Used by the direct results-URL primary path; the form flow
+# remains the fallback that would surface any future code drift. One of these
+# six codes was HOSPITAL LIEN (likely T114 by list order — UNCONFIRMED); it is
+# left in place on purpose so the request keeps working and the parser's
+# row-level exclusion (counted in last_meta["excluded_hospital"]) identifies it
+# on a live run before anyone removes the wrong code.
 LIEN_DOC_TYPE_CODES = "T38,FTL,T580,T8,T114,T156"
 
 _DISMISS_JS = """() => {
@@ -119,7 +125,9 @@ def _normalize_lien_type(raw: str) -> str:
     return raw.title() if raw else ""
 
 
-def _parse_results_text(text: str, county: str) -> list[NoticeData]:
+def _parse_results_text(
+    text: str, county: str, stats: dict | None = None,
+) -> list[NoticeData]:
     """Parse the GovOS results table from the results-page innerText.
 
     The results render as a tab-separated table (live format, Bell 2026-06-29):
@@ -142,6 +150,9 @@ def _parse_results_text(text: str, county: str) -> list[NoticeData]:
     type_set = {t.upper() for t in LIEN_DOC_TYPE_NAMES}
     type_set |= {"ABSTRACTS OF JUDGMENT", "FEDERAL TAX LIENS", "STATE TAX LIENS",
                  "JUDGMENT", "JUDGEMENT", "ASSESSMENT LIEN"}
+    # Recognise the excluded types too so their rows are COUNTED and dropped
+    # (last_meta["excluded_hospital"]) instead of silently falling through.
+    type_set |= {"HOSPITAL LIEN", "HOSPITAL LIENS"}
 
     notices: list[NoticeData] = []
     seen_inst: set[str] = set()
@@ -162,6 +173,11 @@ def _parse_results_text(text: str, county: str) -> list[NoticeData]:
             continue
 
         lien_type_raw = cells[dt_idx]
+        if is_excluded_lien_type(lien_type_raw):
+            # Hospital liens attach to an injury claim, not real property.
+            if stats is not None:
+                stats["excluded_hospital"] = stats.get("excluded_hospital", 0) + 1
+            continue
         grantee = cells[dt_idx - 1]
         grantor = cells[dt_idx - 2] if dt_idx >= 2 else ""
 
@@ -372,6 +388,7 @@ class _PublicSearchLienScraper:
             )
 
         all_notices: list[NoticeData] = []
+        drop_stats: dict = {}   # parser drop counters → last_meta
         async with async_playwright() as p:
             try:
                 browser = await p.chromium.launch(
@@ -602,7 +619,7 @@ class _PublicSearchLienScraper:
                 seen_urls: set[str] = set()
                 while page_num <= MAX_PAGES:
                     text = await _results_text(page)
-                    page_notices = _parse_results_text(text, self.COUNTY)
+                    page_notices = _parse_results_text(text, self.COUNTY, drop_stats)
                     # Cross-page dedup by instrument URL (pagination can repeat rows).
                     fresh = [
                         n for n in page_notices
@@ -652,6 +669,7 @@ class _PublicSearchLienScraper:
                 await browser.close()
 
         self.last_meta["kept"] = len(all_notices)
+        self.last_meta.update(drop_stats)
         logger.info("%s lien scrape complete: %d liens", self.COUNTY, len(all_notices))
         return all_notices
 
