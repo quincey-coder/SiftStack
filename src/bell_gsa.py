@@ -227,6 +227,9 @@ def parse_parcel(page: str) -> dict:
     out["situs"] = summ.get("Location", "")
     out["use_code"] = summ.get("Use Code", "")
     out["legal"] = summ.get("Legal Description", "")
+    if not out["legal"]:   # the page keeps it in its own section, below the summary table
+        m = re.search(r'<section class="legal">\s*<h2>Legal Description</h2>(.*?)</section>', page, re.S)
+        out["legal"] = " ".join(_text(m.group(1)).split()) if m else ""
     out["subdivision"] = summ.get("Subdivision", "")
     out["acreage"] = summ.get("Acreage", "")
 

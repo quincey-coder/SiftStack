@@ -151,8 +151,14 @@ async def _accept_disclaimer(page: Page) -> None:
     await pass_cloudflare(page)
     accept = page.locator(SEL_DISCLAIMER_ACCEPT)
     if await accept.count() > 0:
-        await accept.click()
-        await page.wait_for_load_state("domcontentloaded")
+        # The link is an ASP.NET postback: wait for ITS navigation. Moving on before it lands aborts
+        # it, the session never records the accept, and every later page bounces back to the
+        # disclaimer (Travis clerk searches all timed out on 2026-10-30 when the site was slow).
+        try:
+            async with page.expect_navigation(wait_until="domcontentloaded", timeout=45000):
+                await accept.click()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Disclaimer postback did not navigate: %s", e)
         logger.info("Disclaimer accepted")
 
 

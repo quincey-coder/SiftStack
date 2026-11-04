@@ -3,7 +3,12 @@
 Search cascade:
   1. SSDI (Social Security Death Index) — most structured, 89M+ records
   2. Ancestry obituary collection — broad coverage
-  3. Newspapers.com obituary index — 930M+ pages, recent TN papers (All-Access SSO)
+  3. Newspapers.com obituary index — 930M+ pages (All-Access SSO)
+
+Curative research (research_person / search_records / census_1950, bottom of
+file) is the URL-driven path the curative audit uses: birth-year gated, keeps
+long-dead owners, and reads the free 1950 census for the family household.
+One-off: python src/ancestry_enricher.py person "Jerry C Alley" 1950
 
 Account protection is #1 priority:
   - Headed browser + persistent profile
@@ -159,9 +164,14 @@ async def _login_challenge_visible(page) -> bool:
 
 async def _login_error_visible(page) -> bool:
     """True if the signin form is showing a credential-rejected error."""
+    # Only VISIBLE alert text: the signin page keeps empty/hidden aria-live and
+    # "error" regions whose boilerplate ("try again") read as a rejection while
+    # the background identity check was still running (false 'bad_credentials').
     try:
         alerts = await page.evaluate(
-            """() => [...document.querySelectorAll('[role=alert], [class*=error i], [class*=alert i], [aria-live]')].map(e => (e.innerText||'').toLowerCase()).join(' ')"""
+            """() => [...document.querySelectorAll('[role=alert], [class*=error i], [class*=alert i], [aria-live]')]
+                .filter(e => e.offsetParent !== null && (e.innerText || '').trim().length > 0)
+                .map(e => (e.innerText||'').toLowerCase()).join(' ')"""
         )
     except Exception:
         return False
@@ -180,12 +190,15 @@ async def _await_login_result(page, timeout_s: int = 40) -> str:
     """
     deadline = timeout_s
     waited = 0.0
+    error_hits = 0
     while waited < deadline:
         if await _is_authenticated(page):
             return "authenticated"
         if await _check_blocked(page) or await _login_challenge_visible(page):
             return "challenge"
-        if await _login_error_visible(page):
+        # a rejection must persist (3 polls, ~6s): the redirect often lands after a transient message
+        error_hits = error_hits + 1 if await _login_error_visible(page) else 0
+        if error_hits >= 3:
             return "bad_credentials"
         await asyncio.sleep(2.0)
         waited += 2.0
@@ -211,14 +224,23 @@ async def _ensure_logged_in(page) -> bool:
     if await _check_blocked(page):
         return False
 
-    # Check for actual login state — not just URL
-    is_signed_in = await page.evaluate("""() => {
-        const text = document.body.textContent || '';
-        // "Sign In" in nav = NOT logged in; user menu/account link = logged in
-        const hasSignIn = !!document.querySelector('a[href*="signin"]');
-        const hasAccount = !!document.querySelector('a[href*="account/profile"], [class*="userName"]');
-        return hasAccount || !hasSignIn;
-    }""")
+    # Check for actual login state — not just URL. /search/ client-redirects
+    # after load, which destroys the execution context mid-evaluate: settle and retry.
+    is_signed_in = False
+    for _ in range(4):
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=15000)
+            is_signed_in = await page.evaluate("""() => {
+                // "Sign In" in nav = NOT logged in; user menu/account link = logged in
+                const hasSignIn = !!document.querySelector('a[href*="signin"]');
+                const hasAccount = !!document.querySelector('a[href*="account/profile"], [class*="userName"]');
+                return hasAccount || !hasSignIn;
+            }""")
+            break
+        except Exception as e:  # noqa: BLE001
+            if "context was destroyed" not in str(e) and "navigat" not in str(e).lower():
+                raise
+            await asyncio.sleep(2)
 
     if is_signed_in:
         logger.info("Ancestry session valid (authenticated)")
@@ -523,9 +545,9 @@ async def _search_ssdi(page, first_name: str, last_name: str, state: str = "TX",
     best_composite, best_loc_score, best = scored[0]
 
     # If multiple candidates remain and NONE have county-level match,
-    # this is ambiguous — could be anyone in TN with this name
+    # this is ambiguous — could be anyone in the state with this name
     if len(scored) > 1 and best_loc_score < 2:
-        logger.info("SSDI: %d ambiguous TN matches for %s %s — skipping (no county match)",
+        logger.info("SSDI: %d ambiguous in-state matches for %s %s — skipping (no county match)",
                      len(scored), first_name, last_name)
         for _, ls, r in scored[:5]:
             logger.debug("  candidate: %s (death: %s, loc: %s, loc_score: %d)",
@@ -1359,6 +1381,169 @@ async def lookup_deceased(
     return None
 
 
+# ── Curative research: URL search + DOM parse (2026-10-29) ──────────
+#
+# Built for the curative audit (src/curative_audit.py): long-dead owners are
+# the TARGET there, so nothing here rejects an old death. A same-named
+# stranger is ruled out by birth year (DataSift's owner age keeps counting
+# after death) and by the date the person took title (a dead man can't buy).
+#
+# Searches go by URL (name=First_Last&birth=YYYY&birth_x=2-0-0), not the old
+# form-filling, and results are read from the DOM (li.searchResultRow).
+# On a non-subscriber login, paid collections mask dates ("xx xxx xxxx");
+# the 1950 census and the Find a Grave index are free and fully readable.
+
+CENSUS_1950 = "62308"
+_FOREIGN = {"Germany", "England", "Scotland", "Ireland", "Wales", "Canada", "Mexico", "Australia", "France",
+            "Italy", "Netherlands", "Norway", "Sweden", "New Zealand", "Poland", "Denmark", "Spain", "Philippines",
+            "UK", "England and Wales", "Puerto Rico"}
+DEATH_CATEGORY = "34"     # Death, burial, cemetery & obituaries
+
+
+def _search_url(first: str, last: str, birth_year: int | None = None, collection: str = "",
+                category: str = "", residence: str = "", middle: str = "") -> str:
+    import urllib.parse
+    given = f"{first} {middle}".strip()
+    q = {"name": f"{given}_{last}"}
+    if birth_year:
+        q["birth"] = str(birth_year)
+        q["birth_x"] = "2-0-0"   # +/- 2 years
+    if residence:
+        q["residence"] = residence
+    base = (f"/search/collections/{collection}/" if collection
+            else f"/search/categories/{category}/" if category else "/search/")
+    return ANCESTRY_URL + base + "?" + urllib.parse.urlencode(q)
+
+
+async def _goto_results(page, url: str) -> bool:
+    if _circuit_broken or not _can_load_page():
+        return False
+    await page.goto(url, wait_until="domcontentloaded")
+    _increment_page_loads()
+    try:
+        await page.wait_for_selector("li.searchResultRow, table tr td, .noResults, [class*=noResults]",
+                                     timeout=15000)
+    except Exception:  # noqa: BLE001
+        pass
+    await _delay(2, 4)
+    return not await _check_blocked(page)
+
+
+def _year(s: str) -> int | None:
+    m = re.search(r"\b(1[6-9]\d\d|20\d\d)\b", s or "")
+    return int(m.group(1)) if m else None
+
+
+async def search_records(page, first: str, last: str, birth_year: int | None = None, middle: str = "",
+                         category: str = DEATH_CATEGORY, residence: str = "") -> list[dict]:
+    """Global-results cards -> [{collection, category, name, birth, death, residence, url,
+    birth_year, death_year, masked}]."""
+    if not await _goto_results(page, _search_url(first, last, birth_year, category=category,
+                                                 residence=residence, middle=middle)):
+        return []
+    rows = await page.evaluate("""() => [...document.querySelectorAll('li.searchResultRow')].map(li => {
+        const t = li.querySelector('.global-results-title-link');
+        const f = {};
+        li.querySelectorAll('tbody.result-fields tr').forEach(tr => {
+            const k = (tr.querySelector('th')||{}).innerText, v = (tr.querySelector('td')||{}).innerText;
+            if (k) f[k.trim()] = (v||'').trim().replace(/\\s+/g, ' ');
+        });
+        return {collection: t ? t.innerText.trim() : '', url: t ? t.getAttribute('href') : '',
+                category: ((li.querySelector('.resultCategory')||{}).innerText||'').trim(), fields: f};
+    })""")
+    out = []
+    for r in rows or []:
+        f = r.get("fields") or {}
+        birth, death = f.get("Birth", ""), f.get("Death", "")
+        out.append({"collection": r["collection"], "category": r["category"], "name": f.get("Name", ""),
+                    "birth": birth, "death": death, "residence": f.get("Residence", ""),
+                    "url": ANCESTRY_URL + r["url"] if r.get("url", "").startswith("/") else r.get("url", ""),
+                    "birth_year": _year(birth), "death_year": _year(death),
+                    "masked": bool(re.search(r"\bx{2,}", birth + death))})
+    return out
+
+
+def pick_death_record(records: list[dict], first: str, last: str, middle: str = "",
+                      birth_year: int | None = None, alive_after: str = "") -> dict | None:
+    """Best death record for this person, or None when nothing is safely theirs.
+
+    Accept: name agrees (a conflicting middle is a different person), a death
+    year, no death before `alive_after` (the date they took title), and either
+    a birth year within 2 of the owner's or a middle initial that agrees."""
+    best = None
+    for r in records:
+        if not re.search(r"death|burial|obituar", r.get("category", "") + r.get("collection", ""), re.I):
+            continue
+        if not r.get("death_year") or not _name_matches(first, last, r["name"], middle):
+            continue
+        if alive_after and r["death_year"] < int(alive_after[:4]):
+            continue
+        # 'Germany, Find a Grave Index' / 'England, ...': a foreign collection is a namesake
+        lead = (r.get("collection") or "").split(",")[0].strip()
+        if lead and not re.match(r"(U\.?S\.?|United States|Web|Global|Texas|[A-Z][a-z]+(?: [A-Z][a-z]+)?$)", lead) \
+                or lead in _FOREIGN:
+            continue
+        by = r.get("birth_year")
+        if by and r["death_year"] - by < 18:
+            continue   # died as a child: not an owner
+        if birth_year and by and abs(by - birth_year) > 2:
+            continue
+        has_middle = bool(middle) and bool(re.search(rf"\b{re.escape(middle[0])}", r["name"][len(first):], re.I))
+        if not ((birth_year and by) or has_middle):
+            continue
+        # place: a Texas owner who died in Illinois / Germany is a namesake unless
+        # BOTH the birth year and the middle initial agree
+        when = r"(?:abt|bef|aft)?\s*(?:\b(?:\d{1,2}|x+)\s+)?(?:\b(?:[A-Za-z]{3}|x{3})\s+)?(?:\b\d{4}\b|\bx{4}\b)"
+        place = re.sub(when, " ", r.get("residence", "") + " , " + r.get("death", ""), flags=re.I)
+        place = re.sub(r"\bx+\b", "", place).strip(" ,")
+        in_tx = bool(re.search(r"Texas|\bTX\b", place, re.I))
+        if not in_tx and re.search(r"[A-Za-z]{3,}", place) and not (birth_year and by and has_middle):
+            continue
+        if not in_tx and not (birth_year and by):
+            continue
+        score = (2 if birth_year and by else 0) + (1 if has_middle else 0) + (1 if in_tx else 0)
+        if best is None or score > best[0]:
+            best = (score, r)
+    return best[1] if best else None
+
+
+async def census_1950(page, first: str, last: str, birth_year: int | None = None,
+                      residence: str = "") -> list[dict]:
+    """1950 US census rows (free collection): name, relatives, home, birth year,
+    birthplace, relation to head - the household that names parents/siblings."""
+    if not await _goto_results(page, _search_url(first, last, birth_year, collection=CENSUS_1950,
+                                                 residence=residence)):
+        return []
+    rows = await page.evaluate("""() => [...document.querySelectorAll('tr')].map(tr =>
+        [...tr.querySelectorAll('td')].map(td => (td.innerText||'').trim().replace(/\\s+/g, ' ')))
+        .filter(c => c.length >= 7 && /View Record/.test(c[0]))""")
+    out = []
+    for c in rows or []:
+        out.append({"name": c[1], "relatives": [x.strip() for x in c[2].split(",") if x.strip()],
+                    "home_1950": c[3], "birth_year": _year(c[4]), "birthplace": c[5], "relation": c[6]})
+    return out
+
+
+async def research_person(page, name: str, birth_year: int | None = None, alive_after: str = "",
+                          want_census: bool = True) -> dict:
+    """One person for the curative audit: death record + (born <= 1950) census household."""
+    first, middle, last = _parse_owner_name(name)
+    out: dict = {"name": name, "birth_year_hint": birth_year, "death": None, "census": [], "searched": []}
+    if not first or not last:
+        return out
+    recs = await search_records(page, first, last, birth_year, middle=middle)
+    out["searched"].append("death records")
+    out["masked_results"] = sum(1 for r in recs if r["masked"])
+    out["death"] = pick_death_record(recs, first, last, middle, birth_year, alive_after)
+    if want_census and (birth_year is None or birth_year <= 1950) and not _circuit_broken:
+        await _delay(2, 4)
+        rows = await census_1950(page, first, last, birth_year)
+        out["searched"].append("1950 census")
+        out["census"] = [r for r in rows if _name_matches(first, last, r["name"], middle)
+                         and (not birth_year or not r["birth_year"] or abs(r["birth_year"] - birth_year) <= 2)][:3]
+    return out
+
+
 # ── CLI: manual session bootstrap ───────────────────────────────────
 
 if __name__ == "__main__":
@@ -1373,6 +1558,19 @@ if __name__ == "__main__":
     if cmd == "bootstrap":
         ok = asyncio.run(bootstrap_login())
         sys.exit(0 if ok else 1)
+    elif cmd == "person" and len(sys.argv) > 2:
+        # python src/ancestry_enricher.py person "Jerry C Alley" [birth_year] [took_title_YYYY-MM-DD]
+        async def _one():
+            pw, ctx, page = await launch_browser()
+            if not page:
+                return None
+            try:
+                return await research_person(page, sys.argv[2],
+                                             int(sys.argv[3]) if len(sys.argv) > 3 else None,
+                                             sys.argv[4] if len(sys.argv) > 4 else "")
+            finally:
+                await close_browser(pw, ctx)
+        print(json.dumps(asyncio.run(_one()), indent=1))
     else:
-        print("Usage: python src/ancestry_enricher.py bootstrap")
+        print('Usage: python src/ancestry_enricher.py bootstrap | person "First M Last" [birth_year] [took_title]')
         sys.exit(2)

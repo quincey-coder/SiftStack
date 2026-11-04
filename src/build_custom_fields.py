@@ -28,8 +28,8 @@ CREATE_DELAY = 0.15
 RETRY_DELAY = 0.3
 
 
-def build(dry_run: bool = False) -> dict:
-    defs = json.loads(DEFINITIONS_PATH.read_text())
+def build(dry_run: bool = False, definitions: Path = DEFINITIONS_PATH) -> dict:
+    defs = json.loads(Path(definitions).read_text())
     group_def = defs["group"]
     field_defs = defs["fields"]
 
@@ -143,7 +143,8 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run", action="store_true", help="print without creating")
+    parser.add_argument("--defs", default=DEFINITIONS_PATH, help="field definitions JSON")
     args = parser.parse_args()
-    result = build(dry_run=args.dry_run)
+    result = build(dry_run=args.dry_run, definitions=args.defs)
     print(f"\n{result}")
     sys.exit(1 if result.get("failed") or result.get("verify") == "FAILED" else 0)

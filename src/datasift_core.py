@@ -238,6 +238,11 @@ async def dismiss_popups(page) -> None:
             document.querySelectorAll('[class*="nps-iframe"], [class*="beamer"]').forEach(
                 el => { el.remove(); removed++; }
             );
+            // Intercom's messenger can open over the wizard and swallow Next Step (seen 2026-10-31)
+            if (window.Intercom) { window.Intercom('shutdown'); }
+            document.querySelectorAll(
+                '.intercom-lightweight-app, #intercom-container, [class*="intercom-messenger"]'
+            ).forEach(el => { el.remove(); removed++; });
             // Look for the notification popup overlay
             const els = document.querySelectorAll(
                 '[class*="notification"], [class*="Notification"], '

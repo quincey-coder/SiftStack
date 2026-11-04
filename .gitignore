@@ -89,3 +89,7 @@ youtube_transcripts.py
 owner_purge_poll.log
 purge_all_*.log
 scraper_health_state.json
+
+# Ad-hoc DataSift API dumps (real owner records) and the Tyler portal browser profile
+sample_*.json
+.tyler_profile/

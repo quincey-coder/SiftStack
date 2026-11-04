@@ -1,0 +1,25 @@
+{
+  "group": {
+    "entity_type": "property",
+    "label": "Curative Intelligence",
+    "description": "Curative title audit results and quick links. Filterable fields rank the record; link fields open the county source. Field labels match the curative upload CSV headers 1:1."
+  },
+  "fields": [
+    { "label": "Curative Tier", "field_type": "select", "placeholder": "Audit tier", "options": ["A", "B", "C", "Drop"] },
+    { "label": "Curative Score", "field_type": "number", "placeholder": "Audit score" },
+    { "label": "Curative Spread", "field_type": "number", "placeholder": "60% of CAD value minus all known arrears" },
+    { "label": "Death Proof", "field_type": "select", "placeholder": "Best evidence of the death", "options": ["Court / Recorded", "County Roll Estate Label", "Obituary + Memorial", "Obituary Only", "Memorial Only", "None"] },
+    { "label": "Title Defect Type", "field_type": "text_input", "placeholder": "Title problems found in the audit" },
+    { "label": "Ghost Payer Strength", "field_type": "select", "placeholder": "Tax payments in a dead person's name", "options": ["Strong", "Weak", "None"] },
+    { "label": "Last Tax Payer", "field_type": "text_input", "placeholder": "Name on the newest tax payment" },
+    { "label": "Last Tax Payment Date", "field_type": "date", "placeholder": "Date of the newest tax payment" },
+    { "label": "Open Lien Creditors", "field_type": "text", "placeholder": "Unreleased clerk instruments: type, creditor, instrument number" },
+    { "label": "Legal Description", "field_type": "text_input", "placeholder": "Legal description from the clerk record" },
+    { "label": "Letters Granted Date", "field_type": "date", "placeholder": "Date the court granted letters" },
+    { "label": "Last Court Activity", "field_type": "date", "placeholder": "Newest event on the probate docket" },
+    { "label": "CAD Link", "field_type": "text_input", "placeholder": "Appraisal district page" },
+    { "label": "Tax Link", "field_type": "text_input", "placeholder": "County tax page" },
+    { "label": "Probate Link", "field_type": "text_input", "placeholder": "Probate case page" },
+    { "label": "Grave Link", "field_type": "text_input", "placeholder": "Find A Grave memorial" }
+  ]
+}

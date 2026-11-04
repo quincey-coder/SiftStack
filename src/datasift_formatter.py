@@ -902,7 +902,9 @@ def _build_caretaker_section(notice: NoticeData) -> str:
     if not name:
         return ""
 
-    rel_raw = (notice.dm_relationship or notice.decision_maker_relationship or "").strip()
+    # dm_relationship is an ad-hoc attribute only some scrapers set (Bell
+    # tax-del, BSC caretakers) — not a NoticeData field.
+    rel_raw = (getattr(notice, "dm_relationship", "") or notice.decision_maker_relationship or "").strip()
     rel_label = _DM_RELATIONSHIP_LABELS.get(rel_raw, rel_raw or "live decision-maker")
 
     src_raw = (notice.decision_maker_source or "").strip()
