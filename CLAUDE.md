@@ -301,6 +301,73 @@ built the same day after the foreclosure audit found the scrapers delivering
   details view needs a bidder login — never fetch it. The old
   `TRAVIS_TAX_SALES_URL` tax-office page is a 404.
 
+## Foreclosure auction tracking — the sale date is the lead (2026-10-08)
+
+Texas trustee sales happen ONCE a month: the **first Tuesday** (first Wednesday
+when that Tuesday is Jan 1 / Jul 4) — Tex. Prop. Code §51.002. Verified: all
+230 auction dates in the CRM fell on a first Tuesday. Postings go up 21+ days
+ahead and often 2-3 months ahead (Travis, Sep-Oct 2026: 91 notices for the next
+sale, 73 two months out, 6 three-plus). Everything below exists so the sale date
+reaches DataSift and stays current.
+
+- **Where the date comes from, per county** (`NoticeData.auction_date_source`):
+  Travis = `record` (the `[E]` cell of the tccsearch grid); Bell =
+  `notice_text` (OCR of the posted PDF) else `folder_month`; Williamson =
+  `folder_month` for index rows (the index PDF has NO sale-date column), and
+  `notice_text`/`folder_month` for notice PDFs read when a month has no index
+  yet. Bell + Williamson notice PDFs stamp provenance in the shared
+  `trustee_notice_parse.parse_trustee_notice_text`.
+  (2026-10-15: a parallel per-file Williamson OCR reader — five sale-date
+  sentence forms, lawful-sale-day validation — was built on a stale checkout
+  and dropped in favour of the Sept rewrite when syncing; it survives on
+  branch `backup/pre-sync-253acc1` if Williamson index rows need real dates.)
+- **Notes lead with `=== AUCTION ===`** (`_build_auction_section`): sale day
+  + days-to-go, provenance ("ASSUMED from the posting month" when derived),
+  posted date, posting URL, and `MOVED: was 10/6 -> 11/3` on a re-post. Tags:
+  `auction_YYYY-MM-DD`, a bucket (`auction_in_30d` / `auction_in_60d` /
+  `auction_90d_plus` / `auction_passed`), `auction_moved`,
+  `auction_date_assumed`; legacy `has_auction` unchanged. A preset on
+  `auction_in_30d` IS the hot list.
+- **The wizard has NO built-in date target.** Every date target is a custom
+  field; our `Foreclosure Date` column auto-maps to the custom field of that
+  name and sits inert. The built-in `auction_date` that DataSift filters sort
+  on is filled ONLY by DataFlik enrichment (every record with one carries a
+  `dataflik_id`). The two fields are different things: `auction_date` = sale
+  day (100% first Tuesdays); `foreclosure_date` = DataFlik's filing date (any
+  weekday) — never treat it as a sale date.
+- **`auction_watch` (`src/auction_watch.py`) — dedup that lets a posting back
+  in when it gets better.** `seen_notice_ids` is monotonic; a Travis Temp-index
+  row verified days later carries the SAME instrument number, so the version
+  with owner/address/date never reached the CRM, and a postponed sale's new
+  date never overwrote the old one (DataSift "Add Data" doesn't update fields).
+  The watch keeps `{key: {auction_date, complete}}` beside the seen set (KVS
+  `auction_watch`; local `auction_watch.json`) and re-emits a seen foreclosure
+  only when it completed or its date moved (`watch_reason`,
+  `auction_moved_from`). Keys seen before the watch existed stay suppressed
+  (re-emitting history would re-upload hundreds of rows); they are recorded
+  on first sight so the NEXT change is visible. Non-foreclosure types are
+  untouched. A re-emitted row uploads as a new row: DataSift matches the
+  address, appends the Notes message and the new `auction_…` tag — the OLD
+  dated tag remains, so read the newest `auction_YYYY-MM-DD` / the Notes.
+- **Hot list:** `python src/foreclosure_hotlist.py [--horizon 120] [--notify]`
+  — read-only pull of all five foreclosure lists, effective sale date = the
+  latest of DataFlik's `auction_date` and our custom `Foreclosure Date`,
+  ranked by days-to-sale → `output/foreclosure_hotlist_<date>.xlsx` (Hot List
+  / Passed / No sale date) + CSV + Slack block. The daily run also posts an
+  UPCOMING AUCTIONS block (`slack_notifier.build_auction_block`) from its own
+  notices.
+- **"Went to auction" ≠ "sold".** Checking the day after a sale, nothing public
+  can confirm the outcome: trustee's deeds record 1-3 weeks later (Travis
+  indexes them under the generic `DEED` type, 41), DataFlik's `last_sold`
+  refreshes later still, and the next month's re-postings (= postponed) land
+  through the 21-day deadline. `last_sold >= auction_date` is the one
+  evidence-backed sold signal available from the CRM itself. Tag `Sold` on
+  evidence; the `foreclosure_sale_passed_YYYY-MM` tag is the reversible
+  holding pattern for the rest.
+- **Williamson foreclosure reads zero LOCALLY but produces rows in the cloud**
+  (8 on 2026-10-08): the wilco.org listing 403s a bare local request and the
+  cloud runs go out through the residential proxy. Not a production outage.
+
 ## TX Data Source Details
 
 All Texas data sources are **public** — no logins or credentials required for any county source. (tccsearch.org sits behind Cloudflare — see below — and the Odyssey portals use reCAPTCHA, but neither needs an account.)

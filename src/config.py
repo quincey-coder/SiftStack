@@ -18,6 +18,7 @@ OUTPUT_DIR = PROJECT_ROOT / "output"
 LOG_DIR = PROJECT_ROOT / "logs"
 STATE_FILE = PROJECT_ROOT / "last_run.json"
 SEEN_IDS_FILE = PROJECT_ROOT / "seen_ids.json"
+AUCTION_WATCH_FILE = PROJECT_ROOT / "auction_watch.json"   # see auction_watch.py
 DROPBOX_STATE_FILE = PROJECT_ROOT / "dropbox_state.json"
 PHOTO_STATE_FILE = PROJECT_ROOT / "photo_state.json"
 # Travis tax-delinquent cross-run state (skill-ported cleaner + dropped/new/repeat diff)

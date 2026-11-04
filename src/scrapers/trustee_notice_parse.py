@@ -168,9 +168,12 @@ def parse_trustee_notice_text(
 
     notice.raw_text = text[:1000]
     _second_pass(notice, text)
+    if notice.auction_date:
+        notice.auction_date_source = "notice_text"
 
     if not notice.auction_date and fallback_sale_date:
         notice.auction_date = fallback_sale_date
+        notice.auction_date_source = "folder_month"
 
     if notice.owner_name or notice.address:
         return notice

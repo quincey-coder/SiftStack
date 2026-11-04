@@ -93,3 +93,6 @@ scraper_health_state.json
 # Ad-hoc DataSift API dumps (real owner records) and the Tyler portal browser profile
 sample_*.json
 .tyler_profile/
+# auction_watch local state (cloud copy lives in the Apify KVS)
+auction_watch.json
+auction_watch.json.tmp

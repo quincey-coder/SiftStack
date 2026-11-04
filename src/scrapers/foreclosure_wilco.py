@@ -345,6 +345,7 @@ def parse_index_pdf_bytes(pdf_bytes: bytes, sale_month: str, sale_year: int) -> 
             state="TX",
             date_added=filed_date or datetime.now().strftime("%Y-%m-%d"),
             auction_date=sale_date,
+            auction_date_source="folder_month" if sale_date else "",
             address=row["address"].title(),
             city=row["city"].title(),
             owner_name=owner,

@@ -180,6 +180,17 @@ class NoticeData:
     """Structured data extracted from a single notice."""
     date_added: str = ""       # Published date (YYYY-MM-DD)
     auction_date: str = ""     # Scheduled sale/auction date (YYYY-MM-DD)
+    # Where auction_date came from: "record" (indexed on the county grid),
+    # "notice_text" (read from the posted notice), "folder_month" (derived —
+    # Williamson index has no sale-date column, so the folder's first Tuesday
+    # is assumed), or "" when unknown. Lets Notes say how sure the date is.
+    auction_date_source: str = ""
+    # Set by auction_watch when a previously-seen posting re-emits with a
+    # different sale date (postponement). Holds the prior YYYY-MM-DD.
+    auction_moved_from: str = ""
+    # Why auction_watch let an already-seen key back through: "completed"
+    # (owner/address/date filled in after the Temp-index lag) or "moved".
+    watch_reason: str = ""
     address: str = ""
     city: str = ""
     state: str = "TX"
