@@ -98,6 +98,80 @@ def _situs_from_feature(attrs: dict) -> dict | None:
     }
 
 
+# address -> geo_id (or None for a confirmed miss)
+_situs_memo: dict[tuple[str, str], str | None] = {}
+_DIRECTIONALS = {"N", "S", "E", "W", "NE", "NW", "SE", "SW", "NORTH", "SOUTH", "EAST", "WEST"}
+_STREET_SUFFIXES = {
+    "ST", "STREET", "DR", "DRIVE", "RD", "ROAD", "LN", "LANE", "AVE", "AVENUE", "BLVD",
+    "CT", "COURT", "CV", "COVE", "CIR", "CIRCLE", "LOOP", "LP", "PL", "PLACE", "WAY",
+    "PKWY", "PARKWAY", "TRL", "TRAIL", "TRCE", "TRACE", "PASS", "BND", "BEND", "XING",
+    "HWY", "HY", "RUN", "PATH", "TER", "TERRACE", "SQ", "PT", "POINT", "HOLW", "VW",
+}
+
+
+def geo_id_by_situs(address: str, zip5: str = "") -> str | None:
+    """Find the TCAD parcel (10-digit geo_id) whose SITUS is ``address``.
+
+    The reverse of situs_by_geo_id, added 2026-11-11 for records that arrive
+    with a street address but no parcel id (Travis foreclosures, name-backfilled
+    liens): the tax-cache ADDRESS index is keyed by owner MAILING address, so it
+    only finds owner-occupants and can return a tenant's own parcel elsewhere.
+    The parcel fabric's situs is the property itself.
+
+    Query = house number + first significant street word (directional and
+    suffix stripped), filtered to the ZIP. Returns the geo_id only when exactly
+    one parcel matches; ambiguous or missing -> None. Never raises.
+    """
+    import re as _re
+    m = _re.match(r"^\s*(\d+)\s+(.+)$", address or "")
+    if not m:
+        return None
+    num = m.group(1)
+    words = [w for w in _re.sub(r"[^A-Z0-9 ]", " ", m.group(2).upper()).split()]
+    sig = [w for w in words if w not in _DIRECTIONALS and w not in _STREET_SUFFIXES]
+    stem = (sig or words or [""])[0]
+    stem = _re.sub(r"[^A-Z0-9]", "", stem)
+    z5 = (zip5 or "")[:5]
+    if not stem:
+        return None
+    key = (f"{num} {' '.join(words)}", z5)
+    if key in _situs_memo:
+        return _situs_memo[key]
+    try:
+        _throttle()
+        resp = requests.get(
+            TCAD_PARCEL_URL,
+            params={
+                # num digits-only and stem alphanumeric-only (validated above).
+                "where": f"situs_num='{num}' AND situs_street LIKE '{stem}%'",
+                "outFields": _OUT_FIELDS,
+                "returnGeometry": "false",
+                "f": "json",
+            },
+            timeout=GIS_TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        logger.warning("TCAD GIS situs->parcel lookup failed for %r: %s", address, e)
+        return None
+    if data.get("error"):
+        logger.warning("TCAD GIS situs->parcel error for %r: %s", address, data["error"])
+        return None
+    geos = set()
+    for feat in data.get("features") or []:
+        a = feat.get("attributes") or {}
+        fz = str(a.get("situs_zip") or "")[:5]
+        if z5 and fz and fz != z5:
+            continue
+        g = normalize_geo_id(str(a.get("geo_id") or ""))
+        if g:
+            geos.add(g)
+    result = geos.pop() if len(geos) == 1 else None
+    _situs_memo[key] = result
+    return result
+
+
 def situs_by_geo_id(parcel_id: str) -> dict | None:
     """Return {address, city, state, zip, geo_id, prop_id, source} for a Travis
     parcel, or None when the parcel is unknown / has no situs / GIS is down.

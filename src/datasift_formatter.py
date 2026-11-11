@@ -655,6 +655,16 @@ def _build_tags(notice: NoticeData, extra_tags: list[str] | None = None) -> str:
     return ",".join(tags)
 
 
+def _is_real_person_name(name: str) -> bool:
+    """True for a plausible person name: 2+ alphabetic tokens, no digits."""
+    toks = [t for t in re.split(r"\s+", (name or "").strip()) if t]
+    return (
+        len(toks) >= 2
+        and not any(ch.isdigit() for ch in name)
+        and sum(1 for t in toks if len(t.strip(".")) > 1) >= 2
+    )
+
+
 def _get_contact_info(notice: NoticeData) -> dict:
     """Determine the contact person and mailing address.
 
@@ -693,8 +703,15 @@ def _get_contact_info(notice: NoticeData) -> dict:
 
     if not first and not last:
         # Try entity research result (signing member, registered agent, etc.)
-        if notice.entity_person_name:
+        # Only a REAL person behind the entity: two name parts, no digits.
+        # Entity research's name-parse also yields surname-only guesses
+        # ("JAROLIK HOMES LLC" -> member "Jarolik") and digit stubs ("3423
+        # INVESTMENTS LLC" -> member "3423"); shipping those as First/Last
+        # fabricates a person. They stay in Notes ("Entity Contact: ...").
+        if _is_real_person_name(notice.entity_person_name):
             first, last, _et = _split_name(notice.entity_person_name)
+            if not (first and last):
+                first, last = "", ""
         # Try tax-roll owner. tax_owner_name is LAST-FIRST (NAMELF): normalize to
         # FIRST LAST before splitting (else "JEFFEIS TANISA" reverses and
         # "MCDONALD ROBERT J & MEGAN L" collapses to Last=J). If the tax owner is
@@ -1144,12 +1161,17 @@ def _build_legal_owner_section(notice: NoticeData) -> str:
     differs from the cleaned owner_name (catches ETAL / JR / III / trust
     markers that _clean_and_split_name strips for the First/Last columns)."""
     raw = (notice.tax_owner_name or "").strip()
+    party = (getattr(notice, "notice_party_name", "") or "").strip()
+    party_line = (
+        f"\nName on the filing: {party} (not the owner of record — the owner of "
+        "record is used as the contact)" if party else ""
+    )
     if not raw:
-        return ""
+        return f"=== LEGAL OWNER (COUNTY RECORD) ==={party_line}" if party else ""
     # Skip when the raw value is just a case-folded version of the display name.
-    if raw.lower() == (notice.owner_name or "").lower().strip():
+    if raw.lower() == (notice.owner_name or "").lower().strip() and not party:
         return ""
-    return f"=== LEGAL OWNER (COUNTY RECORD) ===\n{raw}"
+    return f"=== LEGAL OWNER (COUNTY RECORD) ===\n{raw}{party_line}"
 
 
 def _build_notes(notice: NoticeData) -> str:
@@ -1947,3 +1969,26 @@ def write_cleanup_csv(cleanup_notices: list[NoticeData]) -> dict | None:
         "sold": sold,
         "resolved": resolved,
     }
+
+
+def write_review_csv(review_notices: list[NoticeData]) -> dict | None:
+    """Write the records owner reconcile HELD (owner_reconcile.py) to one CSV.
+
+    Same DataSift layout as the lead CSVs plus a leading "Review Reason"
+    column, so a record the operator clears can be uploaded as-is (drop the
+    first column). Never auto-uploaded. Returns {"path", "label", "count"} or
+    None when nothing was held.
+    """
+    if not review_notices:
+        return None
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    csv_path = OUTPUT_DIR / f"datasift_REVIEW_{timestamp}.csv"
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["Review Reason"] + list(DATASIFT_COLUMNS))
+        writer.writeheader()
+        for notice in review_notices:
+            row = _build_row(notice)
+            row["Review Reason"] = notice.review_reason
+            writer.writerow(row)
+    logger.info("Review CSV: %d record(s) held for review -> %s", len(review_notices), csv_path)
+    return {"path": csv_path, "label": "REVIEW (held, not uploaded)", "count": len(review_notices)}

@@ -227,6 +227,12 @@ def _stage_notices(args) -> StageResult:
         skip_obituary=not args.deep_heirs,
         source_label="FTM scheduled run",
     ))
+    try:  # records owner reconcile held -> REVIEW CSV (never dropped silently)
+        import enrichment_pipeline as _ep
+        from datasift_formatter import write_review_csv
+        write_review_csv(list(_ep.LAST_REVIEW))
+    except Exception as e:
+        logger.warning("Review CSV failed: %s", e)
     notices = deduplicate(notices)
     res.records = len(notices)
 

@@ -308,6 +308,14 @@ def run_watcher(
                         source_label=f"Dropbox watcher ({county}/{notice_type})",
                     )
                     notices = run_enrichment_pipeline(notices, opts)
+                    # Records owner reconcile held (e.g. no house number) go
+                    # to a REVIEW CSV instead of vanishing.
+                    try:
+                        import enrichment_pipeline as _ep
+                        from datasift_formatter import write_review_csv
+                        write_review_csv(list(_ep.LAST_REVIEW))
+                    except Exception as _e:
+                        logger.warning("Review CSV failed: %s", _e)
 
                     if notices:
                         from datetime import datetime

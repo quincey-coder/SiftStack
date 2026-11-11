@@ -29,6 +29,7 @@ the roll). cad_lookup.py scores names and prefers delinquent_situs on ties.
 """
 
 import csv
+import re
 import logging
 import os
 import time
@@ -255,7 +256,10 @@ def _load_delq(
                 # Owner MAILING block — the delinquent CSV carries it, and keeping
                 # it in its own keys is what lets parcel lookups hand back a true
                 # mailing address instead of falling back to the situs.
-                "mailing": (row.get("Address 1") or row.get("Address 2") or "").strip(),
+                # Address 1 is often a co-owner / care-of NAME line ("LUIS
+                # ALONSO FRANCO", "NATALIE N VAN DELDEN") with the street in
+                # Address 2/3 — take the first line that looks like a street.
+                "mailing": _pick_mail_line(row.get("Address 1"), row.get("Address 2"), row.get("Address 3")),
                 "mcity": (row.get("City") or "").strip().upper(),
                 "mstate": (row.get("State") or "").strip().upper(),
                 "mzip": (row.get("Zip Code") or "").strip()[:5],
@@ -323,7 +327,7 @@ def _load_cur(
             # for others (the two are mutually-exclusive in this feed). Fall back
             # to ADDRESS1 so we don't drop owners like "LIEN TRAN INVESTMENT TRUST"
             # whose address sits only in ADDRESS1.
-            mailing = (row.get("MAILINGADDRESS") or row.get("ADDRESS1") or "").strip()
+            mailing = _pick_mail_line(row.get("MAILINGADDRESS"), row.get("ADDRESS1"), row.get("ADDRESS2"))
             # 9-digit zip → 5-digit
             zipc = (row.get("ZIPCODE") or "").strip()
             if len(zipc) == 9 and zipc.isdigit():
@@ -422,6 +426,20 @@ def search_by_name(last_name: str, first_name: str = "") -> list[dict]:
     # Probe both directions: tax rolls use LAST FIRST; caller may pass either.
     # We indexed on first-token which for LAST-FIRST format IS the last name.
     return idx.get(key, [])
+
+
+_STREETISH_RE = re.compile(r"\d|\bBOX\b|\bGENERAL DELIVERY\b", re.I)
+
+
+def _pick_mail_line(*lines) -> str:
+    """First mailing line that looks like a street (has a number / PO Box).
+    Falls back to the first non-blank line ONLY when none does, so a roll that
+    puts a care-of name first no longer ships the NAME as the mailing street."""
+    vals = [re.sub(r"\s+", " ", str(v or "")).strip() for v in lines]
+    for v in vals:
+        if v and _STREETISH_RE.search(v):
+            return v
+    return ""
 
 
 def search_by_address(street: str, zip5: str) -> dict | None:

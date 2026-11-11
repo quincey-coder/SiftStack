@@ -172,7 +172,13 @@ def _is_complete_for_seen(n) -> bool:
     """True when a record may be sealed into seen_notice_ids."""
     if getattr(n, "record_status", "") == "sold":
         return False
-    return _has_owner_identity(n) and _has_property_address(n)
+    if _has_owner_identity(n) and _has_property_address(n):
+        return True
+    # Owner reconcile looked the address up and the county has no owner of
+    # record for it (unit / unaddressed situs). Waiting cannot fill it — the
+    # clerk never supplies the owner of a foreclosure — so leaving it open only
+    # re-emitted the same ownerless row every day (2026-11-11: 140 re-emits).
+    return (getattr(n, "owner_check", "") == "unresolved") and _has_property_address(n)
 
 
 def _seal_seen_ids(notices, seen_ids: set, *, require_complete: bool = True) -> tuple[int, int]:
@@ -354,6 +360,47 @@ def _collect_health_events(health) -> None:
         health.zillow = dict(getattr(_pe, "LAST_RUN_STATS", None) or {})
     except Exception:
         pass
+
+
+def _last_review_records() -> list:
+    """Records the enrichment pipeline's owner reconcile held for review."""
+    try:
+        import enrichment_pipeline
+        return list(getattr(enrichment_pipeline, "LAST_REVIEW", []) or [])
+    except Exception:
+        return []
+
+
+def _write_review_output(review: list, no_drive: bool = False) -> dict | None:
+    """Write the REVIEW CSV (records held by owner reconcile) and push it to
+    Drive. Returns a drive_links-style dict (url may be None) or None when
+    nothing was held. Never auto-uploaded to DataSift."""
+    if not review:
+        return None
+    try:
+        from datasift_formatter import write_review_csv
+        info = write_review_csv(review)
+    except Exception:
+        logging.exception("Review CSV generation failed")
+        return None
+    if not info:
+        return None
+    link = None
+    if not no_drive and config.GOOGLE_DRIVE_FOLDER_ID and config.GOOGLE_SERVICE_ACCOUNT_KEY:
+        try:
+            from drive_uploader import upload_file
+            from datetime import datetime as _dt
+            _now = _dt.now()
+            sub = ([_now.strftime("%Y"), _now.strftime("%m-%B"), "review"]
+                   if config.GOOGLE_DRIVE_AUTO_FOLDER else None)
+            link = upload_file(Path(info["path"]), config.GOOGLE_DRIVE_FOLDER_ID,
+                               config.GOOGLE_SERVICE_ACCOUNT_KEY, subfolder_parts=sub)
+        except Exception:
+            logging.exception("Review CSV Drive upload failed")
+    logging.info("Review CSV: %d record(s) held (not uploaded) -> %s%s",
+                 info["count"], Path(info["path"]).name, f" | Drive: {link}" if link else "")
+    return {"label": info["label"], "records": info["count"],
+            "filename": Path(info["path"]).name, "url": link, "path": str(info["path"])}
 
 
 def _upload_cleanup_csv_to_drive(cleanup_info: dict, no_drive: bool = False) -> str | None:
@@ -929,6 +976,7 @@ async def actor_main() -> None:
                 source_label="Apify Actor",
             )
             notices = run_enrichment_pipeline(notices, opts)
+            _review = _last_review_records()
 
             # Sold (dropped-off-roll) records — rehydrated by the tax-delinquent
             # scrapers from the prior run's snapshot. They bypass enrichment and
@@ -1175,6 +1223,24 @@ async def actor_main() -> None:
                         })
             except Exception as e:
                 Actor.log.warning("Cleanup CSV generation failed: %s", e)
+
+            # ── REVIEW CSV: records owner reconcile held out of the upload ──
+            # (debtor not the owner of record, no house number, ...). Drive +
+            # the Slack CSV-links block; never auto-uploaded.
+            _review_info = _write_review_output(_review)
+            if _review_info:
+                try:
+                    with open(_review_info["path"], "rb") as f:
+                        await kvs.set_value("datasift_review.csv", f.read(), content_type="text/csv")
+                except Exception as e:
+                    Actor.log.warning("Review CSV -> KVS failed: %s", e)
+                if _review_info.get("url"):
+                    drive_links.append({k: v for k, v in _review_info.items() if k != "path"})
+                health.record_event(
+                    "warn", "owner_reconcile",
+                    f"{_review_info['records']} record(s) held for review (owner of record "
+                    f"mismatch / unverified / no house number) -> {_review_info['filename']}",
+                )
 
             # ── DataSift auto-upload: the upload wizard via Playwright ──
             # The operator's manual batch procedure (2026-08-23 → 09-16),
@@ -1496,7 +1562,9 @@ async def actor_main() -> None:
             # ── Persist state for next run ──
             # Seal only COMPLETE records (name + address) using the pre-pipeline
             # snapshot key; incomplete ones stay open for the rolling re-scan.
-            _sealed, _left_open = _seal_seen_ids(notices, seen_ids)
+            # Held-for-review records are sealed too: they were delivered (to
+            # the REVIEW CSV) and would otherwise repeat in it every day.
+            _sealed, _left_open = _seal_seen_ids(list(notices) + list(_review), seen_ids)
             Actor.log.info(
                 "Dedup seal: %d new key(s) sealed, %d left open for re-hit",
                 _sealed, _left_open,
@@ -1655,6 +1723,7 @@ def _run_pdf_import(args) -> None:
         source_label=f"PDF import ({pdf_path.name})",
     )
     notices = run_enrichment_pipeline(notices, opts)
+    _write_review_output(_last_review_records(), no_drive=getattr(args, 'no_drive', False))
 
     if not notices:
         logging.warning("No records remaining after pipeline")
@@ -1732,6 +1801,7 @@ def _run_photo_import(args) -> None:
         source_label=f"Photo import ({folder.name})",
     )
     notices = run_enrichment_pipeline(notices, opts)
+    _write_review_output(_last_review_records(), no_drive=getattr(args, 'no_drive', False))
 
     if not notices:
         logging.warning("No records remaining after pipeline")
@@ -1839,6 +1909,7 @@ def _run_csv_import(args) -> None:
     )
     detect_existing_enrichment(notices, opts)
     notices = run_enrichment_pipeline(notices, opts)
+    _write_review_output(_last_review_records(), no_drive=getattr(args, 'no_drive', False))
 
     if not notices:
         logging.warning("No records remaining after pipeline")
@@ -3162,6 +3233,8 @@ def _run_scrape_pipeline(args, targets) -> None:
         source_label=f"CLI {args.mode}",
     )
     notices = run_enrichment_pipeline(notices, opts)
+    _review = _last_review_records()
+    _write_review_output(_review, no_drive=getattr(args, "no_drive", False))
 
     # Sold (dropped-off-roll) records — rehydrated by the tax-delinquent
     # scrapers from the prior run's snapshot. Bypass enrichment; appended just
@@ -3263,7 +3336,7 @@ def _run_scrape_pipeline(args, targets) -> None:
         # snapshot key (Smarty may have mutated notice.address since). Sold
         # tag-update rows are never sealed; incomplete records stay open so the
         # rolling lookback re-hits them once the clerk completes them.
-        _sealed, _left_open = _seal_seen_ids(notices, cli_seen_ids)
+        _sealed, _left_open = _seal_seen_ids(list(notices) + list(_review), cli_seen_ids)
         logging.info(
             "Dedup seal: %d new key(s) sealed, %d left open for re-hit",
             _sealed, _left_open,

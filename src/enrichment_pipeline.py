@@ -338,6 +338,11 @@ def _validate_records(notices: list[NoticeData]) -> list[NoticeData]:
 # ── Pipeline ─────────────────────────────────────────────────────────
 
 
+# Records held out of the upload by Step 5b (owner reconcile) on the last
+# run_enrichment_pipeline() call — main.py writes them to the REVIEW CSV.
+LAST_REVIEW: list[NoticeData] = []
+
+
 def run_enrichment_pipeline(
     notices: list[NoticeData],
     opts: PipelineOptions,
@@ -357,9 +362,13 @@ def run_enrichment_pipeline(
      10. Compute mailable flag
      11. Log summary
 
-    Returns the (possibly filtered) list, modified in-place.
+    Returns the (possibly filtered) list, modified in-place. Records held by
+    Step 5b (owner reconcile) are NOT in the returned list — read them from
+    ``enrichment_pipeline.LAST_REVIEW`` right after the call.
     """
     from data_formatter import deduplicate
+    global LAST_REVIEW
+    LAST_REVIEW = []
 
     # ── Step 1: Filter Sold ──────────────────────────────────────────
     if not opts.skip_filter_sold:
@@ -614,6 +623,22 @@ def run_enrichment_pipeline(
                     logger.warning("  CAD owner resolution failed: %s", e)
     elif opts.skip_tax:
         logger.info("── Step 5: Tax Delinquency (skipped) ──")
+
+    # ── Step 5b: Owner Reconcile (owner_reconcile.py, 2026-11-11) ─────
+    # Every record's owner checked against the parcel's owner of record:
+    # substitute trustees / notice parties replaced, ownerless rows filled
+    # (Travis parcels via the TCAD parcel fabric), liens on someone else's
+    # house and no-house-number rows HELD for review instead of uploaded.
+    if not opts.skip_tax:
+        logger.info("── Step 5b: Owner Reconcile ──")
+        try:
+            from owner_reconcile import reconcile_owners
+            notices, LAST_REVIEW = reconcile_owners(notices)
+        except Exception as e:
+            logger.warning("  Owner reconcile failed: %s — records left as scraped", e)
+            LAST_REVIEW = []
+    else:
+        logger.info("── Step 5b: Owner Reconcile (skipped with tax lookups) ──")
 
     # ── Step 6: Smarty Address Standardization ───────────────────────
     if not opts.skip_smarty and not opts.has_smarty:

@@ -540,8 +540,12 @@ def _parcel_lookup_one(parcel_id: str, county: str) -> dict | None:
         # Owner's tax-roll mailing address — where an absentee/LLC owner actually
         # receives mail. Filled only when the owner mailing is otherwise blank.
         "mail_street": mail_street,
-        "mail_city": rec.get("mcity") or rec.get("scity", ""),
-        "mail_state": rec.get("mstate") or rec.get("sstate", "TX"),
-        "mail_zip": rec.get("mzip") or rec.get("szip", ""),
+        # Records that carry their own mailing keys (Travis, Bell since
+        # 2026-11-11) never borrow the s* keys — on Bell those are the PROPERTY
+        # city/zip, which mailed a Troy owner at the Temple situs. Only WCAD
+        # (no m* keys; its mailing is mapped INTO s*) uses the s* fallback.
+        "mail_city": rec["mcity"] if "mcity" in rec else rec.get("scity", ""),
+        "mail_state": (rec["mstate"] if "mstate" in rec else rec.get("sstate", "")) or "TX",
+        "mail_zip": rec["mzip"] if "mzip" in rec else rec.get("szip", ""),
         "source": source,
     }

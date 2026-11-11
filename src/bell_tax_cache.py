@@ -271,6 +271,136 @@ def _clean_mailing(addr: str) -> str:
     return s
 
 
+# ── Owner mailing split (2026-11-11) ─────────────────────────────────
+# BellCAD's `Ownr_Addr` is one cell holding the whole mailing block. The
+# delinquent roll separates the lines with `_x000d_\n`; the 2026-09 appraisal
+# export DROPPED the separators, so the street and city arrive glued:
+#   '165 CEDAR RIDGE CIRKILLEEN, TX 76542'
+#   'C/O DOLORES LARA806 N 8TH STTEMPLE, TX 76501-2642'
+# Every Bell mailing therefore reached DataSift as one street string, and the
+# mailing CITY fell back to the PROPERTY city (an owner in Troy was mailed in
+# Temple). split_owner_address() returns (street, city, state, zip5); glued
+# cities are recognised against a vocabulary learned from the separated rows
+# of the same files (see load_index) plus BASE_CITY_VOCAB.
+BASE_CITY_VOCAB = frozenset({
+    "KILLEEN", "TEMPLE", "BELTON", "HARKER HEIGHTS", "NOLANVILLE", "SALADO", "TROY",
+    "MOODY", "HOLLAND", "ROGERS", "BARTLETT", "LITTLE RIVER", "LITTLE RIVER ACADEMY",
+    "COPPERAS COVE", "FORT HOOD", "FORT CAVAZOS", "MORGANS POINT RESORT", "ACADEMY",
+    "PENDLETON", "HEIDENHEIMER", "KEMPNER", "LAMPASAS", "GATESVILLE", "WACO",
+    "AUSTIN", "ROUND ROCK", "GEORGETOWN", "SAN ANTONIO", "HOUSTON", "DALLAS",
+    "FORT WORTH", "EL PASO", "KYLE", "ALLEN", "LANCASTER", "CEDAR PARK",
+    "PFLUGERVILLE", "LEANDER", "HUTTO", "TAYLOR", "JARRELL", "FLORENCE",
+})
+_MAIL_TAIL_RE = re.compile(r"^(?P<head>.*?),?\s+(?P<st>[A-Z]{2})\s+(?P<zip>\d{5})(?:-?\d{4})?\s*$")
+_CARE_OF_RE = re.compile(r"^(?:C/O|ATTN:?|IN CARE OF)\b", re.I)
+_GLUE_SUFFIXES = ("DR|RD|ST|LN|CT|CIR|AVE|BLVD|WAY|LOOP|LP|PL|TRL|PKWY|HWY|CV|TER|PATH|RUN|"
+                  "PASS|BND|XING|SQ|PT|HOLW|TRCE|CRK|RDG|VW|PIKE|ROW|ALY")
+
+
+def _mail_lines(raw: str) -> list[str]:
+    s = (raw or "").replace("_x000d_", "\n").replace("\r", "\n")
+    return [re.sub(r"\s+", " ", ln).strip().strip(",").strip() for ln in s.split("\n") if ln.strip()]
+
+
+def city_from_separated(raw: str) -> str:
+    """The city of a mailing block that still HAS line separators ('' if none)."""
+    lines = _mail_lines(raw)
+    if len(lines) < 2:
+        return ""
+    m = _MAIL_TAIL_RE.match(lines[-1].upper())
+    if not m:
+        return ""
+    head = m.group("head").strip().rstrip(",").strip()
+    return head if head and not re.search(r"\d", head) else ""
+
+
+def _pick_street_line(lines: list[str]) -> str:
+    """From the street lines of a block, drop care-of/attention lines when a
+    real street line (house number or PO Box) is present."""
+    real = [ln for ln in lines if not _CARE_OF_RE.match(ln)]
+    real = real or lines
+    numbered = [ln for ln in real if re.search(r"\d", ln) or "BOX" in ln.upper()]
+    return (numbered[-1] if numbered else real[-1]) if real else ""
+
+
+def _strip_glued_prefix(street: str) -> str:
+    """'C/O DOLORES LARA806 N 8TH ST' / 'AGUSTINA1225 LIBERTY BELL LP' -> from the
+    first house number on. A name glued in front of the number is never part of
+    the street. PO Boxes are left alone."""
+    if re.match(r"^\s*(?:P\.?\s*O\.?\s*)?BOX\b", street, re.I) or re.match(r"^\s*\d", street):
+        return street
+    m = re.search(r"(?<![A-Z0-9 ])\d|(?<=[A-Za-z])\d|\s\d", street)
+    if m and re.search(r"[A-Za-z]", street[: m.start()]):
+        if re.search(r"\bBOX\s*$", street[: m.start()], re.I):
+            return street
+        return street[m.start():].strip()
+    return street
+
+
+def split_owner_address(raw: str, city_vocab: Iterable[str] = ()) -> tuple[str, str, str, str]:
+    """Split a BellCAD ``Ownr_Addr`` cell into (street, city, state, zip5).
+
+    Never guesses a city it cannot find: an unsplittable glued block returns the
+    street part with a blank city (the formatter then leaves Mailing City blank
+    rather than copying the property city)."""
+    lines = _mail_lines(raw)
+    if not lines:
+        return "", "", "", ""
+    last = lines[-1].upper()
+    m = _MAIL_TAIL_RE.match(last)
+    if not m:
+        return _strip_glued_prefix(_pick_street_line(lines)), "", "", ""
+    state, zip5 = m.group("st"), m.group("zip")
+    head = m.group("head").strip().rstrip(",").strip()
+    if len(lines) >= 2 and head and not re.search(r"\d", head):
+        # Separated block: last line = "CITY, ST ZIP", the street is above it.
+        return _strip_glued_prefix(_pick_street_line(lines[:-1])), head, state, zip5
+    # Glued block: '<street><CITY>' (or '<street> <CITY>') in one line.
+    glued = head
+    vocab = sorted({c.upper() for c in (set(city_vocab) | BASE_CITY_VOCAB) if c}, key=len, reverse=True)
+    street, city = "", ""
+    for c in vocab:
+        if glued.endswith(c) and len(glued) > len(c):
+            cut = len(glued) - len(c)
+            # The street must still end in a word/number — reject splits that
+            # leave nothing street-like ('TEMPLE' alone).
+            if re.search(r"[A-Z0-9]\s*$", glued[:cut]) and re.search(r"\d|BOX", glued[:cut]):
+                street, city = glued[:cut].strip(), c
+                break
+    if not city:
+        # A street suffix glued to an unknown (often out-of-state) city:
+        # '11720 HENLEY CTWALDORF', '5405 CLAIRMONT LNN CHARLESTON'.
+        m3 = re.match(r"^(\d.*\b(?:" + _GLUE_SUFFIXES + r"))([A-Z][A-Z .'-]{2,})$", glued)
+        if m3:
+            street, city = m3.group(1).strip(), m3.group(2).strip()
+    if not city:
+        # A house number / highway number glued to the city: '2268SALADO'.
+        m2 = re.match(r"^(.*\d)([A-Z][A-Z .'-]{2,})$", glued)
+        if m2:
+            street, city = m2.group(1).strip(), m2.group(2).strip()
+        else:
+            street = glued
+    if len(lines) >= 2:
+        street = _pick_street_line(lines[:-1] + [street])
+    return _strip_glued_prefix(street), city, state, zip5
+
+
+def _apply_mailing_split(records: Iterable[dict], city_vocab: set[str]) -> int:
+    """Rewrite each record's packed ``mailing`` into mailing/mcity/mstate/mzip."""
+    n = 0
+    for rec in records:
+        raw = rec.pop("_mailing_raw", None)
+        if raw is None:
+            continue
+        street, city, state, zip5 = split_owner_address(raw, city_vocab)
+        rec["mailing"] = street
+        rec["mcity"] = city
+        rec["mstate"] = state
+        rec["mzip"] = zip5
+        n += 1
+    return n
+
+
 def _split_situs_addr(addr: str) -> tuple[str, str, str]:
     """Bell appraisal `Situs_Addr` packs street + city/state/zip on one line:
         ' FM 2410, HARKER HEIGHTS TX  76548'
@@ -354,7 +484,8 @@ def _load_delinquent(
         prop_id = str(row[col["prop_id"]] if "prop_id" in col else "").strip()
         state_cd = str(row[col.get("state_cd", -1)] or "").strip() if "state_cd" in col else ""
         legal = str(row[col.get("legal_desc", -1)] or "").strip() if "legal_desc" in col else ""
-        ownr_addr = _clean_mailing(str(row[col.get("Ownr_Addr", -1)] or "")) if "Ownr_Addr" in col else ""
+        ownr_raw = str(row[col.get("Ownr_Addr", -1)] or "") if "Ownr_Addr" in col else ""
+        ownr_addr = _clean_mailing(ownr_raw)
         record = {
             "fullname": owner,
             "situsaddress": situs,
@@ -367,6 +498,7 @@ def _load_delinquent(
             "years_delinquent": str(years_count) if years_count else "",
             "first_year_delinquent": first_year,
             "mailing": ownr_addr,
+            "_mailing_raw": ownr_raw,
             "legal_desc": legal,
             "source": "delinquent_situs",
         }
@@ -421,7 +553,8 @@ def _load_appraisal(
         market = str(row[col.get("market", -1)] or "").strip() if "market" in col else ""
         state_cd = str(row[col.get("state_cd", -1)] or "").strip() if "state_cd" in col else ""
         legal = str(row[col.get("legal_desc", -1)] or "").strip() if "legal_desc" in col else ""
-        ownr_addr = _clean_mailing(str(row[col.get("Ownr_Addr", -1)] or "")) if "Ownr_Addr" in col else ""
+        ownr_raw = str(row[col.get("Ownr_Addr", -1)] or "") if "Ownr_Addr" in col else ""
+        ownr_addr = _clean_mailing(ownr_raw)
         record = {
             "fullname": owner,
             "situsaddress": street,
@@ -433,6 +566,7 @@ def _load_appraisal(
             "delinquent_total": "",
             "years_delinquent": "",
             "mailing": ownr_addr,
+            "_mailing_raw": ownr_raw,
             "legal_desc": legal,
             "source": "appraisal_master",
         }
@@ -466,6 +600,20 @@ def load_index(force_download: bool = False) -> dict[str, list[dict]]:
         logger.info("  %d appraisal-master records indexed", n)
     else:
         logger.warning("Bell appraisal master unavailable — probate/foreclosure backfill disabled for Bell")
+
+    # Split every packed owner mailing into street/city/state/zip. The city
+    # vocabulary comes from the blocks that still carry line separators (the
+    # delinquent roll) plus every situs city, so glued appraisal rows resolve.
+    vocab: set[str] = set()
+    for lst in idx.values():
+        for rec in lst:
+            c = city_from_separated(rec.get("_mailing_raw") or "")
+            if c:
+                vocab.add(c)
+            if rec.get("scity"):
+                vocab.add(rec["scity"].upper())
+    n_split = _apply_mailing_split((r for lst in idx.values() for r in lst), vocab)
+    logger.info("  owner mailing split: %d records (%d known cities)", n_split, len(vocab))
 
     # Build the parcel index from the loaded records (delinquent-situs is
     # authoritative; two different owners at one prop_id → ambiguous, declined).

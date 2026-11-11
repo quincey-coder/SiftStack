@@ -90,7 +90,23 @@ def _try_parse_entity_name(name: str, entity_type: str) -> dict | None:
                 "FINANCIAL", "INVESTMENT", "CAPITAL", "HOLDINGS",
                 "PROPERTIES", "MANAGEMENT", "GROUP", "SERVICES",
             }
+            # A number is never part of a person's name ("3423 TRUST").
+            if any(ch.isdigit() for ch in extracted):
+                return None
             if len(parts) >= 2 and not any(w.upper() in business_words for w in parts):
+                # County rolls write trusts in NAMELF order too: "GUGLER CLARK L
+                # REVOCABLE TRUST" is Clark L. Gugler, and the old title-case
+                # shipped "Gugler Clark" as First/Last. A trailing middle INITIAL
+                # is the unambiguous NAMELF tell -> re-orient through the one
+                # NAMELF parser. Without it the order is unknowable; keep as-is.
+                if len(parts) >= 3 and len(parts[-1].rstrip(".")) == 1:
+                    try:
+                        from obituary_enricher import parse_tax_owner_name
+                        _v = parse_tax_owner_name(extracted)
+                        if _v:
+                            extracted = _v[0]
+                    except Exception:
+                        pass
                 return {
                     "person_name": extracted.title(),
                     "role": "trustee",
@@ -142,7 +158,8 @@ def _try_parse_entity_name(name: str, entity_type: str) -> dict | None:
                 "CENTRAL", "PACIFIC", "ATLANTIC", "MOUNTAIN", "VALLEY",
                 "LAKE", "RIVER", "HILL", "SUMMIT", "PEAK",
             }
-            if candidate.upper() not in non_names and len(candidate) >= 3:
+            if (candidate.upper() not in non_names and len(candidate) >= 3
+                    and not any(ch.isdigit() for ch in candidate)):
                 return {
                     "person_name": candidate.title(),
                     "role": "member",

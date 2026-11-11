@@ -258,6 +258,11 @@ class NoticeData:
     # Deceased owner detection
     deceased_indicator: str = ""       # "life_estate", "personal_rep", "trustee", "care_of", "et_al", or ""
     tax_owner_name: str = ""           # Raw owner name from county tax API
+    # ── Owner reconcile (owner_reconcile.py, 2026-11-11) ──
+    cad_owner_raw: str = ""            # Owner of record for the parcel, raw county text
+    notice_party_name: str = ""        # Name the FILING carried, when replaced by the owner of record
+    owner_check: str = ""              # "match" | "from_cad" | "filled" | "unresolved" | "review" | ""
+    review_reason: str = ""            # Why the record was held out of the upload (review CSV)
     # Obituary-confirmed deceased owner
     owner_deceased: str = ""                # "yes" or "" — confirmed via obituary search
     date_of_death: str = ""                 # YYYY-MM-DD from obituary
