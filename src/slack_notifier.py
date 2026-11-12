@@ -38,6 +38,30 @@ def _send_webhook(text: str, webhook_url: str | None = None) -> bool:
         return False
 
 
+def alerts_enabled() -> bool:
+    """Are ALERT messages (health block, error/warning/preflight, upload
+    failures, list-validator blocks) allowed to post to Slack?
+
+    OFF by default — owner request 2026-11-11: Slack carries the daily
+    report, Drive CSVs, auctions, upload summary and roll diffs only. Alerts
+    are still built and written to the run log. Set ``SIFT_SLACK_ALERTS=1``
+    to turn them back on.
+    """
+    return os.environ.get("SIFT_SLACK_ALERTS", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def post_alert(text: str, webhook_url: str | None = None, *, kind: str = "alert") -> bool:
+    """Post an alert to Slack when alerts are enabled; otherwise log it.
+
+    Returns True when the alert was handled (posted, or deliberately kept in
+    the log) so callers don't report a "dead webhook" for a muted alert.
+    """
+    if not alerts_enabled():
+        logger.info("Slack %s muted (SIFT_SLACK_ALERTS off) — log only:\n%s", kind, text)
+        return True
+    return _send_webhook(text, webhook_url)
+
+
 def notify_error(
     step: str,
     error: Exception | str,
@@ -66,9 +90,9 @@ def notify_error(
     lines.append(f"*Time:* {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
     text = "\n".join(lines)
-    sent = _send_webhook(text, webhook_url)
+    sent = post_alert(text, webhook_url, kind="error alert")
     if sent:
-        logger.info("Error notification sent to Slack: %s — %s", step, error)
+        logger.info("Error notification handled: %s — %s", step, error)
     else:
         logger.warning("Could not send error notification (no webhook or send failed)")
     return sent
@@ -98,7 +122,7 @@ def notify_warning(
         lines.append(f"*Context:* {context}")
     lines.append(f"*Time:* {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-    return _send_webhook("\n".join(lines), webhook_url)
+    return post_alert("\n".join(lines), webhook_url, kind="warning")
 
 
 def notify_preflight_failure(
@@ -124,7 +148,7 @@ def notify_preflight_failure(
     lines.append(f"*Time:* {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     lines.append("Pipeline did not start. Fix the above and re-run.")
 
-    return _send_webhook("\n".join(lines), webhook_url)
+    return post_alert("\n".join(lines), webhook_url, kind="preflight alert")
 
 
 def _count_by_field(notices: list[NoticeData], field: str) -> dict[str, int]:
@@ -449,23 +473,57 @@ def build_auction_block(notices: list, horizon_days: int = 60, limit: int = 20) 
     if not rows and not passed:
         return ""
     rows.sort(key=lambda r: (r[0], (getattr(r[2], "county", "") or ""), (getattr(r[2], "address", "") or "")))
-    lines = [f"*UPCOMING AUCTIONS* — {len(rows)} within {horizon_days}d"
-             + (f" · {passed} already passed" if passed else "")]
-    for days, d, n in rows[:limit]:
-        who = (getattr(n, "owner_name", "") or getattr(n, "business_name", "") or "—")
-        flag = ""
-        if getattr(n, "auction_moved_from", ""):
-            flag = f"  ↪ moved from {n.auction_moved_from}"
-        elif getattr(n, "watch_reason", "") == "completed":
-            flag = "  ✚ completed"
-        if getattr(n, "auction_date_source", "") == "folder_month":
-            flag += "  (date assumed)"
-        lines.append(
-            f"• {d.strftime('%a %m/%d')} ({days}d)  {getattr(n, 'address', '') or '(no address)'}, "
-            f"{getattr(n, 'city', '') or ''}  [{(getattr(n, 'county', '') or '')}]  {who}{flag}"
-        )
+
+    def _md(d) -> str:  # "Dec 1" — no zero padding, portable
+        return f"{d.strftime('%b')} {d.day}"
+
+    def _when(days: int) -> str:
+        return "today" if days == 0 else ("tomorrow" if days == 1 else f"in {days} days")
+
+    # Layout is built for a phone: a short header, one bold heading per sale
+    # date, then two short lines per property (address, then owner + county
+    # + flags) so nothing wraps mid-field on a narrow screen.
+    head = f":classical_building: *Upcoming Auctions* · {len(rows)} in the next {horizon_days} days"
+    lines = [head]
+    if passed:
+        lines.append(f"_{passed} sale date{'s' if passed != 1 else ''} already passed_")
+
+    shown = rows[:limit]
+    by_day: dict = {}
+    for days, d, n in shown:
+        by_day.setdefault((days, d), []).append(n)
+    total_by_day: dict = {}
+    for days, d, _n in rows:
+        total_by_day[d] = total_by_day.get(d, 0) + 1
+
+    for (days, d), group in by_day.items():
+        cnt = total_by_day[d]
+        lines.append("")
+        lines.append(f"*{d.strftime('%a')}, {_md(d)}* · {_when(days)} · "
+                     f"{cnt} propert{'ies' if cnt != 1 else 'y'}")
+        for n in group:
+            addr = (getattr(n, "address", "") or "(no address)").strip()
+            city = (getattr(n, "city", "") or "").strip()
+            county = (getattr(n, "county", "") or "").strip()
+            who = (getattr(n, "owner_name", "") or getattr(n, "business_name", "") or "Owner unknown").strip()
+            first = f"• *{addr}*" + (f", {city}" if city else "")
+            detail = [who] + ([county] if county else [])
+            moved = getattr(n, "auction_moved_from", "") or ""
+            if moved:
+                try:
+                    moved = _md(_dt.strptime(moved[:10], "%Y-%m-%d").date())
+                except ValueError:
+                    pass
+                detail.append(f"↪ moved from {moved}")
+            elif getattr(n, "watch_reason", "") == "completed":
+                detail.append("✚ now complete")
+            if getattr(n, "auction_date_source", "") == "folder_month":
+                detail.append("_date assumed_")
+            lines.append(first)
+            lines.append("      " + " · ".join(detail))
     if len(rows) > limit:
-        lines.append(f"… +{len(rows) - limit} more")
+        lines.append("")
+        lines.append(f"_+{len(rows) - limit} more — see the run's Foreclosure CSV_")
     return "\n".join(lines)
 
 

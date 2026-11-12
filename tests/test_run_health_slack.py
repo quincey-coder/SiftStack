@@ -117,6 +117,7 @@ def test_warnings_are_written_to_the_log(caplog):
 def test_send_health_report_logs_warnings_and_sends_errors_only(monkeypatch, caplog):
     import slack_notifier
 
+    monkeypatch.setenv("SIFT_SLACK_ALERTS", "1")
     sent = {}
     monkeypatch.setattr(slack_notifier, "_send_webhook", lambda text, url=None: sent.setdefault("text", text) or True)
     r = _mixed_run()
@@ -125,6 +126,22 @@ def test_send_health_report_logs_warnings_and_sends_errors_only(monkeypatch, cap
     assert ":warning:" not in sent["text"]
     assert "Cloudflare 403" in sent["text"]
     assert sum(1 for rec in caplog.records if "health warn (log-only" in rec.getMessage()) == 4
+
+
+def test_health_report_muted_by_default_but_logged(monkeypatch, caplog):
+    """Owner request 2026-11-11: the health block never reaches Slack unless
+    SIFT_SLACK_ALERTS is on — it still runs and lands in the log."""
+    import slack_notifier
+
+    monkeypatch.delenv("SIFT_SLACK_ALERTS", raising=False)
+    monkeypatch.setattr(slack_notifier, "_send_webhook",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not send")))
+    with caplog.at_level(logging.INFO, logger="run_health"):
+        assert rh.send_health_report(_mixed_run(), "https://hooks.example/x")
+    assert any("SiftStack health" in rec.getMessage() for rec in caplog.records)
+    assert slack_notifier.notify_error("step", "boom", webhook_url="https://hooks.example/x")
+    assert slack_notifier.notify_warning("x", webhook_url="https://hooks.example/x")
+    assert slack_notifier.notify_preflight_failure(["x"], webhook_url="https://hooks.example/x")
 
 
 if __name__ == "__main__":

@@ -81,7 +81,9 @@ check(_build_notes(n4).startswith("=== AUCTION ==="), "AUCTION section leads dec
 check(auction_bucket(0) == "auction_in_30d" and auction_bucket(61) == "auction_90d_plus" and auction_bucket(None) == "", "buckets")
 check(auction_days_out("garbage") is None, "bad date -> None")
 blk = build_auction_block([n, n2, n3])
-check(blk.startswith("*UPCOMING AUCTIONS*") and "1 already passed" in blk and "moved from 2026-10-06" in blk, "slack block")
+check(blk.startswith(":classical_building: *Upcoming Auctions*") and "1 sale date already passed" in blk
+      and "moved from Oct 6" in blk and "_date assumed_" in blk and "in 12 days · 2 properties" in blk, "slack block")
+check(max(len(l) for l in blk.splitlines()) <= 70, "slack block lines stay phone-width")
 
 print("trustee notice parser stamps date provenance")
 body = ("NOTICE OF SUBSTITUTE TRUSTEE'S SALE. Deed of Trust executed by Loraine A Perdomo, a single woman. "

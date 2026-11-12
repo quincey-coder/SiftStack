@@ -348,10 +348,10 @@ def report_upload_failures(
     except Exception as e:  # never let bookkeeping mask the alert
         logger.warning("Could not write upload-failure manifest: %s", e)
     if slack:
-        from slack_notifier import _send_webhook
+        from slack_notifier import post_alert
 
         text = build_slack_block(failures, total_lists=total_lists, manifest_ref=ref)
-        if _send_webhook(text, webhook_url):
+        if post_alert(text, webhook_url, kind="upload-failure alert"):
             logger.info("Upload-failure alert sent to Slack (%d list(s))", len(failures))
         else:
             logger.error("UPLOAD-FAILURE SLACK SEND FAILED — webhook missing or dead")
@@ -489,9 +489,9 @@ def retry(manifest_path: str, *, csv_dir: str | None = None,
         return 1
     print(f"All {len(failures)} list(s) recovered.")
     if slack and config.SLACK_WEBHOOK_URL:
-        from slack_notifier import _send_webhook
+        from slack_notifier import post_alert
 
-        _send_webhook(
+        post_alert(
             f":white_check_mark: *DataSift upload retry OK* — {len(failures)} list(s) "
             f"recovered from {Path(manifest_path).name}: "
             + ", ".join(dict.fromkeys(f.list_name for f in failures))

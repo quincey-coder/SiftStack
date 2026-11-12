@@ -132,6 +132,15 @@ days (date filter silently not applied). The anti-silence layer:
   result-cap/window spikes, Zillow failure share >30%, guardrail trips,
   validator warnings, registry gaps. `Actor.set_status_message` carries the
   verdict; `Actor.fail` only when EVERY target hard-failed.
+- **Alerts are OFF in Slack by default (owner request 2026-11-11, shipped
+  2026-11-12).** The health block, error/warning/preflight alerts,
+  list-validator blocks and upload-failure alerts go through
+  `slack_notifier.post_alert`, which only posts when `SIFT_SLACK_ALERTS=1`;
+  otherwise the full text lands in the run log. Slack carries the daily report,
+  Drive CSV links, upcoming auctions, the DataSift upload summary and roll diffs.
+  The health analysis below still runs (baselines, status message,
+  `Actor.fail`) — it just isn't posted. Don't route new alerts through
+  `_send_webhook` directly.
 - **Warnings are LOG-ONLY in Slack (owner request 2026-09-11).** Only
   error-level findings (hard fails, parse-zero, guardrail trips, schema
   alarms, registry gaps) are bullet lines in the health block. Warn-level

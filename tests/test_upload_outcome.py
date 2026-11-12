@@ -143,6 +143,7 @@ def test_slack_block_names_list_stage_action_and_csv():
 def test_report_writes_manifest_logs_errors_and_sends_slack(tmp_path, monkeypatch, caplog):
     import slack_notifier
 
+    monkeypatch.setenv("SIFT_SLACK_ALERTS", "1")
     sent = {}
     monkeypatch.setattr(slack_notifier, "_send_webhook",
                         lambda text, url=None: sent.setdefault("text", text) or True)

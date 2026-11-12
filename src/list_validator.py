@@ -495,8 +495,9 @@ def gate_outputs(
 
     if report.blocked and slack:
         try:
-            from slack_notifier import _send_webhook
-            _send_webhook(format_report(report, for_slack=True), webhook_url)
+            from slack_notifier import post_alert
+            post_alert(format_report(report, for_slack=True), webhook_url,
+                       kind="list-validation alert")
         except Exception as e:
             log.warning("Could not send validation-failure Slack alert: %s", e)
 

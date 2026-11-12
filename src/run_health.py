@@ -374,9 +374,16 @@ def log_warnings(report: HealthReport) -> None:
 def send_health_report(report: HealthReport, webhook_url: str | None = None) -> bool:
     """Send the health block. Returns False on a dead/missing webhook so the
     caller can surface THAT failure too (Actor status message)."""
-    from slack_notifier import _send_webhook
+    from slack_notifier import _send_webhook, alerts_enabled
 
     log_warnings(report)
+    if not alerts_enabled():
+        # Owner request 2026-11-11: the health block no longer posts to
+        # Slack. It still runs — full text (warnings included) goes to the
+        # log, baselines and the Actor status message are unaffected.
+        logger.info("Health report (Slack alerts off — log only):\n%s",
+                    build_health_block(report, include_warnings=True))
+        return True
     sent = _send_webhook(build_health_block(report), webhook_url)
     if sent:
         logger.info("Health report sent to Slack (%s)",
