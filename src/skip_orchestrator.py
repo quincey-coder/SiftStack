@@ -74,6 +74,9 @@ _UNSCORED_RANK = 3
 _INVALID_RANK = 6
 
 _PROVIDER_ORDER = ("SmartSkip", "DirectSkip")
+# Record tags for the vendors that ran (owner rule 2026-11-01): one per vendor
+# confirmed to have processed the record, so nobody pays to trace it twice.
+_RAN_TAG_ORDER = ("SmartSkip", "DirectSkip", "TrestleIQ")
 
 
 class OrchestratorError(RuntimeError):
@@ -116,6 +119,7 @@ class MergedRecord:
     others: list = field(default_factory=list)   # list[MergedPerson]
     emails: list = field(default_factory=list)
     providers: set = field(default_factory=set)  # any provider that returned anything
+    ran: set = field(default_factory=set)        # providers confirmed to have run on this record, hit or not
     deceased: bool = False
 
     @property
@@ -527,21 +531,28 @@ def request_approval(notices, max_cost: float, run_smartskip=True,
 
 # -- 3. run the vendors ------------------------------------------------
 
-def _run_directskip(eligible, budget) -> tuple[dict, float]:
-    """Returns ({addr_key: DirectSkipRecord}, spent)."""
+def _run_directskip(eligible, budget) -> tuple[dict, float, set]:
+    """Returns ({addr_key: DirectSkipRecord}, spent, {addr_key checked}).
+
+    A no-match is a completed check (free), so it counts as checked; a None
+    (the call failed) does not.
+    """
     client = directskip.DirectSkipClient()
-    out, spent = {}, 0.0
+    out, spent, checked = {}, 0.0, set()
     for n in eligible:
         if round(spent + DS_COST, 2) > budget:
             logger.warning("DirectSkip: budget $%.2f reached; stopping.", budget)
             break
         rec = client.search_record(n)
-        if rec is None or rec.no_match:
+        if rec is None:
+            continue
+        checked.add(_addr_key(getattr(n, "address", "")))
+        if rec.no_match:
             continue
         spent += DS_COST
         out[_addr_key(getattr(n, "address", ""))] = rec
-    logger.info("DirectSkip: %d hit(s), $%.2f", len(out), spent)
-    return out, round(spent, 2)
+    logger.info("DirectSkip: %d hit(s), %d checked, $%.2f", len(out), len(checked), spent)
+    return out, round(spent, 2), checked
 
 
 def _run_smartskip(eligible, tmp_csv, ledger: dict) -> dict:
@@ -571,12 +582,13 @@ def _run_smartskip(eligible, tmp_csv, ledger: dict) -> dict:
 
 # -- 4. merge ----------------------------------------------------------
 
-def merge_record(notice, ss_rec, ds_rec) -> MergedRecord:
+def merge_record(notice, ss_rec, ds_rec, ds_checked: bool = False) -> MergedRecord:
     owner = MergedPerson(role="owner",
                          name=(getattr(notice, "owner_name", "") or "").strip())
     # The export can carry its own deceased signal (probate lists); honour it.
     owner.deceased = bool(getattr(notice, "owner_deceased", ""))
     providers = set()
+    ran = {p for p, did in (("SmartSkip", ss_rec is not None), ("DirectSkip", ds_rec is not None or ds_checked)) if did}
 
     # Owner subject phones - union of both vendors. DirectSkip address-only
     # matches (AB1/AB2) return a DIFFERENT person, so those never go on the owner.
@@ -640,7 +652,7 @@ def merge_record(notice, ss_rec, ds_rec) -> MergedRecord:
     owner.name = _title(owner.name)   # vendors return ALL-CAPS; normalize
     emails = list(dict.fromkeys(e.lower() for e in (ds_rec.subject_emails if ds_rec else []) if e))
     return MergedRecord(notice=notice, owner=owner, others=others, emails=emails,
-                        providers=providers, deceased=owner.deceased)
+                        providers=providers, ran=ran, deceased=owner.deceased)
 
 
 # -- 5. Trestle scoring ------------------------------------------------
@@ -693,6 +705,7 @@ def apply_scores(merged, score_map) -> None:
                     mp.score = info["score"]
                     mp.valid = info["valid"]
                     mp.litigator = info["litigator"]
+                    rec.ran.add("TrestleIQ")
 
 
 # -- 6. tier-priority eviction to the phone cap ------------------------
@@ -823,8 +836,8 @@ def build_notes(rec: MergedRecord, slot_of: dict, cut: list, stamp: str) -> str:
 
 def _build_tags(rec: MergedRecord, stamp: str, over_cap: bool, no_phone: bool) -> str:
     tags = [f"skip_traced_{stamp}", "skip2"]
-    for p in _PROVIDER_ORDER:
-        if p in rec.providers:
+    for p in _RAN_TAG_ORDER:
+        if p in rec.ran:
             tags.append(p)
     tags.append("deceased" if rec.deceased else "living")
     if over_cap:
@@ -934,7 +947,7 @@ def run(notices, approval: SpendApproval,
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
     spent = 0.0
-    ds_records, ss_records = {}, {}
+    ds_records, ss_records, ds_checked = {}, {}, set()
     # Provider order (owner preference, 2026-08-20): SmartSkip runs FIRST — it
     # is the primary vendor (grounded relatives WITH relationships), DirectSkip
     # second as the per-record cross-check. Was DirectSkip-first. If SmartSkip
@@ -948,11 +961,12 @@ def run(notices, approval: SpendApproval,
             logger.error("SmartSkip failed (%s) - continuing DirectSkip-only.", e)
         spent += ledger["smartskip"]   # counted even when the order failed after paying
     if run_directskip:
-        ds_records, ds_spent = _run_directskip(eligible, budget=max(max_cost - spent, 0.0))
+        ds_records, ds_spent, ds_checked = _run_directskip(eligible, budget=max(max_cost - spent, 0.0))
         spent += ds_spent
 
     merged = [merge_record(n, ss_records.get(_addr_key(getattr(n, "address", ""))),
-                           ds_records.get(_addr_key(getattr(n, "address", ""))))
+                           ds_records.get(_addr_key(getattr(n, "address", ""))),
+                           ds_checked=_addr_key(getattr(n, "address", "")) in ds_checked)
               for n in eligible]
 
     trestle_budget = max(max_cost - spent, 0.0)

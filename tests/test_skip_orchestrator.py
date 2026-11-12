@@ -186,6 +186,34 @@ def test_write_upload_csv_slots_and_tags():
     assert row["Email 1"] == "jane@example.com"
 
 
+def _tags_for(rec):
+    import csv as _csv
+    out = _tmp("", ext="csv")
+    so.write_upload_csv([rec], out, phone_cap=30, stamp="11/2026")
+    with open(out, newline="", encoding="utf-8") as fh:
+        return next(_csv.DictReader(fh))["Tags"].split(",")
+
+
+def test_vendor_tags_mark_what_ran_including_trestle():
+    rec = so.merge_record(_notice(), _ss_record(), _ds_record())
+    so.apply_scores([rec], {"5125550101": {"tier": "Dial First", "score": 95, "valid": True, "litigator": False}})
+    tags = _tags_for(rec)
+    assert "SmartSkip" in tags and "DirectSkip" in tags and "TrestleIQ" in tags
+
+
+def test_no_trestle_tag_when_nothing_was_scored():
+    rec = so.merge_record(_notice(), _ss_record(), _ds_record())
+    so.apply_scores([rec], {})
+    assert "TrestleIQ" not in _tags_for(rec)
+
+
+def test_directskip_no_match_still_tags_directskip_but_a_failed_call_does_not():
+    checked = so.merge_record(_notice(), _ss_record(), None, ds_checked=True)
+    assert "DirectSkip" in _tags_for(checked) and "SmartSkip" in _tags_for(checked)
+    failed = so.merge_record(_notice(), _ss_record(), None, ds_checked=False)
+    assert "DirectSkip" not in _tags_for(failed)
+
+
 def test_litigator_number_withheld_from_slots_but_in_notes():
     import csv as _csv
     rec = so.merge_record(_notice(), _ss_record(), _ds_record())
