@@ -874,7 +874,12 @@ NOT upload (DataSift API is read-only — the CSV goes through the wizard).
   record-level `litigator` tag** (it would suppress the whole record).
 - **Output:** the 30-phone DataSift layout (`Property Street Address…Phone 1..30,
   Email 1..6, Tags, Notes, Owner Deceased`). Record `Tags` include `skip_traced_MM/YYYY`
-  + provider tags (`SmartSkip`/`DirectSkip` — whoever contributed) + `living`/`deceased`.
+  + vendor tags `SmartSkip` / `DirectSkip` / `TrestleIQ`, one per vendor CONFIRMED to have run
+  on that record (owner rule 2026-11-01; `MergedRecord.ran`): SmartSkip = a row came back,
+  DirectSkip = a hit OR a completed no-match (a failed call doesn't count), TrestleIQ = at least
+  one of the record's numbers was scored + `living`/`deceased`. Any later wizard pass that sets
+  record tags must carry these too (the 11-01 Pass A files dropped them; fixed with a
+  "Tagging existing properties" pass).
   Per-number tier/provider/relative labels live in **Notes** (the guaranteed channel;
   DataSift appends behind existing phones, so labels are number-keyed, never slot-keyed).
 - **CLI:** `python src/skip_orchestrator.py estimate --input export.csv [--max-cost N]`
@@ -1318,10 +1323,11 @@ the whole account on 2026-07-14.
 - `test_manage_presets.py` — Headed browser test (preset discovery + sold exclusion + sequence creation)
 - `test_manage_sold.py` — Headed browser test (SiftMap sold property tagging)
 
-### CSV Column Structure (64 columns)
+### CSV Column Structure (63 columns)
 - **Core auto-mapped (11):** Property Street/City/State/ZIP, Owner First/Last Name, Mailing Street/City/State/ZIP, Tags
 - **Lists + Notes (2):** Lists (for niche sequential), Notes (contextual per notice type)
-- **Uploadable fields:** MSL Status, Assessed Value (County), Assessed Value Year, Back Taxes Amount, Years Delinquent, Tax Auction Date, Foreclosure Date, Probate Open Date, Personal Representative, APN
+- **Uploadable fields:** MSL Status, Assessed Value (County), Assessed Value Year, Back Taxes Amount, Years Delinquent, Tax Auction Date, Foreclosure Date, Probate Open Date, Personal Representative
+- **NO APN column (removed 2026-11-12 — do not add it back).** A row whose APN differs from the APN DataSift holds for that address makes the wizard create a SECOND record instead of merging (41 of 43 such rows; 0 of 41 with a blank or equal APN). Travis rows carried the county geo ID (14 digits) while DataSift stores the TCAD property ID. DataSift fills its own APN on import. Older CSVs that still have the column are protected by `datasift_uploader.WIZARD_BLANKED_COLUMNS` / `NEVER_MAPPED_COLUMNS`. Check uploads by counting records PER ADDRESS.
 - **Custom fields:** Notice Type, County, Date Added, Owner Deceased, Date of Death, Decedent Name, Decision Maker, DM Relationship, DM Confidence, DM 2/3 Name/Relationship, Obituary URL, Source URL
 
 **The wizard has only 253 drop targets, and columns without one are DISCARDED

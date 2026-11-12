@@ -13,6 +13,7 @@ import hashlib
 import logging
 import os
 import re
+import tempfile
 from pathlib import Path
 
 import config
@@ -28,6 +29,39 @@ from datasift_core import (
 logger = logging.getLogger(__name__)
 
 DATASIFT_UPLOAD_URL = "https://app.reisift.io/records/properties"
+
+
+# ── What the wizard is NOT told ───────────────────────────────────────
+#
+# APN. On "Add data" DataSift matches an uploaded row to an existing property
+# by address — UNLESS the row carries an APN that differs from the APN
+# DataSift holds for that address. Then it creates a SECOND record at the same
+# address, and its auto-enrichment overwrites the new record's APN with its
+# own, so the two copies end up identical in every stored field.
+# Measured 2026-11-12 on 84 uploaded rows whose address was already in the
+# account (batches 10-21 … 11-12, read-only before/after forensics):
+#     APN blank in the CSV ......... 21 merged,  0 duplicated
+#     APN equal to DataSift's ...... 20 merged,  0 duplicated
+#     APN different ................  2 merged, 41 duplicated
+# The owner columns made no difference. Travis rows carry the county geo ID
+# (14 digits, "02437207140000") while DataSift stores the TCAD property ID
+# ("710654"), so nearly every Travis row that hit an existing address
+# duplicated — since 2026-08-11, when the APN column first got mapped.
+#
+# Since 2026-11-12 the formatter no longer writes an APN column at all (owner
+# decision), so a CSV created today has nothing to withhold. These two guards
+# are for every file written BEFORE that — on Drive, in output/, re-sent
+# through upload_only or a manual batch:
+#   1. the wizard is sent a copy with the APN VALUES emptied (a blank APN is
+#      the case that merged 21/21), and
+#   2. the APN column is never dragged onto DataSift's APN field.
+WIZARD_BLANKED_COLUMNS: tuple[str, ...] = ("APN",)
+NEVER_MAPPED_COLUMNS = frozenset({"apn"})          # compared lower-cased: "APN", "Apn", "apn"
+
+
+def _never_mapped(name: str) -> bool:
+    return (name or "").strip().lower() in NEVER_MAPPED_COLUMNS
+_WIZARD_TMP: tempfile.TemporaryDirectory | None = None
 
 
 async def _click_next_step(page: Page, timeout: int = 20000) -> bool:
@@ -94,6 +128,7 @@ async def upload_csv(
     existing_list: bool = False,
     do_finish: bool = True,
     update_option: str = "",
+    blank_columns: tuple[str, ...] | None = WIZARD_BLANKED_COLUMNS,
 ) -> dict:
     """Upload a CSV file to DataSift via the 7-step upload wizard.
 
@@ -113,6 +148,10 @@ async def upload_csv(
         list_name: Target list name. Required when existing_list=True.
         existing_list: If True, select "Adding properties to an existing list"
             instead of creating a new list. The list must already exist in DataSift.
+        blank_columns: Columns whose values are withheld from the wizard in
+            "add" mode (default: APN — a mismatching APN makes DataSift create
+            a duplicate record). The file on disk is not changed. Pass None to
+            send the file exactly as it is.
 
     Returns:
         Dict with upload results: {success, records_uploaded, errors, message}
@@ -266,7 +305,19 @@ async def upload_csv(
                 result["message"] = "Upload-file step reached but no file input present"
                 logger.error(result["message"])
                 return result
-            await fi.first.set_input_files(str(csv_path))
+            # "Add data" creates/merges property records: withhold the APN
+            # values so DataSift matches on the address (see
+            # WIZARD_BLANKED_COLUMNS). Update-mode passes are left as they are.
+            send_path, withheld = (
+                _wizard_copy(csv_path, blank_columns) if mode == "add" else (csv_path, 0)
+            )
+            result["apn_values_withheld"] = withheld
+            if withheld:
+                logger.info(
+                    "Sending the wizard a copy with %d %s value(s) left empty "
+                    "(a mismatching APN makes DataSift create a duplicate record)",
+                    withheld, "/".join(blank_columns or ()))
+            await fi.first.set_input_files(str(send_path))
             for _ in range(30):
                 await page.wait_for_timeout(1000)
                 if (await page.locator('text="File uploaded!"').count() > 0
@@ -684,7 +735,12 @@ async def _map_wizard_columns(page: Page) -> tuple[list[str], list[str]]:
     # the rest appears as cards are consumed. One pass left Phone 8 Tags..15
     # unmapped, so keep passing until a pass maps nothing.
     for _pass in range(6):
-        pending = [n for n in await _unmapped_column_names(page) if n not in no_target]
+        left = await _unmapped_column_names(page)
+        withheld = [n for n in left if _never_mapped(n)]
+        if withheld and _pass == 0:
+            logger.info("  %s: left unmapped on purpose (a mismatching APN makes DataSift "
+                        "create a duplicate record)", withheld)
+        pending = [n for n in left if n not in no_target and not _never_mapped(n)]
         if not pending:
             break
         before = len(mapped)
@@ -729,6 +785,8 @@ async def _map_wizard_columns(page: Page) -> tuple[list[str], list[str]]:
                 await _drag_card(page, src.first, dst.first)
         # anything knocked back to the left list gets placed by name again
         for name in await _unmapped_column_names(page):
+            if _never_mapped(name):
+                continue
             s = page.locator(f'{_FOREIGN_NAME}:text-is("{name}")')
             t = page.locator(f'{_OWN_NAME}:text-is("{name}")')
             if await s.count() and await t.count():
@@ -737,6 +795,10 @@ async def _map_wizard_columns(page: Page) -> tuple[list[str], list[str]]:
     pairs = await _mapping_pairs(page)
     logger.info("Mapping check: %d fields read, %d with a column mapped; sample %s",
                 len(pairs), sum(1 for _, g in pairs if g), [p for p in pairs if p[1]][:4])
+    auto_mapped = [(own, got) for own, got in pairs if _never_mapped(got)]
+    if auto_mapped:
+        logger.warning("DataSift mapped %s by itself — the file sent has those values emptied, "
+                       "so nothing reaches the field", auto_mapped)
     mismatched = [(own, got) for own, got in pairs if not _mapping_ok(own, got)]
     if mismatched:
         logger.error("Columns still under the WRONG field after repair: %s", mismatched)
@@ -1513,6 +1575,60 @@ def _csv_sha256(path) -> str:
         return hashlib.sha256(Path(path).read_bytes()).hexdigest()
     except OSError:
         return ""
+
+
+def _wizard_copy(csv_path, columns: tuple[str, ...] | None = WIZARD_BLANKED_COLUMNS) -> tuple[Path, int]:
+    """The file the wizard is given: ``csv_path`` itself, or a copy (same file
+    name, temp folder) with every value of ``columns`` emptied.
+
+    Returns ``(path_to_send, values_emptied)``. The original is returned
+    untouched when there is nothing to empty, or when the file cannot be
+    parsed and rewritten faithfully (same rows, same other cells) — an upload
+    is never blocked or altered by a failed copy; the failure is logged.
+    """
+    global _WIZARD_TMP
+    csv_path = Path(csv_path)
+    if not columns:
+        return csv_path, 0
+    try:
+        csv.field_size_limit(max(csv.field_size_limit(), 10_000_000))
+        with open(csv_path, newline="", encoding="utf-8-sig") as f:
+            rows = list(csv.reader(f))
+        if not rows:
+            return csv_path, 0
+        wanted = {c.strip().lower() for c in columns}
+        idx = [i for i, h in enumerate(rows[0]) if (h or "").strip().lower() in wanted]
+        emptied = 0
+        out = [rows[0]]
+        for row in rows[1:]:
+            row = list(row)
+            for i in idx:
+                if i < len(row) and (row[i] or "").strip():
+                    row[i] = ""
+                    emptied += 1
+            out.append(row)
+        if not emptied:
+            return csv_path, 0
+        if _WIZARD_TMP is None:
+            _WIZARD_TMP = tempfile.TemporaryDirectory(prefix="ds_wizard_")
+        dest_dir = Path(tempfile.mkdtemp(dir=_WIZARD_TMP.name))
+        dest = dest_dir / csv_path.name
+        with open(dest, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerows(out)
+        # Prove the copy differs from the original ONLY in the emptied cells.
+        with open(dest, newline="", encoding="utf-8") as f:
+            back = list(csv.reader(f))
+        if len(back) != len(rows) or any(
+            len(a) != len(b) or any(x != y for i, (x, y) in enumerate(zip(a, b)) if i not in idx)
+            for a, b in zip(rows, back)
+        ):
+            raise ValueError("the wizard copy does not match the original outside the emptied columns")
+        return dest, emptied
+    except Exception:
+        logger.exception(
+            "Could not build the wizard copy of %s — uploading the original file "
+            "(rows whose APN differs from DataSift's may create duplicate records)", csv_path.name)
+        return csv_path, 0
 
 
 def _csv_data_rows(path) -> int | None:

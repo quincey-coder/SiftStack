@@ -122,7 +122,7 @@ if WRITE:
                 "FULL NAME/COMPANY/TRUST": r["company"], "Owner First Name": r["first"], "Owner Last Name": r["last"],
                 "Mailing Street Address": r["m_street"], "Mailing City": r["m_city"], "Mailing State": r["m_state"], "Mailing ZIP Code": r["m_zip"],
                 "Tags": ",".join(tags), "Lists": "", "Notes": note,
-                "Foreclosure Date": _format_date(str(r["sale_date"])), "APN": r["apn"],
+                "Foreclosure Date": _format_date(str(r["sale_date"])),   # no APN column: a mismatching APN duplicates the record
                 "Notice Type": r["notice_type"], "County": county if county in ("Travis","Bell","Williamson") else "",
             })
             w.writerow(row)

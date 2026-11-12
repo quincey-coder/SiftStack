@@ -78,7 +78,13 @@ DATASIFT_COLUMNS = [
     "Foreclosure Date",
     "Probate Open Date",
     "Personal Representative",
-    "APN",                      # was "Parcel ID" — DataSift's target is APN
+    # NO "APN" COLUMN (removed 2026-11-12, owner decision). A row whose APN
+    # differs from the APN DataSift holds for that address makes DataSift
+    # create a SECOND record there instead of merging (41 of 43 such rows;
+    # 0 of 41 rows with a blank or equal APN). Travis rows carried the county
+    # geo ID (14 digits) while DataSift stores the TCAD property ID, so they
+    # duplicated on every repeat. DataSift fills its own APN on import. The
+    # parcel ID still lives on NoticeData.parcel_id — do not add it back here.
     # ── Custom fields ("Deceased & Heir Intelligence" group) ──
     # Headers MUST match the DataSift custom-field labels 1:1
     # (deceased_heir_fields.json) — upload auto-maps on exact label match.
@@ -1511,7 +1517,7 @@ def _build_row(
         "Foreclosure Date": foreclosure_date,
         "Probate Open Date": probate_open,
         "Personal Representative": personal_rep,
-        "APN": notice.parcel_id,
+        # (no APN — see DATASIFT_COLUMNS: a mismatching APN duplicates the record)
         # ── Custom fields ("Deceased & Heir Intelligence" group) ──
         # Headers match the custom-field labels 1:1; select values must be
         # exact option labels (case-sensitive match on import).

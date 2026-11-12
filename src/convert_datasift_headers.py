@@ -68,6 +68,11 @@ _MERGES = {
 
 _MERGE_SOURCES = {c for pair in _MERGES.values() for c in pair}
 
+# Dropped on purpose, never carried into a converted file and not a "loss":
+# an APN that differs from DataSift's makes an upload create a duplicate record
+# (2026-11-12). "Parcel ID" is the same column under its pre-08-11 name.
+_RETIRED = {"APN", "Parcel ID"}
+
 
 def _merge(name: str, rel: str) -> str:
     """_name_rel, but a relationship/role with no name still survives."""
@@ -80,7 +85,7 @@ def _merge(name: str, rel: str) -> str:
 def convert_row(old: dict) -> dict:
     new = {c: "" for c in DATASIFT_COLUMNS}
     for k, v in old.items():
-        if k is None or k in _MERGE_SOURCES or k in _NORMALIZED:
+        if k is None or k in _MERGE_SOURCES or k in _NORMALIZED or k in _RETIRED:
             continue
         target = _RENAMES.get(k, k)
         if target in new:
@@ -97,7 +102,7 @@ def _audit_row(old: dict, new: dict, path: str, idx: int) -> list[str]:
     """Return loss descriptions for any non-empty old cell absent from its target."""
     losses = []
     for k, v in old.items():
-        if k is None or not (v or "").strip():
+        if k is None or not (v or "").strip() or k in _RETIRED:
             continue
         if k in _NORMALIZED:
             target = _NORMALIZED[k][0]

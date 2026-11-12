@@ -174,6 +174,15 @@ def _norm_header(cols: list[str]) -> list[str]:
     return [_HEADER_ALIASES.get(c, c) for c in cols]
 
 
+# Columns we used to write and no longer do. An archived CSV that still has
+# one passes header parity with a WARN instead of an ERROR; a file written
+# today never has it. "APN" (and its older name "Parcel ID") was retired
+# 2026-11-12: an APN that differs from DataSift's makes the upload create a
+# duplicate record. The uploader empties its values before the wizard sees
+# them, so an old file is still safe to send.
+_RETIRED_COLUMNS = frozenset({"APN"})
+
+
 # ── column resolution across the two known schemas ──────────────────────
 def _resolve_columns(header: list[str]) -> dict[str, str | None]:
     """Map logical field → actual header name present in this file (or None)."""
@@ -243,10 +252,18 @@ def validate_file(path: Path) -> FileReport:
 
     # ---- header parity for DataSift-format files ----
     canon = _canonical_datasift_columns()
-    hnorm = _norm_header(header)
+    retired = [c for c in header if _norm_header([c])[0] in _RETIRED_COLUMNS]
+    hnorm = [c for c in _norm_header(header) if c not in _RETIRED_COLUMNS]
+    if fr.schema == "datasift" and retired:
+        fr.findings.append(Finding(
+            WARN, "retired_column",
+            f"File still has the retired column(s) {retired} — written before 2026-11-12. "
+            "The uploader withholds the APN values (a mismatching APN duplicates the record).",
+        ))
     if fr.schema == "datasift" and canon is not None and hnorm != canon:
         missing = [c for c in canon if c not in hnorm]
-        extra = [_norm_header([c])[0] for c in header if _norm_header([c])[0] not in canon]
+        extra = [_norm_header([c])[0] for c in header
+                 if _norm_header([c])[0] not in canon and _norm_header([c])[0] not in _RETIRED_COLUMNS]
         detail = []
         if missing:
             detail.append(f"missing {len(missing)}: {missing[:5]}")

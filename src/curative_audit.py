@@ -3329,7 +3329,9 @@ def stage_score(out_dir: Path | None = None) -> Path:
     # Wizard CSVs: Notes + tags onto each record's EXISTING tax list (A/B only).
     hdr_up = ["Property Street Address", "Property City", "Property State", "Property ZIP Code",
               "Owner First Name", "Owner Last Name", "Mailing Street Address", "Mailing City",
-              "Mailing State", "Mailing ZIP Code", "Tags", "Notes", "APN"]
+              "Mailing State", "Mailing ZIP Code", "Tags", "Notes"]
+    # No APN column: an APN that differs from DataSift's makes the wizard
+    # create a duplicate record instead of merging (see datasift_formatter).
     fresh = OUT_PREFIX.endswith("FRESH")
     batch = "Curative Fresh Wk1" if fresh else "Curative Wk1"   # fresh rows CREATE records: their own batch tag
     by_list: dict[str, list] = {}
@@ -3345,7 +3347,7 @@ def stage_score(out_dir: Path | None = None) -> Path:
             rec["street"], rec["city"], "TX", rec["zip5"],
             rec["owner_first"] or "", rec["owner_last"] or rec["owner_company"] or "",
             m.get("street") or "", m.get("city") or "", m.get("state") or "", m.get("zip5") or "",
-            f"{batch},curative_{a['tier']}" + (",curative_top100" if is_top else ""), a["notes"], rec["apn"]])
+            f"{batch},curative_{a['tier']}" + (",curative_top100" if is_top else ""), a["notes"]])
     for lst, rs in by_list.items():
         p = out_dir / (f"{batch.replace(' ', '_')}_UPLOAD_{lst.replace(' ', '_')}.csv" if "review" not in lst
                        else f"{batch.replace(' ', '_')}_{lst}.csv")
