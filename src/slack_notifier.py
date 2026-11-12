@@ -10,6 +10,7 @@ Discord webhook URLs should use the /slack suffix:
 import logging
 import os
 from datetime import datetime
+from pathlib import Path
 
 import requests
 
@@ -307,6 +308,12 @@ def build_rawpipe_block(
     drive_by_label: dict[str, str] = {
         d["label"]: d["url"] for d in (drive_links or []) if d.get("label") and d.get("url")
     }
+    # The file name is the exact match. Labels repeat when the county split
+    # writes several CSVs for one list (Bell + Travis Foreclosure), so a label
+    # lookup would hand both entries the same link.
+    drive_by_file: dict[str, str] = {
+        d["filename"]: d["url"] for d in (drive_links or []) if d.get("filename") and d.get("url")
+    }
 
     # Group notices by notice_type → list_name so we can show addresses
     # per uploaded list.
@@ -325,14 +332,24 @@ def build_rawpipe_block(
         f"*{title}:* {len(ok)}/{len(rawpipe_results)} "
         f"list(s) succeeded · {total_records} record(s) total"
     ]
+    not_resent = sum(1 for r in ok if r.get("resumed"))
+    if not_resent:
+        lines[0] += f" · {not_resent} file(s) not sent again (already landed before a host restart)"
 
     for r in ok:
         list_name = r.get("list_name", "?")
         uuid = r.get("list_uuid")
         url = DATASIFT_LIST_URL_TMPL.format(uuid=uuid) if uuid else DATASIFT_LIST_URL_FALLBACK
         records = r.get("line_count", "?")
+        county = (r.get("county") or "").strip()
+        shown = f"{list_name} ({county})" if county else list_name
         lines.append("")
-        lines.append(f"*<{url}|{list_name}>* — {records} record(s)")
+        lines.append(f"*<{url}|{shown}>* — {records} record(s)")
+        if r.get("resumed"):
+            lines.append("  :repeat: not sent again — this exact file already landed "
+                         "earlier in this run, before a host restart")
+        if r.get("skipped_empty"):
+            lines.append("  :heavy_minus_sign: empty file — nothing to send")
 
         # Skip-trace status (if it was triggered)
         st = r.get("skip_trace") or {}
@@ -345,12 +362,16 @@ def build_rawpipe_block(
                 lines.append(f"  ✗ skip-trace failed: {str(st.get('error', ''))[:80]}")
 
         # Drive CSV link (if uploaded to Drive)
-        drive_url = drive_by_label.get(list_name)
+        fname = r.get("filename") or ""
+        drive_url = drive_by_file.get(fname) if fname else drive_by_label.get(list_name)
         if drive_url:
-            lines.append(f"  :bookmark: Full CSV in Drive: <{drive_url}|{list_name}.csv>")
+            lines.append(f"  :bookmark: Full CSV in Drive: <{drive_url}|{fname or list_name + '.csv'}>")
 
-        # Per-record address sample
+        # Per-record address sample (this CSV's county only, when it has one)
         list_notices = notices_by_list.get(list_name, [])
+        if county:
+            list_notices = [n for n in list_notices
+                            if (getattr(n, "county", "") or "").strip().lower() == county.lower()]
         for n in list_notices[:max_addresses]:
             addr_parts = [
                 p for p in [n.address, n.city, n.state, (n.zip or "")[:5]]
@@ -369,9 +390,11 @@ def build_rawpipe_block(
 
     for r in fail:
         list_name = r.get("list_name", "?")
+        county = (r.get("county") or "").strip()
+        shown = f"{list_name} ({county})" if county else list_name
         err = str(r.get("error") or r.get("message") or "unknown error")[:120]
         lines.append("")
-        lines.append(f"  ✗ `{list_name}` — {err}")
+        lines.append(f"  ✗ `{shown}` — {err}")
 
     return "\n".join(lines)
 
@@ -405,13 +428,20 @@ def build_datasift_upload_block(
     stopped_after = ""
     for i, info in enumerate(csv_infos):
         ln = info.get("list_name") or info.get("label") or "?"
+        # Which CSV this is — the county and file name tell two CSVs for the
+        # same list apart (Bell Foreclosure vs Travis Foreclosure).
+        which = {"county": info.get("county") or "",
+                 "filename": Path(str(info["path"])).name if info.get("path") else ""}
         if i < len(uploads):
             r = uploads[i]
             ok = bool(r.get("success"))
             entries.append({
+                **which,
                 "label": info.get("label", ln), "list_name": ln, "success": ok,
                 "line_count": info.get("count"),
                 "error": "" if ok else (r.get("message") or "upload failed"),
+                "resumed": bool(ok and r.get("resumed")),
+                "skipped_empty": bool(ok and r.get("skipped_empty")),
             })
             if not ok:
                 stopped_after = str(info.get("label", ln))
@@ -420,6 +450,7 @@ def build_datasift_upload_block(
             if stopped_after:
                 reason = f"not attempted — uploader stopped after the {stopped_after} failure"
             entries.append({
+                **which,
                 "label": info.get("label", ln), "list_name": ln, "success": False,
                 "line_count": info.get("count"), "error": reason,
             })

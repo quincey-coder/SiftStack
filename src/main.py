@@ -538,23 +538,38 @@ async def _actor_wizard_upload(
     # runs, 09-17..09-19). Progress lives in THIS RUN's default
     # KVS — it survives the migration, never touches cross-run
     # state — so a restart skips CSVs/bulk actions already done.
+    # The record names each uploaded CSV by its target list + content hash
+    # (datasift_uploader.read_upload_progress) — NOT by label: two CSVs for
+    # the same list (Bell + Travis Foreclosure) are two separate entries.
     _UP_PROGRESS_KEY = "DATASIFT_UPLOAD_PROGRESS"
+    _run_id = os.environ.get("APIFY_ACTOR_RUN_ID", "")
     _up_resume: dict = {}
     try:
+        from datasift_uploader import read_upload_progress
         _saved = await Actor.get_value(_UP_PROGRESS_KEY)
-        if isinstance(_saved, dict) and _saved.get("batch_tag") == batch_tag:
-            _up_resume = _saved
-            Actor.log.warning(
-                "DataSift upload: resuming after a restart — %d CSV(s) already "
-                "uploaded, enrich_done=%s, skip_trace_done=%s",
-                len(_saved.get("uploaded") or {}),
-                bool(_saved.get("enrich_done")), bool(_saved.get("skip_trace_done")),
-            )
+        if _saved is not None:
+            if isinstance(_saved, dict) and _saved.get("run_id", _run_id) != _run_id:
+                Actor.log.warning(
+                    "DataSift upload: ignoring upload progress saved by another run (%r)",
+                    _saved.get("run_id"),
+                )
+            else:
+                _prior = read_upload_progress(_saved, batch_tag)
+                if _prior["uploaded"] or _prior["enrich_done"] or _prior["skip_trace_done"]:
+                    _up_resume = _saved
+                    Actor.log.warning(
+                        "DataSift upload: resuming after a restart — %d CSV(s) already "
+                        "uploaded (%s), enrich_done=%s, skip_trace_done=%s",
+                        len(_prior["uploaded"]),
+                        ", ".join(f"{e['file'] or '?'} -> {e['list_name']}" for e in _prior["uploaded"]),
+                        _prior["enrich_done"], _prior["skip_trace_done"],
+                    )
     except Exception:
         Actor.log.exception("Could not read upload progress (uploading everything)")
+        _up_resume = {}
 
     async def _save_upload_progress(state: dict) -> None:
-        await Actor.set_value(_UP_PROGRESS_KEY, {**state, "batch_tag": batch_tag})
+        await Actor.set_value(_UP_PROGRESS_KEY, {**state, "batch_tag": batch_tag, "run_id": _run_id})
 
     try:
         from datasift_uploader import upload_datasift_split

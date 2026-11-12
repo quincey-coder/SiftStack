@@ -85,6 +85,15 @@ def _infos(tmp_path, names=("Foreclosure", "Probate", "Liens")):
     return infos
 
 
+def _done(*infos, **flags):
+    """Saved progress (current format) saying these CSVs already landed."""
+    return {"version": up.UPLOAD_PROGRESS_VERSION,
+            "uploaded": [{"list_name": i["list_name"], "sha256": up._csv_sha256(i["path"]),
+                          "file": Path(i["path"]).name, "label": i["label"], "rows": 1}
+                         for i in infos],
+            **flags}
+
+
 def _run(infos, **kw):
     saved = []
 
@@ -111,7 +120,7 @@ def test_progress_is_reported_after_each_csv_and_bulk_action(tmp_path, monkeypat
 def test_restart_skips_identical_csvs_and_finishes_the_rest(tmp_path, monkeypatch):
     infos = _infos(tmp_path)
     calls = _stub(monkeypatch)
-    resume = {"uploaded": {"Foreclosure": up._csv_sha256(infos[0]["path"])}}
+    resume = _done(infos[0])
     res, saved = _run(infos, resume=resume)
     assert calls["upload"] == ["Probate", "Liens"]
     assert res["success"] and len(res["uploads"]) == 3
@@ -124,7 +133,8 @@ def test_restart_skips_identical_csvs_and_finishes_the_rest(tmp_path, monkeypatc
 def test_changed_csv_is_reuploaded_not_skipped(tmp_path, monkeypatch):
     infos = _infos(tmp_path)
     calls = _stub(monkeypatch)
-    resume = {"uploaded": {"Foreclosure": "0" * 64}}  # hash from a different re-scrape
+    resume = {"version": up.UPLOAD_PROGRESS_VERSION,  # hash from a different re-scrape
+              "uploaded": [{"list_name": "Foreclosure", "sha256": "0" * 64}]}
     _run(infos, resume=resume)
     assert calls["upload"] == ["Foreclosure", "Probate", "Liens"]
 
@@ -132,8 +142,7 @@ def test_changed_csv_is_reuploaded_not_skipped(tmp_path, monkeypatch):
 def test_fully_completed_run_never_opens_a_browser(tmp_path, monkeypatch):
     infos = _infos(tmp_path)
     calls = _stub(monkeypatch)
-    resume = {"uploaded": {i["label"]: up._csv_sha256(i["path"]) for i in infos},
-              "enrich_done": True, "skip_trace_done": True}
+    resume = _done(*infos, enrich_done=True, skip_trace_done=True)
     res, saved = _run(infos, resume=resume)
     assert res["success"] and res["resumed"] is True
     assert calls == {"upload": [], "enrich": 0, "skip": 0, "login": 0}
@@ -144,8 +153,7 @@ def test_fully_completed_run_never_opens_a_browser(tmp_path, monkeypatch):
 def test_restart_after_uploads_only_reruns_the_missing_bulk_action(tmp_path, monkeypatch):
     infos = _infos(tmp_path)
     calls = _stub(monkeypatch)
-    resume = {"uploaded": {i["label"]: up._csv_sha256(i["path"]) for i in infos},
-              "enrich_done": True}
+    resume = _done(*infos, enrich_done=True)
     res, saved = _run(infos, resume=resume)
     assert calls["upload"] == [] and calls["enrich"] == 0 and calls["skip"] == 1
     assert res["enrich_result"]["resumed"] is True
@@ -162,7 +170,7 @@ def test_failed_csv_is_not_marked_uploaded(tmp_path, monkeypatch):
     calls = _stub(monkeypatch, fail_label="Probate")
     res, saved = _run(_infos(tmp_path))
     assert res["success"] is False
-    assert list(saved[-1]["uploaded"]) == ["Foreclosure"]
+    assert [e["label"] for e in saved[-1]["uploaded"]] == ["Foreclosure"]
     assert calls["enrich"] == 0 and calls["skip"] == 0
 
 
@@ -170,7 +178,8 @@ def test_unreadable_csv_is_never_treated_as_uploaded(tmp_path, monkeypatch):
     calls = _stub(monkeypatch)
     infos = [{"path": tmp_path / "missing.csv", "label": "Foreclosure",
               "list_name": "Foreclosure", "count": 1}]
-    _run(infos, resume={"uploaded": {"Foreclosure": ""}})
+    _run(infos, resume={"version": up.UPLOAD_PROGRESS_VERSION,
+                        "uploaded": [{"list_name": "Foreclosure", "sha256": ""}]})
     assert calls["upload"] == ["Foreclosure"]
 
 

@@ -8,6 +8,7 @@ DataSift has no public REST API, so we automate the web UI:
 Requires: DATASIFT_EMAIL and DATASIFT_PASSWORD in .env or environment.
 """
 
+import csv
 import hashlib
 import logging
 import os
@@ -468,8 +469,11 @@ async def _fill_wizard_setup(page: Page, mode: str, list_name: str | None,
         # The existing-list option's full label is "Adding properties to an
         # existing list inside DataSift" (verified live 2026-08-23), so an
         # exact-text match misses it — match on the stable prefix instead.
-        option = ("Adding properties to an existing list" if existing_list
-                  else "Uploading a new list not in DataSift yet")
+        # ``update_option`` in add mode overrides the dropdown choice, e.g.
+        # "Swap owner of an existing property" (rename an existing record's
+        # owner without creating a new record).
+        option = update_option or ("Adding properties to an existing list" if existing_list
+                                   else "Uploading a new list not in DataSift yet")
         opt = page.locator(f'[class*="SelectOptionContainer"]:has-text("{option}")')
         if await opt.count() == 0:
             opt = page.locator(f'text={option}')
@@ -1511,6 +1515,80 @@ def _csv_sha256(path) -> str:
         return ""
 
 
+def _csv_data_rows(path) -> int | None:
+    """Data rows in an upload CSV (header excluded). None when the file cannot
+    be read or parsed — the caller then treats it as non-empty and uploads it,
+    so a file is only ever called empty when it provably has no data row."""
+    try:
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            lines = sum(1 for row in csv.reader(f) if any((c or "").strip() for c in row))
+    except (OSError, UnicodeError, csv.Error):
+        return None
+    return max(lines - 1, 0)
+
+
+# ── Restart progress (what survives an Apify host migration) ─────────
+#
+# Saved by the caller after every CSV that lands; read back when the run
+# restarts from scratch. Version 2 (2026-11-12) identifies an uploaded CSV by
+# its TARGET LIST + CONTENT HASH. Version 1 keyed the book by the CSV label,
+# and county-split CSVs share one label ("Foreclosure" for Bell and for
+# Travis): the Bell upload marked the Travis file as done, and the Travis
+# file was never sent (run SVzz7yneq1ksLWijD). A version-1 record even holds
+# the wrong file's hash, so it is discarded, never converted.
+UPLOAD_PROGRESS_VERSION = 2
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def read_upload_progress(saved, batch_tag: str | None = None) -> dict:
+    """Validate saved upload progress.
+
+    Returns ``{"uploaded": [{"list_name", "sha256", "file", "label", "rows"}],
+    "enrich_done": bool, "skip_trace_done": bool}``. Anything that is not
+    exactly a current-version record for this batch tag comes back empty —
+    the safe direction is always to upload again (DataSift merges by address).
+    """
+    empty = {"uploaded": [], "enrich_done": False, "skip_trace_done": False}
+    if not saved:
+        return empty
+    if not isinstance(saved, dict):
+        logger.warning("Upload progress ignored: not a record (%s) — uploading every CSV",
+                       type(saved).__name__)
+        return empty
+    if saved.get("version") != UPLOAD_PROGRESS_VERSION:
+        logger.warning(
+            "Upload progress ignored: format version %r, expected %r — uploading every CSV",
+            saved.get("version"), UPLOAD_PROGRESS_VERSION)
+        return empty
+    if "batch_tag" in saved and saved["batch_tag"] != batch_tag:
+        logger.warning("Upload progress ignored: it belongs to batch tag %r, this upload is %r",
+                       saved["batch_tag"], batch_tag)
+        return empty
+    entries = saved.get("uploaded")
+    if not isinstance(entries, list):
+        logger.warning("Upload progress ignored: 'uploaded' is not a list — uploading every CSV")
+        return empty
+    uploaded: list[dict] = []
+    for e in entries:
+        if (
+            isinstance(e, dict)
+            and isinstance(e.get("list_name"), str) and e["list_name"]
+            and isinstance(e.get("sha256"), str) and _SHA256_RE.match(e["sha256"])
+        ):
+            uploaded.append({
+                "list_name": e["list_name"], "sha256": e["sha256"],
+                "file": str(e.get("file") or ""), "label": str(e.get("label") or ""),
+                "rows": e.get("rows") if isinstance(e.get("rows"), int) else None,
+            })
+        else:
+            logger.warning("Upload progress: dropped a malformed entry (%r)", e)
+    return {
+        "uploaded": uploaded,
+        "enrich_done": saved.get("enrich_done") is True,
+        "skip_trace_done": saved.get("skip_trace_done") is True,
+    }
+
+
 async def upload_datasift_split(
     csv_infos: list[dict],
     email: str | None = None,
@@ -1548,65 +1626,25 @@ async def upload_datasift_split(
         launch_args: Extra Chromium args (the Actor passes --no-sandbox).
         resume: Progress from an earlier attempt IN THE SAME RUN (the Actor
             restarts from scratch when Apify migrates it to a new host):
-            ``{"uploaded": {label: sha256}, "enrich_done", "skip_trace_done"}``.
-            A CSV is skipped only when its label AND content hash match — a
-            re-scrape that changed the file re-uploads it (DataSift merges by
-            address), so no row is lost. Bulk-action flags apply to the
-            batch-tag path only.
+            the record ``on_progress`` was handed (see
+            ``read_upload_progress``). A CSV is skipped only when a CSV with
+            the same TARGET LIST and the same CONTENT HASH is in that record —
+            never because of its label, its position, or anything uploaded
+            during this call. A re-scrape that changed the file re-uploads it
+            (DataSift merges by address), so no row is lost. Bulk-action
+            flags apply to the batch-tag path only, and are dropped as soon
+            as this call uploads a CSV (new rows need the bulk action again).
         on_progress: ``async fn(state_dict)`` called after every CSV that
             lands and every bulk action that succeeds, so the caller can
             persist the state ``resume`` reads back.
 
     Returns:
-        Dict with per-upload results, enrich_result, and skip_trace_result.
+        Dict with per-upload results (``uploads``, index-aligned with
+        ``csv_infos`` up to the point the uploader stopped), ``counts``,
+        enrich_result, and skip_trace_result.
     """
     email = email or os.environ.get("DATASIFT_EMAIL", "")
     password = password or os.environ.get("DATASIFT_PASSWORD", "")
-
-    state = {
-        "uploaded": dict((resume or {}).get("uploaded") or {}),
-        "enrich_done": bool((resume or {}).get("enrich_done")),
-        "skip_trace_done": bool((resume or {}).get("skip_trace_done")),
-    }
-
-    async def _report_progress() -> None:
-        if on_progress is None:
-            return
-        try:
-            await on_progress(dict(state, uploaded=dict(state["uploaded"])))
-        except Exception:
-            logger.exception("upload progress callback failed (upload continues)")
-
-    hashes = {str(info["label"]): _csv_sha256(info["path"]) for info in csv_infos}
-
-    def _already_uploaded(label: str) -> bool:
-        return bool(hashes.get(label)) and state["uploaded"].get(label) == hashes[label]
-
-    _resumed_msg = "already uploaded earlier in this run (before a host restart)"
-    if (
-        csv_infos and batch_tag
-        and all(_already_uploaded(str(i["label"])) for i in csv_infos)
-        and (not enrich or state["enrich_done"])
-        and (not skip_trace or state["skip_trace_done"])
-    ):
-        logger.info("DataSift upload already completed earlier in this run — nothing to redo")
-        return {
-            "success": True,
-            "resumed": True,
-            "uploads": [
-                {"success": True, "label": i["label"], "resumed": True, "message": _resumed_msg}
-                for i in csv_infos
-            ],
-            "message": f"All {len(csv_infos)} CSVs + bulk actions already done before a host restart",
-            "batch_tag": batch_tag,
-        }
-
-    if not email or not password:
-        return {
-            "success": False,
-            "message": "DATASIFT_EMAIL and DATASIFT_PASSWORD must be set",
-            "uploads": [],
-        }
 
     if existing_list and (enrich or skip_trace) and not batch_tag:
         # Refuse rather than bulk-act on an entire established list.
@@ -1616,6 +1654,145 @@ async def upload_datasift_split(
                 "existing_list=True with enrich/skip_trace requires batch_tag — "
                 "refusing to bulk-act on a whole established list"
             ),
+            "uploads": [],
+        }
+
+    # ── What an earlier attempt of this run already did ──
+    # Read ONCE and never added to: the skip decision for every CSV is made
+    # against this frozen record, so a CSV uploaded during this call can
+    # never cause another CSV of this call to be skipped.
+    prior = read_upload_progress(resume, batch_tag)
+    prior_by_id = {(e["list_name"], e["sha256"]): e for e in prior["uploaded"]}
+    state = {
+        "version": UPLOAD_PROGRESS_VERSION,
+        "batch_tag": batch_tag,
+        "uploaded": [dict(e) for e in prior["uploaded"]],
+        "enrich_done": prior["enrich_done"],
+        "skip_trace_done": prior["skip_trace_done"],
+    }
+
+    async def _report_progress() -> None:
+        if on_progress is None:
+            return
+        try:
+            await on_progress(dict(state, uploaded=[dict(e) for e in state["uploaded"]]))
+        except Exception:
+            logger.exception("upload progress callback failed (upload continues)")
+
+    # ── One plan entry per CSV, by POSITION (labels and list names repeat:
+    # the county split writes a Bell and a Travis CSV for the same list) ──
+    plan: list[dict] = []
+    for info in csv_infos:
+        list_name = str(info.get("list_name") or "")
+        sha = _csv_sha256(info["path"])
+        rows = _csv_data_rows(info["path"])
+        empty = rows == 0
+        plan.append({
+            "list_name": list_name,
+            "file": Path(str(info["path"])).name,
+            "sha": sha,
+            "rows": rows,
+            "empty": empty,
+            "resumed_from": (prior_by_id.get((list_name, sha)) if sha and not empty else None),
+        })
+
+    _resumed_msg = "already uploaded earlier in this run (before a host restart)"
+
+    async def _wizard_pass(page, info: dict, existing_list: bool) -> dict:
+        """One pass of the upload wizard that ALWAYS returns a result. An
+        exception inside the wizard (page-load timeout, detached element)
+        becomes a failed pass for THIS CSV — so it is retried from a clean
+        page and, if it fails again, reported for this file alone instead of
+        aborting the batch and flagging the files that already landed."""
+        try:
+            return await upload_csv(
+                page, info["path"], list_name=info["list_name"],
+                existing_list=existing_list,
+            )
+        except Exception as e:
+            logger.exception("Upload wizard crashed on %s", info.get("label"))
+            return {"success": False, "records_uploaded": 0, "errors": 0,
+                    "message": f"wizard crashed: {type(e).__name__}: {e}"[:300]}
+
+    async def _bulk(action, *args, **kwargs) -> dict:
+        """A bulk action that ALWAYS returns a result: by the time it runs
+        every CSV has landed, so a crash here is an enrich / skip-trace
+        failure — never a reason to report the uploads themselves as lost."""
+        try:
+            return await action(*args, **kwargs)
+        except Exception as e:
+            logger.exception("Bulk action crashed after the uploads landed")
+            return {"success": False, "message": f"crashed: {type(e).__name__}: {e}"[:300]}
+
+    def _not_sent(info: dict, p: dict) -> dict:
+        """Result for a CSV that does not go through the wizard in this call."""
+        base = {"success": True, "label": info["label"], "list_name": p["list_name"],
+                "csv_file": p["file"], "csv_rows": p["rows"]}
+        if p["empty"]:
+            return {**base, "skipped_empty": True, "message": "no data rows — nothing to upload"}
+        was = p["resumed_from"].get("file") or ""
+        return {**base, "resumed": True,
+                "message": _resumed_msg + (f" as {was}" if was and was != p["file"] else "")}
+
+    def _summary(uploads: list[dict]) -> tuple[str, dict]:
+        """Honest tally: a CSV counts as uploaded only when the wizard
+        confirmed it in THIS call."""
+        counts = {
+            "csvs": len(csv_infos),
+            "uploaded": sum(1 for u in uploads if u.get("success")
+                            and not u.get("resumed") and not u.get("skipped_empty")),
+            "resumed": sum(1 for u in uploads if u.get("resumed")),
+            "empty": sum(1 for u in uploads if u.get("skipped_empty")),
+            "failed": sum(1 for u in uploads if not u.get("success")),
+            "not_attempted": len(csv_infos) - len(uploads),
+        }
+        notes = [
+            text for n, text in (
+                (counts["resumed"], f"{counts['resumed']} already uploaded before a host restart"),
+                (counts["empty"], f"{counts['empty']} empty, nothing to send"),
+                (counts["failed"], f"{counts['failed']} failed"),
+                (counts["not_attempted"], f"{counts['not_attempted']} not attempted"),
+            ) if n
+        ]
+        msg = f"Uploaded {counts['uploaded']}/{len(csv_infos)} CSVs"
+        return (f"{msg} ({', '.join(notes)})" if notes else msg), counts
+
+    for i, step in enumerate(plan):
+        logger.info(
+            "Upload plan %d/%d: %s -> list %r, %s row(s)%s", i + 1, len(plan), step["file"],
+            step["list_name"], "?" if step["rows"] is None else step["rows"],
+            " [empty — not sent]" if step["empty"]
+            else " [already uploaded before a restart — not sent again]" if step["resumed_from"]
+            else "")
+
+    to_send = [s for s in plan if not s["empty"] and not s["resumed_from"]]
+    landed_before = any(s["resumed_from"] for s in plan)
+    bulk_pending = landed_before and (
+        (enrich and not (batch_tag and state["enrich_done"]))
+        or (skip_trace and not (batch_tag and state["skip_trace_done"]))
+    )
+    if not to_send and not bulk_pending:
+        # Nothing for the browser to do: every CSV landed before a restart
+        # (and so did the bulk actions), or there is nothing to send at all.
+        uploads = [_not_sent(info, s) for info, s in zip(csv_infos, plan)]
+        message, counts = _summary(uploads)
+        if landed_before:
+            logger.info("DataSift upload already completed earlier in this run — nothing to redo")
+        else:
+            logger.info("DataSift upload: no CSV has a data row — nothing to upload")
+        return {
+            "success": True,
+            "resumed": landed_before,
+            "uploads": uploads,
+            "counts": counts,
+            "message": message,
+            "batch_tag": batch_tag or "",
+        }
+
+    if not email or not password:
+        return {
+            "success": False,
+            "message": "DATASIFT_EMAIL and DATASIFT_PASSWORD must be set",
             "uploads": [],
         }
 
@@ -1659,21 +1836,33 @@ async def upload_datasift_split(
             # Upload each CSV sequentially
             uploads = []
             all_success = True
-            for i, info in enumerate(csv_infos):
+            sent_this_call = 0
+            for i, (info, step) in enumerate(zip(csv_infos, plan)):
                 label = info["label"]
-                if _already_uploaded(str(label)):
-                    logger.info("Skipping CSV %d/%d (%s): %s",
-                                i + 1, len(csv_infos), label, _resumed_msg)
-                    uploads.append({"success": True, "label": label,
-                                    "resumed": True, "message": _resumed_msg})
+                # A "not sent" decision was made when the plan was built; the
+                # earlier uploads of this call took minutes. Re-check the file
+                # now and send it if it is no longer what was decided on
+                # (this can only turn a skip into an upload, never the reverse).
+                if step["resumed_from"] and _csv_sha256(info["path"]) != step["sha"]:
+                    logger.warning("CSV %d/%d (%s) changed on disk since the upload plan — sending it",
+                                   i + 1, len(csv_infos), step["file"])
+                    step["resumed_from"] = None
+                if step["empty"] and _csv_data_rows(info["path"]) != 0:
+                    logger.warning("CSV %d/%d (%s) is no longer empty — sending it",
+                                   i + 1, len(csv_infos), step["file"])
+                    step["empty"] = False
+                if step["empty"] or step["resumed_from"]:
+                    skipped = _not_sent(info, step)
+                    logger.info("Skipping CSV %d/%d (%s, %s): %s",
+                                i + 1, len(csv_infos), label, step["file"], skipped["message"])
+                    uploads.append(skipped)
                     continue
                 logger.info("Uploading CSV %d/%d (%s): %s",
                             i + 1, len(csv_infos), label, info["path"])
+                # Hash of exactly the bytes the wizard is about to read.
+                sha_before = _csv_sha256(info["path"])
 
-                result = await upload_csv(
-                    page, info["path"], list_name=info["list_name"],
-                    existing_list=existing_list,
-                )
+                result = await _wizard_pass(page, info, existing_list)
                 for retry in range(1, CSV_RETRIES + 1):
                     if result.get("success"):
                         break
@@ -1688,40 +1877,74 @@ async def upload_datasift_split(
                     except Exception as e:
                         logger.warning("Page reset before the retry failed: %s", e)
                     first_message = result.get("message")
-                    result = await upload_csv(
-                        page, info["path"], list_name=info["list_name"],
-                        existing_list=existing_list,
-                    )
+                    result = await _wizard_pass(page, info, existing_list)
                     result["retried"] = retry
                     result["first_failure"] = first_message
                 result["label"] = label
+                result["csv_file"] = step["file"]
+                result["csv_rows"] = step["rows"]
+                result.setdefault("list_name", step["list_name"])
                 uploads.append(result)
 
                 if not result.get("success"):
-                    logger.error("Upload %s failed: %s", label, result.get("message"))
+                    logger.error("Upload %s (%s) failed: %s", label, step["file"], result.get("message"))
                     all_success = False
                     break
 
-                if hashes.get(str(label)):
-                    state["uploaded"][str(label)] = hashes[str(label)]
-                    await _report_progress()
+                # New rows just landed, so a bulk action an earlier attempt
+                # finished no longer covers everything under the batch tag.
+                sent_this_call += 1
+                state["enrich_done"] = False
+                state["skip_trace_done"] = False
+                # Record THIS file — its own list + its own content hash —
+                # and only when the file is byte-for-byte what was hashed
+                # before the wizard read it. Otherwise record nothing: a
+                # restart then uploads it again, which is the safe direction.
+                sha_after = _csv_sha256(info["path"])
+                if sha_before and sha_before == sha_after and step["list_name"]:
+                    done_id = (step["list_name"], sha_before)
+                    if not any((e["list_name"], e["sha256"]) == done_id for e in state["uploaded"]):
+                        state["uploaded"].append({
+                            "list_name": step["list_name"], "sha256": sha_before,
+                            "file": step["file"], "label": str(label), "rows": step["rows"],
+                        })
+                else:
+                    logger.warning(
+                        "Upload %s (%s) landed but is not recorded for the restart guard "
+                        "(file unreadable or changed while uploading) — a restart would send it again",
+                        label, step["file"])
+                await _report_progress()
 
                 # Reset page state between uploads: dismiss popups + navigate
                 # back to records URL + dismiss again. Without this, the Beamer
                 # NPS iframe from upload #1 intercepts the Step 1 click on #2.
+                # A reset that fails must not abort the batch: this file has
+                # landed, and the next wizard pass navigates for itself (and
+                # is retried from a clean page if it then fails).
                 if i < len(csv_infos) - 1:
                     logger.info("Resetting page state before next upload...")
-                    await _dismiss_popups(page)
-                    await page.goto(DATASIFT_UPLOAD_URL, wait_until="domcontentloaded")
-                    await page.wait_for_timeout(5000)
-                    await _dismiss_popups(page)
+                    try:
+                        await _dismiss_popups(page)
+                        await page.goto(DATASIFT_UPLOAD_URL, wait_until="domcontentloaded")
+                        await page.wait_for_timeout(5000)
+                        await _dismiss_popups(page)
+                    except Exception as e:
+                        logger.warning("Page reset before the next upload failed: %s", e)
 
+            message, counts = _summary(uploads)
             combined = {
                 "success": all_success,
                 "uploads": uploads,
-                "message": f"Uploaded {len(uploads)}/{len(csv_infos)} CSVs",
+                "counts": counts,
+                "message": message,
                 "batch_tag": batch_tag or "",
             }
+            # Bulk actions only make sense over rows that are in DataSift:
+            # sent by this call or by an earlier attempt of this run.
+            landed_any = bool(sent_this_call) or landed_before
+            if all_success and (enrich or skip_trace) and not landed_any:
+                logger.info("No CSV had a data row — skipping enrich / skip trace")
+                return combined
 
             # Batch-tag anchor: ONE enrich + ONE skip-trace over exactly the
             # rows this run uploaded (every CSV carries the tag), regardless
@@ -1741,7 +1964,7 @@ async def upload_datasift_split(
                     await page.wait_for_timeout(60000)
                 anchor_list = csv_infos[0]["list_name"]
                 if do_enrich:
-                    er = await enrich_records(page, anchor_list, tag=batch_tag)
+                    er = await _bulk(enrich_records, page, anchor_list, tag=batch_tag)
                     er["anchor"] = f"tag:{batch_tag}"
                     combined["enrich_result"] = er
                     logger.info("Enrichment [tag %s]: %s", batch_tag, er.get("message", ""))
@@ -1749,7 +1972,7 @@ async def upload_datasift_split(
                         state["enrich_done"] = True
                         await _report_progress()
                 if do_skip:
-                    sr = await skip_trace_records(page, anchor_list, tag=batch_tag)
+                    sr = await _bulk(skip_trace_records, page, anchor_list, tag=batch_tag)
                     sr["anchor"] = f"tag:{batch_tag}"
                     combined["skip_trace_result"] = sr
                     logger.info("Skip trace [tag %s]: %s", batch_tag, sr.get("message", ""))
@@ -1773,19 +1996,21 @@ async def upload_datasift_split(
                 await page.wait_for_timeout(60000)
 
                 list_names: list[str] = []
-                for info in csv_infos:
+                for info, step in zip(csv_infos, plan):
+                    if step["empty"]:
+                        continue  # nothing of this CSV is in the list
                     if info["list_name"] not in list_names:
                         list_names.append(info["list_name"])
 
                 enrich_results, skip_results = [], []
                 for ln in list_names:
                     if enrich:
-                        er = await enrich_records(page, ln)
+                        er = await _bulk(enrich_records, page, ln)
                         er["list_name"] = ln
                         enrich_results.append(er)
                         logger.info("Enrichment [%s]: %s", ln, er.get("message", ""))
                     if skip_trace:
-                        sr = await skip_trace_records(page, ln)
+                        sr = await _bulk(skip_trace_records, page, ln)
                         sr["list_name"] = ln
                         skip_results.append(sr)
                         logger.info("Skip trace [%s]: %s", ln, sr.get("message", ""))

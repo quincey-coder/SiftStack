@@ -103,12 +103,19 @@ class UploadFailure:
 
 
 def _drive_url_for(info: dict, drive_links: list[dict] | None) -> str:
+    # The file name identifies the CSV; the label does not (the county split
+    # gives the Bell and the Travis Foreclosure CSV the same label). A label
+    # is only a fallback for links that carry no file name, and only when it
+    # names exactly one of them — never a guess at another county's file.
     fname = Path(str(info.get("path", ""))).name
-    for d in drive_links or []:
-        if not d.get("url"):
-            continue
-        if d.get("filename") == fname or d.get("label") == info.get("label"):
+    links = [d for d in drive_links or [] if d.get("url")]
+    for d in links:
+        if fname and d.get("filename") == fname:
             return d["url"]
+    by_label = [d for d in links
+                if not d.get("filename") and d.get("label") == info.get("label")]
+    if len(by_label) == 1:
+        return by_label[0]["url"]
     return ""
 
 
