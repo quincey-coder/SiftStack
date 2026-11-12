@@ -193,7 +193,19 @@ async def login(page, email: str = None, password: str = None) -> bool:
         if authed:
             break
     if not authed:
-        logger.error("DataSift login failed — authenticated shell not detected")
+        # Evidence for a cloud run nobody can watch: where the browser ended
+        # up and what the page says (wrong password, captcha, new-device
+        # check, blank SPA ...), plus a screenshot.
+        body = ""
+        try:
+            body = await page.evaluate("() => (document.body.innerText || '').slice(0, 600)")
+        except Exception:
+            pass
+        logger.error(
+            "DataSift login failed — authenticated shell not detected (url=%s, page text=%r)",
+            page.url, " ".join(body.split()),
+        )
+        await screenshot(page, "login_failed")
         return False
 
     await save_cookies(page)

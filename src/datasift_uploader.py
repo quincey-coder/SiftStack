@@ -1591,7 +1591,22 @@ async def upload_datasift_split(
                 "Chrome/120.0.0.0 Safari/537.36"
             ),
         )
+        # SIFT_DS_TRACE=1 records a Playwright trace of the whole upload
+        # (datasift_trace.zip, open with `playwright show-trace`) — the way
+        # to see what a cloud run's browser actually did.
+        tracing = os.environ.get("SIFT_DS_TRACE", "").strip() in ("1", "true", "yes")
+        if tracing:
+            try:
+                await context.tracing.start(screenshots=True, snapshots=True)
+            except Exception:
+                logger.exception("Could not start the Playwright trace (upload continues)")
+                tracing = False
         page = await context.new_page()
+        try:
+            page.on("pageerror", lambda e: logger.warning("DataSift page error: %s", str(e)[:300]))
+            page.on("crash", lambda *_: logger.error("DataSift browser page CRASHED"))
+        except Exception:
+            pass
 
         try:
             # Login once
@@ -1735,6 +1750,11 @@ async def upload_datasift_split(
             return combined
 
         finally:
+            if tracing:
+                try:
+                    await context.tracing.stop(path="datasift_trace.zip")
+                except Exception:
+                    logger.exception("Could not save the Playwright trace")
             await browser.close()
 
 

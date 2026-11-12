@@ -238,6 +238,13 @@
             "default": false,
             "editor": "checkbox"
         },
+        "upload_only": {
+            "title": "Upload-only run (no scraping)",
+            "type": "boolean",
+            "description": "ON: skip the scrape entirely and push CSVs that already exist through the DataSift upload wizard. Reads the UPLOAD_MANIFEST record in the state store ({\"batch_tag\": ..., \"csvs\": [{\"key\", \"label\", \"list_name\"}]}); each key is a CSV record in the same store. For re-uploading after a failed upload and for testing the cloud upload on a few rows. Screenshots of every wizard step are saved to the run's key-value store.",
+            "default": false,
+            "editor": "checkbox"
+        },
         "datasift_split_by_county": {
             "title": "Split lead CSVs per county",
             "type": "boolean",

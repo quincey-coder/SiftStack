@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 import time
 from datetime import datetime
@@ -483,6 +484,204 @@ def _upload_forensics_reports_to_drive(no_drive: bool = False) -> int:
 # ── Apify Actor mode ─────────────────────────────────────────────────
 
 
+async def _push_upload_debug(Actor, started_at: float) -> int:
+    """Copy the wizard's debug screenshots (+ Playwright trace) into the RUN's
+    default key-value store, so a cloud upload failure can be looked at
+    afterwards. Local runs keep the PNGs in the working directory; in the
+    cloud the container is gone when the run ends."""
+    pushed = 0
+    try:
+        shots = sorted(
+            (p for p in Path(".").glob("datasift_*.png") if p.stat().st_mtime >= started_at - 2),
+            key=lambda p: p.stat().st_mtime,
+        )
+        for i, p in enumerate(shots[-80:]):
+            key = re.sub(r"[^A-Za-z0-9_.-]", "_", f"ds_shot_{i:02d}_{p.stem[9:]}")[:200] + ".png"
+            await Actor.set_value(key, p.read_bytes(), content_type="image/png")
+            pushed += 1
+        for name, ctype in (("datasift_trace.zip", "application/zip"),
+                            ("datasift_failure.html", "text/html")):
+            p = Path(name)
+            if p.exists() and p.stat().st_mtime >= started_at - 2:
+                await Actor.set_value(name, p.read_bytes(),
+                                      content_type=ctype)
+                pushed += 1
+        if pushed:
+            Actor.log.info("DataSift upload debug: %d file(s) saved to this run's key-value store", pushed)
+    except Exception:
+        Actor.log.exception("Could not save the upload debug files")
+    return pushed
+
+
+async def _actor_wizard_upload(
+    Actor, csv_infos: list, drive_links: list, *, batch_tag, enrich: bool,
+    skip_trace: bool, health, kvs, notify_slack: bool, debug_always: bool = False,
+) -> tuple[dict, list]:
+    """The Actor's DataSift upload: the upload wizard through Playwright.
+
+    Shared by the normal run (after the CSVs are built) and the upload-only
+    run (`upload_only` input). Returns (upload_result, upload_failures).
+    """
+    from time import time as _now
+    _dbg_start = _now()
+    upload_result: dict = {}
+    _up_fail: list = []
+    import upload_outcome as _uo
+    _ds_headed = bool(os.environ.get("DISPLAY")) or sys.platform == "win32"
+    if not _ds_headed:
+        Actor.log.warning(
+            "DataSift upload: no DISPLAY — running the wizard HEADLESS "
+            "(the Actor normally runs under xvfb-run)"
+        )
+    # Restart guard: Apify migrates runs to a new host mid-flight
+    # and the Actor then restarts from scratch (2 of 3 scheduled
+    # runs, 09-17..09-19). Progress lives in THIS RUN's default
+    # KVS — it survives the migration, never touches cross-run
+    # state — so a restart skips CSVs/bulk actions already done.
+    _UP_PROGRESS_KEY = "DATASIFT_UPLOAD_PROGRESS"
+    _up_resume: dict = {}
+    try:
+        _saved = await Actor.get_value(_UP_PROGRESS_KEY)
+        if isinstance(_saved, dict) and _saved.get("batch_tag") == batch_tag:
+            _up_resume = _saved
+            Actor.log.warning(
+                "DataSift upload: resuming after a restart — %d CSV(s) already "
+                "uploaded, enrich_done=%s, skip_trace_done=%s",
+                len(_saved.get("uploaded") or {}),
+                bool(_saved.get("enrich_done")), bool(_saved.get("skip_trace_done")),
+            )
+    except Exception:
+        Actor.log.exception("Could not read upload progress (uploading everything)")
+
+    async def _save_upload_progress(state: dict) -> None:
+        await Actor.set_value(_UP_PROGRESS_KEY, {**state, "batch_tag": batch_tag})
+
+    try:
+        from datasift_uploader import upload_datasift_split
+        Actor.log.info(
+            "DataSift upload: %d CSV(s) through the upload wizard "
+            "(headed=%s, enrich=%s, skip_trace=%s, batch tag %s)",
+            len(csv_infos), _ds_headed, enrich,
+            skip_trace, batch_tag,
+        )
+        upload_result = await upload_datasift_split(
+            csv_infos,
+            headless=not _ds_headed,
+            enrich=enrich,
+            skip_trace=skip_trace,
+            existing_list=True,
+            batch_tag=batch_tag,
+            launch_args=["--no-sandbox", "--disable-dev-shm-usage"],
+            resume=_up_resume,
+            on_progress=_save_upload_progress,
+        )
+    except Exception as e:
+        Actor.log.exception(
+            "DataSift upload crashed: %s — the CSVs are still on Drive/KVS "
+            "for a manual wizard upload", e,
+        )
+        upload_result = {
+            "success": False, "uploads": [],
+            "message": f"uploader crashed: {e}",
+        }
+        _up_fail = _uo.failures_from_exception(
+            e, csv_infos, drive_links, uploader="playwright",
+        )
+    else:
+        _up_fail = _uo.failures_from_playwright(upload_result, csv_infos, drive_links)
+        if upload_result.get("success"):
+            Actor.log.info("DataSift upload: %s", upload_result.get("message"))
+            for _k, _lbl in (("enrich_result", "Enrich"), ("skip_trace_result", "Skip trace")):
+                if upload_result.get(_k):
+                    Actor.log.info("  %s: %s", _lbl, upload_result[_k].get("message", ""))
+        else:
+            Actor.log.error("DataSift upload failed: %s", upload_result.get("message"))
+
+    # ── Upload-failure alert: any list that did not fully land ──
+    # Error-level Slack alert + JSON manifest (KVS rolling history)
+    # naming the CSV, the list, the stage that broke and what to
+    # do — a failed upload is never just a line in the run log.
+    if _up_fail:
+        try:
+            health.record_event(
+                "error", "datasift upload",
+                f"{len(_up_fail)} of {len(csv_infos)} list(s) did not "
+                f"fully land (wizard) — see the upload alert",
+            )
+            _manifest = _uo.report_upload_failures(
+                _up_fail, out_dir=config.OUTPUT_DIR,
+                slack=notify_slack and bool(config.SLACK_WEBHOOK_URL),
+                total_lists=len(csv_infos),
+                run_id=os.environ.get("APIFY_ACTOR_RUN_ID", ""),
+                manifest_ref=f"KVS key `{_uo.KVS_KEY}` (newest first)",
+            )
+            _hist = await kvs.get_value(_uo.KVS_KEY)
+            await kvs.set_value(_uo.KVS_KEY, _uo.append_history(_hist, _manifest))
+        except Exception:
+            Actor.log.exception("Upload-failure reporting failed")
+    if _up_fail or debug_always:
+        await _push_upload_debug(Actor, _dbg_start)
+    return upload_result, _up_fail
+
+
+async def _actor_upload_only(Actor, kvs, *, enrich: bool, skip_trace: bool,
+                             health, notify_slack: bool) -> bool:
+    """`upload_only` run: skip scraping, push CSVs that already exist through
+    the wizard. Reads ``UPLOAD_MANIFEST`` from the state store::
+
+        {"batch_tag": "upload_2026-11-11",
+         "csvs": [{"key": "datasift_foreclosure.csv", "label": "Foreclosure",
+                   "list_name": "Foreclosure", "url": "<Drive link, optional>"}]}
+
+    Each ``key`` is a CSV record in the same store. Used to re-upload a run's
+    files after a failed upload, and to test the cloud upload on a few rows.
+    """
+    import csv as _csv
+    import tempfile
+    manifest = await kvs.get_value("UPLOAD_MANIFEST")
+    if not isinstance(manifest, dict) or not manifest.get("csvs"):
+        Actor.log.error("upload_only: no UPLOAD_MANIFEST (with a 'csvs' list) in the state store")
+        return False
+    tmp = Path(tempfile.mkdtemp(prefix="upload_only_"))
+    csv_infos: list[dict] = []
+    drive_links: list[dict] = []
+    for ent in manifest["csvs"]:
+        key = ent["key"]
+        val = await kvs.get_value(key)
+        if val is None:
+            Actor.log.error("upload_only: CSV key %r is not in the state store", key)
+            return False
+        data = val.encode("utf-8") if isinstance(val, str) else bytes(val)
+        path = tmp / (re.sub(r"[^A-Za-z0-9_.-]", "_", key) or "upload.csv")
+        path.write_bytes(data)
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            count = max(sum(1 for _ in _csv.reader(f)) - 1, 0)
+        csv_infos.append({"path": str(path), "label": ent.get("label") or key,
+                          "list_name": ent["list_name"], "count": count})
+        if ent.get("url"):
+            drive_links.append({"label": ent.get("label") or key, "records": count,
+                                "filename": path.name, "url": ent["url"]})
+        Actor.log.info("upload_only: %s -> list %r (%d rows)", key, ent["list_name"], count)
+
+    # Record a Playwright trace of the whole upload (saved with the screenshots).
+    os.environ.setdefault("SIFT_DS_TRACE", "1")
+    result, failures = await _actor_wizard_upload(
+        Actor, csv_infos, drive_links, batch_tag=manifest.get("batch_tag") or None,
+        enrich=enrich, skip_trace=skip_trace, health=health, kvs=kvs,
+        notify_slack=notify_slack, debug_always=True,
+    )
+    try:
+        await Actor.set_value("UPLOAD_RESULT", json.loads(json.dumps(result, default=str)))
+    except Exception:
+        Actor.log.exception("Could not save UPLOAD_RESULT")
+    ok = bool(result.get("success")) and not failures
+    for u in result.get("uploads") or []:
+        Actor.log.info("  %s: success=%s mapped=%s unmapped=%s %s", u.get("label"), u.get("success"),
+                       u.get("columns_mapped"), u.get("columns_unmapped"), (u.get("message") or "")[:200])
+    return ok
+
+
+
 async def actor_main() -> None:
     """Run as an Apify Actor — full automated pipeline.
 
@@ -774,6 +973,19 @@ async def actor_main() -> None:
                     return await self._c.set_record(key, value, content_type=content_type)
 
             kvs = _UserKVS(_state_kvs)
+
+            # ── upload_only: no scraping — push existing CSVs through the wizard ──
+            if bool(actor_input.get("upload_only", False)):
+                Actor.log.info("upload_only run: skipping the scrape, uploading UPLOAD_MANIFEST CSVs")
+                _ok = await _actor_upload_only(
+                    Actor, kvs, enrich=datasift_do_enrich, skip_trace=datasift_do_skip_trace,
+                    health=health, notify_slack=do_notify_slack,
+                )
+                if _ok:
+                    await Actor.set_status_message("upload_only: DataSift upload succeeded")
+                else:
+                    await Actor.fail(status_message="upload_only: DataSift upload FAILED — see log + ds_shot_* screenshots")
+                return
 
             # ── Load last_run_date ──
             if mode == "daily" and not since_date_override:
@@ -1253,99 +1465,11 @@ async def actor_main() -> None:
             upload_result: dict = {}
             _up_fail: list = []
             if upload_datasift and _publish_ok and csv_infos:
-                import upload_outcome as _uo
-                _ds_headed = bool(os.environ.get("DISPLAY")) or sys.platform == "win32"
-                if not _ds_headed:
-                    Actor.log.warning(
-                        "DataSift upload: no DISPLAY — running the wizard HEADLESS "
-                        "(the Actor normally runs under xvfb-run)"
-                    )
-                # Restart guard: Apify migrates runs to a new host mid-flight
-                # and the Actor then restarts from scratch (2 of 3 scheduled
-                # runs, 09-17..09-19). Progress lives in THIS RUN's default
-                # KVS — it survives the migration, never touches cross-run
-                # state — so a restart skips CSVs/bulk actions already done.
-                _UP_PROGRESS_KEY = "DATASIFT_UPLOAD_PROGRESS"
-                _up_resume: dict = {}
-                try:
-                    _saved = await Actor.get_value(_UP_PROGRESS_KEY)
-                    if isinstance(_saved, dict) and _saved.get("batch_tag") == _batch_tag:
-                        _up_resume = _saved
-                        Actor.log.warning(
-                            "DataSift upload: resuming after a restart — %d CSV(s) already "
-                            "uploaded, enrich_done=%s, skip_trace_done=%s",
-                            len(_saved.get("uploaded") or {}),
-                            bool(_saved.get("enrich_done")), bool(_saved.get("skip_trace_done")),
-                        )
-                except Exception:
-                    Actor.log.exception("Could not read upload progress (uploading everything)")
-
-                async def _save_upload_progress(state: dict) -> None:
-                    await Actor.set_value(_UP_PROGRESS_KEY, {**state, "batch_tag": _batch_tag})
-
-                try:
-                    from datasift_uploader import upload_datasift_split
-                    Actor.log.info(
-                        "DataSift upload: %d CSV(s) through the upload wizard "
-                        "(headed=%s, enrich=%s, skip_trace=%s, batch tag %s)",
-                        len(csv_infos), _ds_headed, datasift_do_enrich,
-                        datasift_do_skip_trace, _batch_tag,
-                    )
-                    upload_result = await upload_datasift_split(
-                        csv_infos,
-                        headless=not _ds_headed,
-                        enrich=datasift_do_enrich,
-                        skip_trace=datasift_do_skip_trace,
-                        existing_list=True,
-                        batch_tag=_batch_tag,
-                        launch_args=["--no-sandbox", "--disable-dev-shm-usage"],
-                        resume=_up_resume,
-                        on_progress=_save_upload_progress,
-                    )
-                except Exception as e:
-                    Actor.log.exception(
-                        "DataSift upload crashed: %s — the CSVs are still on Drive/KVS "
-                        "for a manual wizard upload", e,
-                    )
-                    upload_result = {
-                        "success": False, "uploads": [],
-                        "message": f"uploader crashed: {e}",
-                    }
-                    _up_fail = _uo.failures_from_exception(
-                        e, csv_infos, drive_links, uploader="playwright",
-                    )
-                else:
-                    _up_fail = _uo.failures_from_playwright(upload_result, csv_infos, drive_links)
-                    if upload_result.get("success"):
-                        Actor.log.info("DataSift upload: %s", upload_result.get("message"))
-                        for _k, _lbl in (("enrich_result", "Enrich"), ("skip_trace_result", "Skip trace")):
-                            if upload_result.get(_k):
-                                Actor.log.info("  %s: %s", _lbl, upload_result[_k].get("message", ""))
-                    else:
-                        Actor.log.error("DataSift upload failed: %s", upload_result.get("message"))
-
-                # ── Upload-failure alert: any list that did not fully land ──
-                # Error-level Slack alert + JSON manifest (KVS rolling history)
-                # naming the CSV, the list, the stage that broke and what to
-                # do — a failed upload is never just a line in the run log.
-                if _up_fail:
-                    try:
-                        health.record_event(
-                            "error", "datasift upload",
-                            f"{len(_up_fail)} of {len(csv_infos)} list(s) did not "
-                            f"fully land (wizard) — see the upload alert",
-                        )
-                        _manifest = _uo.report_upload_failures(
-                            _up_fail, out_dir=config.OUTPUT_DIR,
-                            slack=do_notify_slack and bool(config.SLACK_WEBHOOK_URL),
-                            total_lists=len(csv_infos),
-                            run_id=os.environ.get("APIFY_ACTOR_RUN_ID", ""),
-                            manifest_ref=f"KVS key `{_uo.KVS_KEY}` (newest first)",
-                        )
-                        _hist = await kvs.get_value(_uo.KVS_KEY)
-                        await kvs.set_value(_uo.KVS_KEY, _uo.append_history(_hist, _manifest))
-                    except Exception:
-                        Actor.log.exception("Upload-failure reporting failed")
+                upload_result, _up_fail = await _actor_wizard_upload(
+                    Actor, csv_infos, drive_links, batch_tag=_batch_tag,
+                    enrich=datasift_do_enrich, skip_trace=datasift_do_skip_trace,
+                    health=health, kvs=kvs, notify_slack=do_notify_slack,
+                )
             elif upload_datasift and not _publish_ok:
                 Actor.log.error(
                     "DataSift upload SKIPPED — output validation blocked publishing"
