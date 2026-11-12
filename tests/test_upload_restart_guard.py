@@ -172,3 +172,33 @@ def test_unreadable_csv_is_never_treated_as_uploaded(tmp_path, monkeypatch):
               "list_name": "Foreclosure", "count": 1}]
     _run(infos, resume={"uploaded": {"Foreclosure": ""}})
     assert calls["upload"] == ["Foreclosure"]
+
+
+def test_flaky_csv_is_retried_once_and_the_batch_continues(monkeypatch, tmp_path):
+    """A wizard pass that fails before Finish is accepted committed nothing,
+    so the CSV is re-run once from a clean page instead of stopping the batch
+    (2026-11-11: a 1-row Lis Pendens file failed, then passed on a retry)."""
+    calls = _stub(monkeypatch)
+    seen = {"n": 0}
+
+    async def _flaky(page, path, list_name=None, existing_list=False):
+        calls["upload"].append(list_name)
+        if list_name == "Probate":
+            seen["n"] += 1
+            if seen["n"] == 1:
+                return {"success": False, "message": "Finish not accepted"}
+        return {"success": True, "message": "ok"}
+
+    monkeypatch.setattr(up, "upload_csv", _flaky)
+    res, _saved = _run(_infos(tmp_path), enrich=False, skip_trace=False)
+    assert res["success"] is True
+    assert calls["upload"] == ["Foreclosure", "Probate", "Probate", "Liens"]
+    probate = [u for u in res["uploads"] if u["label"] == "Probate"][0]
+    assert probate["retried"] == 1 and probate["first_failure"] == "Finish not accepted"
+
+
+def test_csv_failing_twice_still_stops_the_batch(monkeypatch, tmp_path):
+    calls = _stub(monkeypatch, fail_label="Probate")
+    res, _saved = _run(_infos(tmp_path), enrich=False, skip_trace=False)
+    assert res["success"] is False
+    assert calls["upload"] == ["Foreclosure", "Probate", "Probate"]

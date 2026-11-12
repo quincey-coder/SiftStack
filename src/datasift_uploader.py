@@ -302,27 +302,59 @@ async def upload_csv(
     # would re-upload and duplicate. The reliable signal that Finish was
     # ACCEPTED is the wizard closing.
     result["success"] = True
-    try:
-        banner = page.get_by_text(
-            re.compile(r"Upload Complete|successfully|records (imported|added|uploaded)",
-                       re.IGNORECASE))
-        await banner.first.wait_for(timeout=20000)
-        result["message"] = (await banner.first.text_content()) or "Upload completed"
-        logger.info("DataSift upload confirmed: %s", result["message"])
-    except PwTimeout:
-        await page.wait_for_timeout(3000)
-        wizard_open = await page.locator('button:has-text("Finish Upload")').count() > 0
-        if wizard_open:
+    # DataSift's own success screen reads "All set! / Your upload has started /
+    # Upload sucessfully started!" (their typo — one "c"), seen live 2026-11-11.
+    _SUCCESS_RE = re.compile(
+        r"Upload Complete|suc+essfully|All set!|upload has started|"
+        r"records (imported|added|uploaded)", re.IGNORECASE)
+    for attempt in range(1, FINISH_CLICK_ATTEMPTS + 1):
+        try:
+            banner = page.get_by_text(_SUCCESS_RE)
+            await banner.first.wait_for(timeout=20000)
+            result["success"] = True
+            result["message"] = ((await banner.first.text_content()) or "Upload completed").strip()
+            logger.info("DataSift upload confirmed: %s", result["message"])
+            break
+        except PwTimeout:
+            await page.wait_for_timeout(3000)
+            finish = page.locator('button:has-text("Finish Upload")')
+            wizard_open = await finish.count() > 0
+            if not wizard_open:
+                result["success"] = True
+                result["message"] = ("Finish accepted; wizard closed. No banner appeared — DataSift "
+                                     "imports asynchronously, so confirm in the Activity tab. "
+                                     "Do NOT re-upload on the strength of a missing banner.")
+                logger.info(result["message"])
+                break
+            # Still on Review with the Finish button showing: nothing was
+            # committed (the success screen has no Finish button), so
+            # clicking again cannot double-upload. Seen 2026-11-11 on a
+            # 1-row Lis Pendens file; the same file went through on a retry.
             result["success"] = False
             result["message"] = ("Clicked 'Finish Upload' but the wizard is still open — "
                                  "the upload was NOT accepted")
-            logger.error(result["message"])
-            await _screenshot(page, "wizard_finish_rejected")
-        else:
-            result["message"] = ("Finish accepted; wizard closed. No banner appeared — DataSift "
-                                 "imports asynchronously, so confirm in the Activity tab. "
-                                 "Do NOT re-upload on the strength of a missing banner.")
-            logger.info(result["message"])
+            await _screenshot(page, f"wizard_finish_rejected_{attempt}")
+            try:
+                seen = await page.evaluate(
+                    """() => Array.from(document.querySelectorAll(
+                        '[class*="Toast"], [class*="toast"], [class*="Error"], [class*="error"], [role="alert"]'))
+                        .map(e => (e.innerText || '').trim()).filter(t => t && t.length < 300).slice(0, 5)""")
+            except Exception:
+                seen = []
+            if attempt >= FINISH_CLICK_ATTEMPTS:
+                logger.error("%s (page said: %s)", result["message"], seen or "nothing")
+                break
+            logger.warning("Finish Upload did not register (attempt %d/%d, page said: %s) — clicking again",
+                           attempt, FINISH_CLICK_ATTEMPTS, seen or "nothing")
+            await _dismiss_popups(page)
+            try:
+                await finish.first.click(force=True, timeout=10000)
+            except Exception:
+                try:
+                    await page.evaluate("el => el.click()", await finish.first.element_handle())
+                except Exception as e:
+                    logger.warning("Finish re-click failed: %s", e)
+            await page.wait_for_timeout(5000)
 
     await _save_cookies(page)
     return result
@@ -337,6 +369,12 @@ async def upload_csv(
 # unsafe: three exact-text "Tags" nodes exist on that screen (sidebar nav at
 # x=54, the source card at x=413, the drop target at x=893).
 MAX_WIZARD_STEPS = 12
+# Finish Upload is clicked up to this many times while the wizard stays open.
+FINISH_CLICK_ATTEMPTS = 3
+# A CSV whose wizard pass failed is re-run this many extra times from a clean
+# Records page. Safe: upload_csv only reports failure when Finish was never
+# accepted, i.e. nothing was committed.
+CSV_RETRIES = 1
 
 # Columns whose mapping is NOT optional. Tags drive the niche-sequential
 # presets; Lists routes the record. Committing without them yields records no
@@ -1636,6 +1674,26 @@ async def upload_datasift_split(
                     page, info["path"], list_name=info["list_name"],
                     existing_list=existing_list,
                 )
+                for retry in range(1, CSV_RETRIES + 1):
+                    if result.get("success"):
+                        break
+                    logger.warning(
+                        "Upload %s failed (%s) — nothing was committed; retry %d/%d from a clean page",
+                        label, result.get("message"), retry, CSV_RETRIES)
+                    try:
+                        await _dismiss_popups(page)
+                        await page.goto(DATASIFT_UPLOAD_URL, wait_until="domcontentloaded")
+                        await page.wait_for_timeout(5000)
+                        await _dismiss_popups(page)
+                    except Exception as e:
+                        logger.warning("Page reset before the retry failed: %s", e)
+                    first_message = result.get("message")
+                    result = await upload_csv(
+                        page, info["path"], list_name=info["list_name"],
+                        existing_list=existing_list,
+                    )
+                    result["retried"] = retry
+                    result["first_failure"] = first_message
                 result["label"] = label
                 uploads.append(result)
 
